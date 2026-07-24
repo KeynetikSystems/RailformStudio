@@ -392,8 +392,9 @@ def test_snaputil_seg_dist():
 
 
 def test_snaputil_collect_snap_points():
-    """collect_snap_points must pick up control points, vertices, and
-    on-curve samples from every other object, and must exclude the
+    """collect_snap_points must pick up control points and vertices (exact
+    targets) from every other object by default, with coarse on-curve
+    samples available only via include_samples=True, and must exclude the
     object passed as `exclude`."""
     from rfstudio import snaputil
     doc = FreeCAD.newDocument("snaputil_test") if hasattr(FreeCAD, "newDocument") \
@@ -411,15 +412,202 @@ def test_snaputil_collect_snap_points():
             1 for p in pts if p.distanceToPoint(Vector(0, 0, 0)) < 1e-6
             or p.distanceToPoint(Vector(10, 0, 0)) < 1e-6)
         assert endpoints_found >= 2, "expected both line endpoints as candidates"
-        # on-curve sampling should add interior points too (10-unit line)
-        assert len(pts) > 2, "expected on-curve samples beyond the 2 endpoints"
+        # samples are OFF by default now -> a plain line yields ONLY its two
+        # exact endpoints, no coarse interior arc-length samples (the exact
+        # ray->edge path covers 'anywhere on the curve' precisely instead).
+        assert len(pts) == 2, "default should be exact endpoints only, got %d" % len(pts)
+        # opting samples back in restores the old interior-sample behaviour
+        pts_s = snaputil.collect_snap_points(doc, exclude=None, include_samples=True)
+        assert len(pts_s) > 2, "include_samples=True should add interior samples"
         # excluding the object removes its candidates entirely
         pts_excluded = snaputil.collect_snap_points(doc, exclude=line)
         assert len(pts_excluded) == 0
-        out("  snaputil collect   OK  n=%d (excluded -> %d)"
-            % (len(pts), len(pts_excluded)))
+        out("  snaputil collect   OK  exact=%d samples-on=%d (excluded -> %d)"
+            % (len(pts), len(pts_s), len(pts_excluded)))
     finally:
         FreeCAD.closeDocument(doc.Name)
+
+
+def test_snaputil_ray_snap_is_depth_accurate():
+    """The exact snap must project the cursor RAY onto the curve, not a
+    single focal-plane point. This is the accuracy fix: the ray method
+    lands where the curve truly passes closest to what the cursor points
+    at, independent of depth, whereas the old focal-plane method drifts
+    along the curve (here, all the way to the wrong endpoint)."""
+    from rfstudio import snaputil
+    edge = Part.Edge(Part.LineSegment(Vector(0, 0, 0), Vector(10, 0, 0)))
+
+    # Ray straight down through x=3: correct snap is (3,0,0).
+    pt, d, _ = snaputil.nearest_point_on_shapes_to_ray(
+        Vector(3, 0, 50), Vector(0, 0, -1), [edge])
+    assert pt is not None and pt.distanceToPoint(Vector(3, 0, 0)) < 1e-6, pt
+    assert d < 1e-6, d
+
+    # Adversarial: a ray from (0,0,50) tilted in +x overshoots the segment
+    # end, so the true nearest point on the segment is the endpoint (10,0,0).
+    pt2, _d2, _ = snaputil.nearest_point_on_shapes_to_ray(
+        Vector(0, 0, 50), Vector(0.6, 0, -0.8), [edge])
+    assert pt2 is not None and pt2.distanceToPoint(Vector(10, 0, 0)) < 1e-4, pt2
+
+    # The OLD focal-plane method (nearest point to the getPoint result at
+    # z=50, i.e. (0,0,50)) would instead return the OPPOSITE end (0,0,0) --
+    # a full 10-unit error. Assert the two methods genuinely disagree here,
+    # so this test would fail if anything silently reverted to the old path.
+    pt_old, _do, _ = snaputil.nearest_point_on_shapes(Vector(0, 0, 50), [edge])
+    assert pt_old.distanceToPoint(Vector(0, 0, 0)) < 1e-6, pt_old
+    assert pt2.distanceToPoint(pt_old) > 5.0, (pt2, pt_old)
+
+    # Degenerate direction is rejected, not crashed.
+    none_pt, _, _ = snaputil.nearest_point_on_shapes_to_ray(
+        Vector(0, 0, 0), Vector(0, 0, 0), [edge])
+    assert none_pt is None
+    out("  snaputil ray-snap  OK  straight=(3,0,0) tilted->endpoint (old drifts 10u)")
+
+
+def test_snaputil_axis_snap_stays_on_axis():
+    """Axis-locked snap must return a point ON the drag axis where a target
+    curve crosses it -- so the axis constraint is preserved while still
+    snapping to the crossing (Feature: snap during axis drags)."""
+    from rfstudio import snaputil
+    # target: the world X axis segment 0..10
+    edge = Part.Edge(Part.LineSegment(Vector(0, 0, 0), Vector(10, 0, 0)))
+    # drag axis: vertical (Z) line through x=3 -> crosses the target at (3,0,0)
+    pt, d, _ = snaputil.closest_point_on_axis_to_shapes(
+        Vector(3, 0, 20), Vector(0, 0, 1), [edge])
+    assert pt is not None and pt.distanceToPoint(Vector(3, 0, 0)) < 1e-6, pt
+    assert d < 1e-6, d
+    # a drag axis that never comes near the segment: still returns the point
+    # of closest approach on the axis, with a nonzero distance the caller
+    # can gate on via max_dist.
+    pt2, d2, _ = snaputil.closest_point_on_axis_to_shapes(
+        Vector(50, 0, 20), Vector(0, 0, 1), [edge], max_dist=1.0)
+    assert pt2 is None, (pt2, d2)   # 40 units away -> rejected by max_dist
+    out("  snaputil axis-snap OK  crossing=(3,0,0) on-axis; far target rejected")
+
+
+def test_on_curve_constraint_pulls_point_onto_edge():
+    """The on_curve constraint must pull a free point onto a fixed target
+    edge via the simultaneous solver (Feature: point-on-curve constraint)."""
+    from rfstudio import core
+    edge = Part.Edge(Part.LineSegment(Vector(0, 0, 0), Vector(10, 0, 0)))
+    p = Vector(3, 2, 0)   # 2 units off the X axis
+    solved = core.solve_point_constraints([p], [("on_curve", 0, edge)])
+    q = solved[0]
+    # point now lies on the edge (distance ~0), having moved down in Y
+    d = Part.Vertex(q).distToShape(edge)[0]
+    assert d < 1e-3, (tuple(round(c, 4) for c in q), d)
+    assert abs(q.y) < 1e-3, q
+    out("  on_curve solve     OK  (3,2,0) -> (%.3f,%.3f,%.3f) d=%.2e"
+        % (q.x, q.y, q.z, d))
+
+
+def test_snaputil_collect_intersection_points():
+    """collect_intersection_points must find the TRUE crossing of two
+    edges that actually meet in 3D, reject a near-miss pair beyond `tol`,
+    and skip entirely once fed more than `max_edges` (cost control)."""
+    from rfstudio import snaputil
+    e1 = Part.Edge(Part.LineSegment(Vector(-5, 0, 0), Vector(5, 0, 0)))
+    e2 = Part.Edge(Part.LineSegment(Vector(0, -5, 0), Vector(0, 5, 0)))
+    hits = snaputil.collect_intersection_points([e1, e2])
+    assert len(hits) == 1, hits
+    assert hits[0].distanceToPoint(Vector(0, 0, 0)) < 1e-6, hits[0]
+
+    # a pair whose bounding boxes don't overlap -> broad-phase rejects it,
+    # no crossing reported
+    e3 = Part.Edge(Part.LineSegment(Vector(100, 100, 0), Vector(105, 100, 0)))
+    hits2 = snaputil.collect_intersection_points([e1, e3])
+    assert hits2 == [], hits2
+
+    # too many candidate edges -> skipped outright rather than doing an
+    # expensive O(n^2) scan
+    many = [e1, e2] + [Part.Edge(Part.LineSegment(Vector(i, i, 0), Vector(i+1, i, 0)))
+                       for i in range(70)]
+    hits3 = snaputil.collect_intersection_points(many, max_edges=60)
+    assert hits3 == [], "expected max_edges guard to skip a 72-edge scan"
+    out("  intersection pts   OK  crossing=(0,0,0), bbox-reject + max_edges guard hold")
+
+
+def test_snaputil_collect_strong_snap_points_includes_intersections():
+    """collect_strong_snap_points must combine exact discrete points
+    (vertices/control points/knots) with true curve-curve intersections
+    from the OTHER objects in the document."""
+    from rfstudio import snaputil
+    doc = FreeCAD.newDocument("snaputil_strong_test") if hasattr(FreeCAD, "newDocument") \
+        else None
+    if doc is None:
+        out("  strong snap pts    SKIP (no document API available)")
+        return
+    try:
+        a = doc.addObject("Part::Feature", "A")
+        a.Shape = Part.makeLine(Vector(-5, 0, 0), Vector(5, 0, 0))
+        b = doc.addObject("Part::Feature", "B")
+        b.Shape = Part.makeLine(Vector(0, -5, 0), Vector(0, 5, 0))
+        doc.recompute()
+        pts = snaputil.collect_strong_snap_points(doc, exclude=None)
+        # both lines' endpoints (4 exact vertices) plus their crossing at origin
+        crossing_found = any(p.distanceToPoint(Vector(0, 0, 0)) < 1e-6 for p in pts)
+        assert crossing_found, "expected the A/B crossing point among strong candidates"
+        endpoint_found = any(p.distanceToPoint(Vector(5, 0, 0)) < 1e-6 for p in pts)
+        assert endpoint_found, "expected line A's endpoint among strong candidates"
+        out("  strong snap pts    OK  n=%d includes crossing + endpoints" % len(pts))
+    finally:
+        FreeCAD.closeDocument(doc.Name)
+
+
+class _FakeOrthoView(object):
+    """Minimal stand-in for a View3DInventor: a fixed top-down orthographic
+    view along -Z, just enough for pick_ray/screen_project to run for real
+    outside the FreeCAD Gui. getPoint/getPointOnScreen are exact inverses
+    of each other (both just drop/restore Z), so this exercises the ACTUAL
+    nearest_snap_ranked/nearest_exact_snap/nearest_snap code paths headlessly
+    instead of only asserting the rule they're supposed to encode."""
+    def getPoint(self, sx, sy):
+        return Vector(sx, sy, 0)
+
+    def getCameraType(self):
+        return "Orthographic"
+
+    def getViewDirection(self):
+        return Vector(0, 0, -1)
+
+    def getPointOnScreen(self, vec):
+        return (vec.x, vec.y)
+
+
+def test_snaputil_vertex_beats_closer_edge_point():
+    """Vertex/endpoint priority: nearest_snap_ranked must return an exact
+    discrete candidate (e.g. a curve endpoint) over an on-edge projection
+    that is geometrically closer to the cursor, as long as the discrete
+    candidate is also within the pixel tolerance -- mirroring Blender's
+    'a vertex hit beats an edge hit within threshold' rule. Runs the REAL
+    ranked-snap code path via a fake orthographic view (see _FakeOrthoView),
+    not a simulation of its rule."""
+    from rfstudio import snaputil
+    view = _FakeOrthoView()
+    # cursor at screen (0.05, 0); an edge passes at x=0.02 (closer to the
+    # cursor than the vertex at the origin), but the vertex is ALSO within
+    # tolerance -- it must win.
+    pos = (0.05, 0.0)
+    vertex = Vector(0.0, 0, 0)
+    edge = Part.Edge(Part.LineSegment(Vector(0.02, 1, 0), Vector(0.02, -1, 0)))
+    max_px = 0.5   # generous tolerance in this synthetic 1-unit-per-px view
+
+    # sanity: the edge really is screen-closer to the cursor than the vertex
+    edge_only = snaputil.nearest_exact_snap(view, [edge], pos, max_px)
+    assert edge_only is not None
+    assert abs(edge_only.x - 0.02) < 1e-9, edge_only
+    assert abs(pos[0] - 0.02) < abs(pos[0] - 0.0), "edge should be screen-closer"
+
+    ranked = snaputil.nearest_snap_ranked(view, [vertex], [edge], pos, max_px)
+    assert ranked is not None
+    assert ranked.distanceToPoint(vertex) < 1e-9, \
+        "expected the exact vertex to win over the closer on-edge point, got %r" % (ranked,)
+
+    # and when the vertex is OUT of tolerance, the edge projection still wins
+    far_vertex = Vector(100, 100, 0)
+    ranked2 = snaputil.nearest_snap_ranked(view, [far_vertex], [edge], pos, max_px)
+    assert ranked2 is not None and abs(ranked2.x - 0.02) < 1e-9, ranked2
+    out("  vertex priority    OK  in-tol vertex wins; out-of-tol falls to edge")
 
 
 def test_review_recommendation_classifies_outcomes():
@@ -1760,6 +1948,12 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_rail_roundtrip_clamped, test_rail_roundtrip_explicit_knots,
               test_rails_to_edges,
               test_snaputil_seg_dist, test_snaputil_collect_snap_points,
+              test_snaputil_ray_snap_is_depth_accurate,
+              test_snaputil_axis_snap_stays_on_axis,
+              test_on_curve_constraint_pulls_point_onto_edge,
+              test_snaputil_collect_intersection_points,
+              test_snaputil_collect_strong_snap_points_includes_intersections,
+              test_snaputil_vertex_beats_closer_edge_point,
               test_clean_patch_44_exact_control_net,
               test_clean_patch_66_exact_control_net,
               test_clean_patch_rejects_wrong_grid_size,
