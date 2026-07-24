@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Vendored / stray junk (not part of the workbench)
+UserskelvnAppDataLocalhermeshermes-agentvenvLibsite-packages/
+CUserskelvn*core.py
+C:Userskelvn*core.py
+
+# Editor
+.vscode/
+.vs/

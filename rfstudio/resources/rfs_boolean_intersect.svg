@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="Layer_1" xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 64 64">
+  <!-- Generator: Adobe Illustrator 30.0.0, SVG Export Plug-In . SVG Version: 2.1.1 Build 123)  -->
+  <defs>
+    <style>
+      .st0 {
+        stroke: #6fbf3f;
+      }
+
+      .st0, .st1, .st2 {
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      .st0, .st2 {
+        fill: none;
+        stroke-width: 5px;
+      }
+
+      .st1 {
+        fill: #fc5;
+        fill-opacity: .5;
+        stroke: #fc5;
+        stroke-width: 2px;
+      }
+
+      .st3 {
+        fill: #dd34cf;
+        font-family: NotoSerifLao-Bold, 'Noto Serif Lao';
+        font-size: 58.5px;
+        font-weight: 700;
+      }
+
+      .st2 {
+        stroke: #3fa9dd;
+      }
+    </style>
+  </defs>
+  <g>
+    <path class="st2" d="M12,12h20v40H12V12Z"/>
+    <path class="st0" d="M32,12h20v40h-20V12Z"/>
+    <path class="st1" d="M32,12v40h0V12Z"/>
+  </g>
+  <text class="st3" transform="translate(20.5 58.7)"><tspan x="0" y="0">I</tspan></text>
+</svg>
