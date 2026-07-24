@@ -1,15 +1,27 @@
 # -*- coding: utf-8 -*-
-"""True surface-surface trim (RFS_TrimByIntersection)."""
+"""Surface trimming and sketch-on-surface projection."""
 
-from __future__ import annotations
-
+import math
 import Part
+import FreeCAD                      # Console only -- not Gui, works headless
 from FreeCAD import Vector
 
-from .curve import _face_from_input
-from .trim_sketch import trim_face
+from .util import (_face_from_input)
+from .curves import (interpolate_curve)
 
 
+
+# --- true surface-surface trim (RFS_TrimByIntersection) ------------------ #
+# trim_face (above) only trims to a wire that's ALREADY on the face or
+# projectable onto it. The "intersect two faces, trim BOTH" use case
+# (the operation a real user does by hand today as TWO trim_face calls
+# + manual curve selection) was missing entirely. This fills that gap
+# with a one-call function: take two faces, intersect them via
+# Part.Shape.section, trim each to the side of the intersection
+# containing the OTHER face, return both trimmed faces AND the
+# intersection wire (so the caller can immediately fillet the new edge,
+# for example -- see the composability argument in issues.md: "no true
+# surface-surface trim").
 def trim_faces_by_intersection(face_a, face_b, tol=1e-4):
     """Intersect two faces and trim BOTH to the intersection curve.
 
@@ -71,8 +83,8 @@ def trim_faces_by_intersection(face_a, face_b, tol=1e-4):
         section = None
     if section is None:
         try:
-            import FreeCAD
-            section = FreeCAD.Part.Shape(fa).section(FreeCAD.Part.Shape(fb))
+            from FreeCAD import Part as _Part
+            section = _Part.Shape(fa).section(_Part.Shape(fb))
         except Exception as exc:
             raise ValueError(
                 "trim_faces_by_intersection: Shape.section failed (%s) -- "
@@ -128,3 +140,89 @@ def trim_faces_by_intersection(face_a, face_b, tol=1e-4):
             "(a known Shape.section limitation on certain trimmed inputs; "
             "see trim_face's docstring for the projection fallback)" % exc)
     return trimmed_a, trimmed_b, intersection_wire
+
+
+
+# --- surface trim + sketch-on-surface (native RFS_Trim / RFS_SketchOnSurf) #
+def trim_face(face, wire, tol=1e-4):
+    """Trim `face` to `wire`'s boundary. Native replacement for Curves'
+    'Trim' command (RFS_Trim).
+
+    Fast path: if `wire` already lies on face's surface (the common case --
+    e.g. a curve produced by project_wire_onto_face below, or a curve drawn
+    directly on the surface via SketchOnSurf), OCCT can build the trimmed
+    face directly from (surface, wire) with Part.Face -- this is the exact
+    primitive OCCT provides for "a surface bounded by a wire on it", no
+    boolean operation needed, and it's exact rather than tessellated.
+
+    Fallback: if the wire is off-surface (drawn in a different plane, not
+    yet projected), we don't have a general BRepProj_Projection binding
+    available, so instead project each wire edge onto the face by nearest-
+    point search (same technique as project_wire_onto_face) and retry the
+    fast path once the wire is on-surface.
+    """
+    surf = face.Surface
+    try:
+        return Part.Face(surf, wire)
+    except Exception:
+        pass
+    projected = project_wire_onto_face(face, wire, closed=_is_closed_wire(wire))
+    return Part.Face(surf, Part.Wire(projected.Edges))
+
+
+
+def _is_closed_wire(wire):
+    try:
+        vs = wire.Vertexes
+        return bool(vs) and vs[0].Point.distanceToPoint(vs[-1].Point) < 1e-7
+    except Exception:
+        return False
+
+
+
+def project_wire_onto_face(face, wire, n=60, closed=None):
+    """Project `wire` onto `face`'s surface and rebuild it there as an
+    interpolating B-spline. Native replacement for Curves' 'SoS' /
+    Sketch-on-Surface (RFS_SketchOnSurf).
+
+    FreeCAD's Part.Shape has no direct Python binding for OCCT's general
+    surface projection (BRepProj_Projection); what IS exposed is
+    `Vertex.distToShape`, which returns the closest point ON a shape to a
+    given point -- exact for the "project this point onto that face"
+    question when the point is reasonably close to the face (true for the
+    normal "sketch drawn near/on the intended surface" use case). So we
+    sample the wire, project every sample with distToShape, and refit --
+    the same sample-and-refit idiom the rest of this module already uses
+    (see _nearest_t, _closest_approach_pair) rather than reaching for a
+    binding that isn't available.
+    """
+    if closed is None:
+        closed = _is_closed_wire(wire)
+    edges = wire.Edges if hasattr(wire, "Edges") else [wire]
+    if not edges:
+        raise ValueError("project_wire_onto_face: wire has no edges")
+    pts = []
+    per_edge = max(2, n // max(1, len(edges)))
+    for e in edges:
+        fp, lp = e.FirstParameter, e.LastParameter
+        for k in range(per_edge):
+            t = k / float(per_edge - 1) if per_edge > 1 else 0.0
+            p = e.valueAt(fp + t * (lp - fp))
+            dist, pts_on, _info = Part.Vertex(p).distToShape(face)
+            pts.append(pts_on[0][1] if pts_on else p)
+    # de-duplicate consecutive coincident points (shared edge endpoints)
+    dedup = [pts[0]]
+    for p in pts[1:]:
+        if p.distanceToPoint(dedup[-1]) > 1e-7:
+            dedup.append(p)
+    if len(dedup) < 2:
+        raise ValueError("project_wire_onto_face: projection collapsed to "
+                         "a single point")
+    return interpolate_curve(dedup, closed=closed)
+
+__all__ = [
+    'trim_faces_by_intersection',
+    'trim_face',
+    '_is_closed_wire',
+    'project_wire_onto_face',
+]
