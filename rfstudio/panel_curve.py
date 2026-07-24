@@ -339,6 +339,13 @@ class CurvePanel(_EditPanelBase):
         self.coincide_btn.clicked.connect(self._add_coincidence_constraint)
         btn_layout.addWidget(self.coincide_btn)
 
+        self.on_curve_btn = QtWidgets.QPushButton("On Curve")
+        self.on_curve_btn.setToolTip(
+            "Pin the selected point(s) onto a curve: select the point row(s) "
+            "here, then select a target edge in the 3D view, then click.")
+        self.on_curve_btn.clicked.connect(self._add_on_curve_constraint)
+        btn_layout.addWidget(self.on_curve_btn)
+
         constraints_layout.addLayout(btn_layout)
 
         # Constraint list
@@ -1246,11 +1253,13 @@ class CurvePanel(_EditPanelBase):
                                          % exc)
 
     def _collect_snap_cands(self):
-        """Snap candidates from all other objects (shared with
-        editmode.PointEditor -- see snaputil.collect_snap_points; this used
-        to be a hand-duplicated copy of that logic)."""
-        return snaputil.collect_snap_points(self.obj.Document,
-                                            exclude=self.obj)
+        """EXACT high-priority discrete snap targets from all other objects
+        -- vertices, control points, knots, and true curve-curve
+        intersections (snaputil.collect_strong_snap_points), samples off.
+        These win over an on-edge projection in the ranked snap. Shared with
+        editmode.PointEditor."""
+        return snaputil.collect_strong_snap_points(self.obj.Document,
+                                                   exclude=self.obj)
 
     def _collect_snap_shapes(self):
         """Edges from all other objects, for EXACT perpendicular-
@@ -1309,10 +1318,10 @@ class CurvePanel(_EditPanelBase):
             if view is None:
                 return
             pos = ev["Position"]
-            best = snaputil.nearest_exact_snap(
-                view, getattr(self, "_snap_shapes", []), pos, 18.0)
-            if best is None:
-                best = snaputil.nearest_snap(view, self._snap_cands, pos, 18.0)
+            snap_px = snaputil._snap_tolerance_mm(view, 4.0)
+            best = snaputil.nearest_snap_ranked(
+                view, self._snap_cands, getattr(self, "_snap_shapes", []),
+                pos, snap_px)
             self._snap_pt = best
             if self._snap_coin_root is not None:
                 if best is not None:
@@ -1380,10 +1389,10 @@ class CurvePanel(_EditPanelBase):
             if view is None:
                 return
             pos = ev["Position"]
-            best = snaputil.nearest_exact_snap(
-                view, getattr(self, "_snap_shapes", []), pos, 18.0)
-            if best is None:
-                best = snaputil.nearest_snap(view, self._snap_cands, pos, 18.0)
+            snap_px = snaputil._snap_tolerance_mm(view, 4.0)
+            best = snaputil.nearest_snap_ranked(
+                view, self._snap_cands, getattr(self, "_snap_shapes", []),
+                pos, snap_px)
             self._snap_pt = best
             if self._snap_coin_root is not None:
                 if best is not None:
@@ -1687,6 +1696,53 @@ class CurvePanel(_EditPanelBase):
         self.constraints.append(('coincide', rows[0], rows[1]))
         self._update_constraint_list()
 
+    def _target_edge_from_selection(self):
+        """The first Part edge currently selected in the 3D view that is
+        NOT this curve, or None. Prefers an explicitly sub-selected edge
+        (Object.Edge3); accepts a whole object only if its shape has
+        exactly one edge (unambiguous)."""
+        import Part
+        try:
+            sels = FreeCADGui.Selection.getSelectionEx(self.obj.Document.Name)
+        except Exception:
+            sels = []
+        for s in sels:
+            if getattr(s, "Object", None) is self.obj:
+                continue
+            for sub in (getattr(s, "SubObjects", None) or ()):
+                if isinstance(sub, Part.Edge):
+                    return sub
+        for s in sels:
+            if getattr(s, "Object", None) is self.obj:
+                continue
+            shp = getattr(getattr(s, "Object", None), "Shape", None)
+            edges = getattr(shp, "Edges", None) if shp else None
+            if edges and len(edges) == 1:
+                return edges[0]
+        return None
+
+    def _add_on_curve_constraint(self):
+        """Pin the selected point row(s) onto a target edge selected in the
+        3D view (Feature: point-on-curve constraint). Stores
+        ('on_curve', point_index, edge) per selected row and re-solves."""
+        rows = self._selected_rows()
+        if not rows:
+            FreeCAD.Console.PrintWarning(
+                "Railform: select the point row(s) to pin, then a target "
+                "edge in the 3D view, then click On Curve.\n")
+            return
+        edge = self._target_edge_from_selection()
+        if edge is None:
+            FreeCAD.Console.PrintWarning(
+                "Railform: select a target edge in the 3D view (a single "
+                "curve/edge, not this curve) before clicking On Curve.\n")
+            return
+        for row in rows:
+            self.constraints.append(('on_curve', row, edge))
+        self._update_constraint_list()
+        # apply immediately so the point visibly lands on the curve
+        self._set_points(self._apply_constraints(self._points()))
+
     def _remove_constraint(self):
         """Remove selected constraint from the list."""
         current_row = self.constraint_list.currentRow()
@@ -1708,6 +1764,8 @@ class CurvePanel(_EditPanelBase):
                 text = f"Angle: P{constraint[1]}-P{constraint[2]}-P{constraint[3]} = {constraint[4]:.1f}°"
             elif constraint[0] == 'coincide':
                 text = f"Coincide: P{constraint[1]} <-> P{constraint[2]}"
+            elif constraint[0] == 'on_curve':
+                text = f"On curve: P{constraint[1]} ∈ edge"
             else:
                 text = str(constraint)
             self.constraint_list.addItem(text)
@@ -1879,6 +1937,23 @@ class CurvePanel(_EditPanelBase):
                         if p1.distanceToPoint(p2) > 0.001:
                             adjusted_points[idx1] = p2
                             changed = True
+
+                elif constraint[0] == 'on_curve':
+                    # Keep an on-curve point stuck to its target edge while it
+                    # is the one being dragged (live preview of the pin).
+                    idx, edge = constraint[1], constraint[2]
+                    if idx == dragged_point_index:
+                        try:
+                            import Part
+                            p = adjusted_points[idx]
+                            v = p if isinstance(p, FreeCAD.Vector) \
+                                else FreeCAD.Vector(p[0], p[1], p[2])
+                            d, near, _ = Part.Vertex(v).distToShape(edge)
+                            if d > 0.001 and near:
+                                adjusted_points[idx] = near[0][1]
+                                changed = True
+                        except Exception:
+                            pass
 
             # If no changes in this iteration, we've converged
             if not changed:

@@ -41,6 +41,8 @@ def _constraint_point_indices(c):
         return (c[1], c[2], c[3])
     if kind == "coincide":
         return (c[1], c[2])
+    if kind == "on_curve":
+        return (c[1],)
     return ()
 
 
@@ -76,6 +78,16 @@ def _constraint_residuals(pts, constraints):
             res.append(p1.x - p2.x)
             res.append(p1.y - p2.y)
             res.append(p1.z - p2.z)
+        elif kind == "on_curve":
+            # distance from the point to a FIXED target edge/shape (c[2]),
+            # driven to zero -> the point is pulled onto the curve. The
+            # target geometry is held constant, so this is a one-sided
+            # residual on p_i only (see _constraint_point_indices).
+            try:
+                d = Part.Vertex(pts[c[1]]).distToShape(c[2])[0]
+            except Exception:
+                d = 0.0
+            res.append(d)
     return res
 
 
@@ -122,6 +134,16 @@ def _relax_point_constraints(pts, constraints, pinned, max_iter):
                     if j not in pinned:
                         pts[j] = mid
                     changed = True
+            elif kind == "on_curve":
+                i, edge = c[1], c[2]
+                if i not in pinned:
+                    try:
+                        d, near, _ = Part.Vertex(pts[i]).distToShape(edge)
+                        if d > 1e-3 and near:
+                            pts[i] = near[0][1]   # snap onto the target edge
+                            changed = True
+                    except Exception:
+                        pass
         if not changed:
             break
     return pts
@@ -139,6 +161,7 @@ def solve_point_constraints(points, constraints, pinned=None, tol=1e-16,
       ("vertical",   i, x)          -- p_i.x == x
       ("angle", i, vertex, k, deg)  -- angle(p_i, vertex, p_k) == deg
       ("coincide", i, j)            -- p_i == p_j
+      ("on_curve", i, edge)         -- p_i lies on the fixed Part edge/shape
 
     `pinned`: iterable of point indices to hold fixed (e.g. the point the
                  user is dragging). Points not referenced by ANY constraint

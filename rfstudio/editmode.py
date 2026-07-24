@@ -75,8 +75,7 @@ _HALF_PI = math.pi / 2.0
 
 _AXES = (Vector(1, 0, 0), Vector(0, 1, 0), Vector(0, 0, 1))
 _AXIS_RGB = ((0.95, 0.25, 0.25), (0.35, 0.85, 0.35), (0.30, 0.55, 1.0))
-_PICK_PX = 14.0          # screen pick tolerance
-_SNAP_PX = 18.0          # snap-to-existing-point tolerance
+# Pick and snap tolerances are now instance-specific, computed in __init__ based on screen DPI.
 
 # Thin local alias so the rest of this file reads the same as before the
 # dedup -- the implementation now lives in snaputil.py (shared with
@@ -116,11 +115,20 @@ class PointEditor(object):
         self.obj = vobj.Object
         doc = FreeCADGui.ActiveDocument
         self.view = doc.ActiveView if doc is not None else None
+        # Compute DPI-aware tolerances
+        if self.view is not None:
+            self._snap_px = snaputil._snap_tolerance_mm(self.view, 4.0)   # 4 mm
+            self._pick_px = snaputil._snap_tolerance_mm(self.view, 2.5) # 2.5 mm
+        else:
+            self._snap_px = 18.0
+            self._pick_px = 14.0
         self.sel = 0
         self.drag = None
         self._watchdog = None
         self._snap_pts = []
         self._snap_shapes = []
+        self._hover_pts_cache = None    # lazily built for hover-snap preview
+        self._hover_shapes_cache = None
         self._sym_pairs = None      # {idx: partner_idx} or None (off)
         self._sym_plane = None      # (base, normal) or None
         self.on_commit = None       # called after each drag commit (panel refresh)
@@ -402,13 +410,16 @@ class PointEditor(object):
 
     # ---- snap ---- #
     def _snap_candidates(self):
-        """Points from all other objects: control points, vertices,
-        sampled on-curve positions, and knot positions, so the user can
-        snap onto any curve's discrete features. Delegates to snaputil
-        (shared with taskpanels.CurvePanel's 3D pick mode -- previously
-        this logic was hand-duplicated in both places)."""
-        return snaputil.collect_snap_points(self.obj.Document,
-                                            exclude=self.obj)
+        """EXACT high-priority discrete targets from all other objects:
+        control points, vertices, knot positions, and true curve-curve
+        intersections (see snaputil.collect_strong_snap_points). These win
+        over a generic on-edge projection in _snap. Coarse arc-length
+        samples are intentionally excluded -- the exact ray->edge path
+        already covers 'anywhere on a curve' precisely, so a sample could
+        only pull a snap OFF the true curve. Shared with CurvePanel's 3D
+        pick mode."""
+        return snaputil.collect_strong_snap_points(self.obj.Document,
+                                                   exclude=self.obj)
 
     def _snap_shape_candidates(self):
         """Edges from all other objects, for EXACT perpendicular-
@@ -420,17 +431,36 @@ class PointEditor(object):
                                              exclude=self.obj)]
 
     def _snap(self, pos):
-        """Return the snapped point within _SNAP_PX screen pixels, or
-        None. Tries the exact on-curve projection first (any point along
-        another curve's real geometry); falls back to the discrete
-        candidate list (control points, vertices, samples, knots) for
-        targets that aren't necessarily ON a curve, e.g. a ControlCurve's
-        control polygon."""
-        exact = snaputil.nearest_exact_snap(
-            self.view, getattr(self, "_snap_shapes", []), pos, _SNAP_PX)
-        if exact is not None:
-            return exact
-        return snaputil.nearest_snap(self.view, self._snap_pts, pos, _SNAP_PX)
+        """Return the snapped point within self._snap_px screen pixels, or
+        None. Vertex/endpoint priority: an EXACT discrete target (vertex,
+        control point, knot, or curve-curve intersection) within tolerance
+        always wins over a generic on-edge projection -- only if none is in
+        range do we fall to the exact point anywhere along a curve's real
+        geometry (see snaputil.nearest_snap_ranked)."""
+        return snaputil.nearest_snap_ranked(
+            self.view, self._snap_pts, getattr(self, "_snap_shapes", []),
+            pos, self._snap_px)
+
+    def _hover_snap_candidates(self):
+        """(shapes, points) for the hover-snap preview, built lazily and
+        cached so a hover doesn't re-scan every object each mouse move. The
+        cache is invalidated at the end of each drag (see _release), since
+        the edited curve's geometry changes there.
+
+        Separate from the drag-time _snap_pts/_snap_shapes (which are
+        rebuilt at drag start) precisely so a preview can run BEFORE any
+        drag begins -- the whole point of the hover preview."""
+        if self._hover_shapes_cache is None:
+            try:
+                self._hover_shapes_cache = [
+                    e for e, _o in snaputil.collect_snap_shapes(
+                        self.obj.Document, exclude=self.obj)]
+                self._hover_pts_cache = snaputil.collect_strong_snap_points(
+                    self.obj.Document, exclude=self.obj)
+            except Exception:
+                self._hover_shapes_cache = []
+                self._hover_pts_cache = []
+        return self._hover_shapes_cache, self._hover_pts_cache
 
     # ---- symmetric editing (model only half) ------------------------- #
     def set_symmetry(self, plane_base, plane_normal, tol=1e-4):
@@ -471,9 +501,9 @@ class PointEditor(object):
         # drags disable snapping) killed snap-to-curve. Treat the marker itself
         # as a POINT grab, and only count the OUTER part of each arrow as an
         # axis handle.
-        if ((pos[0] - sp[0]) ** 2 + (pos[1] - sp[1]) ** 2) ** 0.5 <= _PICK_PX:
+        if ((pos[0] - sp[0]) ** 2 + (pos[1] - sp[1]) ** 2) ** 0.5 <= self._pick_px:
             return None
-        best, bestd = None, _PICK_PX
+        best, bestd = None, self._pick_px
         for i, a in enumerate(_AXES):
             tip = self._screen(Vector(p.x + a.x * L, p.y + a.y * L, p.z + a.z * L))
             if tip is None:
@@ -486,7 +516,7 @@ class PointEditor(object):
         return best
 
     def _pick_point(self, pos):
-        best, bestd = None, _PICK_PX
+        best, bestd = None, self._pick_px
         for i, p in enumerate(self._points()):
             sp = self._screen(p)
             if sp is None:
@@ -601,8 +631,7 @@ class PointEditor(object):
                     if axis is not None:
                         # Axis-locked: place the point at the closest point on
                         # the axis line to the cursor ray (exact, no depth-scale
-                        # error). Snapping is disabled while locked so the axis
-                        # constraint is never silently broken.
+                        # error).
                         a = _AXES[axis]
                         try:
                             ro = self.view.getPoint(pos[0], pos[1])
@@ -611,7 +640,22 @@ class PointEditor(object):
                         except Exception:
                             g = self.view.getPoint(pos[0], pos[1])
                             newp = p0 + a * (g - self.drag["g0"]).dot(a)
-                        self._snap_switch.whichChild = -1
+                        # Snap to where the drag axis crosses another curve.
+                        # The snapped point stays ON the axis line, so the
+                        # axis constraint is preserved -- this snaps WITHIN
+                        # the lock, it doesn't break it. (Previously snapping
+                        # was disabled entirely while axis-locked, which is
+                        # what made "drag a point onto that line" impossible.)
+                        snapped = snaputil.nearest_axis_snap(
+                            self.view, p0, a,
+                            getattr(self, "_snap_shapes", []), pos, self._snap_px)
+                        if snapped is not None:
+                            newp = snapped
+                            self._snap_coord.point.set1Value(
+                                0, snapped.x, snapped.y, snapped.z)
+                            self._snap_switch.whichChild = 0
+                        else:
+                            self._snap_switch.whichChild = -1
                     else:
                         # Free drag in the view plane, with snap-to-other-curves.
                         g = self.view.getPoint(pos[0], pos[1])
@@ -663,6 +707,25 @@ class PointEditor(object):
                 self.hover_handle != old_hover_handle):
                 # Trigger a redraw to show hover highlight
                 self._update_hover_highlight()
+
+            # Hover-snap preview: light up the snap marker when the cursor is
+            # near another curve, BEFORE any drag starts, so snapping is
+            # discoverable (and you can see which target will be grabbed).
+            # Suppressed while hovering directly over our own point/handle so
+            # it doesn't fight the deletion/edit hover cues.
+            if (not self.creating and self.hover_point is None
+                    and self.hover_handle is None):
+                shapes, dpts = self._hover_snap_candidates()
+                snapped = snaputil.nearest_snap_ranked(
+                    self.view, dpts, shapes, pos, self._snap_px)
+                if snapped is not None:
+                    self._snap_coord.point.set1Value(
+                        0, snapped.x, snapped.y, snapped.z)
+                    self._snap_switch.whichChild = 0
+                else:
+                    self._snap_switch.whichChild = -1
+            elif self._snap_switch.whichChild != -1:
+                self._snap_switch.whichChild = -1
 
         except Exception:
             pass
@@ -1172,6 +1235,10 @@ class PointEditor(object):
         self._snap_switch.whichChild = -1
         self._snap_pts = []
         self._snap_shapes = []
+        # The edited curve just changed shape -> drop the hover-snap cache so
+        # the preview rebuilds against current geometry on the next hover.
+        self._hover_pts_cache = None
+        self._hover_shapes_cache = None
         # Persist the drag. Bezier-handle drags already wrote themselves back in
         # _edit_bezier_handle (live), so only a point/axis drag needs its final
         # marker position committed to obj.Points. (Previously _release never
@@ -1784,7 +1851,7 @@ class KnotEditor(object):
     def _pick_knot(self, pos):
         """Find the knot whose rendered marker is nearest the cursor screen px."""
         ks = self._knots()
-        best, bestd = -1, _PICK_PX
+        best, bestd = -1, self._pick_px
         for i, t in enumerate(ks):
             p = self._value_at_t(t)
             if p is None:
@@ -1824,10 +1891,10 @@ class KnotEditor(object):
         # through to _pick_knot's normal (unconstrained) drag instead.
         d_anchor = ((pos[0] - sp_anchor[0]) ** 2
                    + (pos[1] - sp_anchor[1]) ** 2) ** 0.5
-        if d_anchor < _PICK_PX:
+        if d_anchor < self._pick_px:
             return None
         d = _seg_dist(pos, sp_anchor, sp_tip)
-        return (sp_anchor, sp_tip) if d < _PICK_PX else None
+        return (sp_anchor, sp_tip) if d < self._pick_px else None
 
     # ---- events ---- #
     def _on_button(self, ev):
@@ -2502,7 +2569,7 @@ class CornerFilletEditor(object):
         return snaputil.screen_project(self.view, vec)
 
     def _pick(self, pos):
-        best, bestd = None, _PICK_PX
+        best, bestd = None, self._pick_px
         for i in self._idx_order:
             p = self._handle_point(i)
             if p is None:
@@ -2843,7 +2910,7 @@ class SurfaceEditor(object):
 
                     # Calculate distance to cursor
                     d = ((sp[0] - pos[0]) ** 2 + (sp[1] - pos[1]) ** 2) ** 0.5
-                    if d < best_dist and d < _PICK_PX:
+                    if d < best_dist and d < self._pick_px:
                         best_dist = d
                         best_u, best_v = u, v
 
