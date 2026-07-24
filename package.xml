@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
+  <name>Railform Studio</name>
+  <description>Curated curve-to-surface workbench: depends on Curves + Silk, presents them under one workflow-ordered UX, adds Blender Railform rail import.</description>
+  <version>0.0.1</version>
+  <date>2026-06-27</date>
+  <maintainer email="fkemuntoh@gmail.com">Kelvin</maintainer>
+  <license file="LICENSE">GPL-3.0-or-later</license>
+  <freecadmin>1.0</freecadmin>
+  <content>
+    <workbench>
+      <classname>RailformStudioWorkbench</classname>
+      <subdirectory>./</subdirectory>
+      <description>Curated surfacing over Curves + Silk</description>
+    </workbench>
+  </content>
+  <!-- depend-and-wrap: these must be installed for full functionality -->
+  <depend type="addon">Curves</depend>
+  <depend type="addon">Silk</depend>
+</package>
