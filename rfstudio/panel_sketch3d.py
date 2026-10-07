@@ -586,9 +586,9 @@ def _resolve_sources(doc, refs):
 
 
 class _PointRow(object):
-    """One row of the point table: X/Y/Z spinboxes + delete button."""
+    """One row of the point table: X/Y/Z spinboxes + plane selector + delete button."""
 
-    def __init__(self, panel, x=0.0, y=0.0, z=0.0):
+    def __init__(self, panel, x=0.0, y=0.0, z=0.0, plane_idx=0):
         self.panel = panel
         self.widget = QtWidgets.QWidget()
         lay = QtWidgets.QHBoxLayout(self.widget)
@@ -607,6 +607,14 @@ class _PointRow(object):
         b.setFixedWidth(24)
         b.clicked.connect(self._del)
         lay.addWidget(b)
+
+        # Plane selector (issues.md #11: multi-plane 3D sketch)
+        lay.addWidget(QtWidgets.QLabel("Π"))
+        self.plane = QtWidgets.QComboBox()
+        self.plane.addItems(["Global", "Local 1", "Local 2", "Local 3"])
+        self.plane.setToolTip("Construction plane for this point (issues.md #11)")
+        self.plane.currentIndexChanged.connect(panel._table_changed)
+        lay.addWidget(self.plane)
 
         # Segment entity to the NEXT point (Line/Arc/Spline) + bulge for arcs
         lay.addWidget(QtWidgets.QLabel("→"))
@@ -674,6 +682,11 @@ class Sketch3DPanel(object):
         # ('' = free point) + the plane they were projected onto.
         self._proj_refs = []
         self._proj_plane = None
+        # Issue #11: per-point construction planes (multi-plane 3D sketch)
+        # list of plane indices per row (0 = global, 1+ = local planes)
+        self._point_planes = []
+        # Local planes: list of (origin, normal, u_dir, v_dir) for indices 1+
+        self._local_planes = []
         self._undo_stack = []
         self._undo_guard = False
         self._handoff_target = None
@@ -896,7 +909,30 @@ class Sketch3DPanel(object):
                               "body moves (issue #7)")
         onsurf_btn.clicked.connect(lambda: self._apply_relation("onsurf"))
         rel_row.addWidget(onsurf_btn)
+        tangent_face_btn = QtWidgets.QPushButton("Tangent to face")
+        tangent_face_btn.setToolTip("Constrain the chosen point's direction (pt# -> pt#+1) "
+                                    "to be tangent to the selected face -- adds a "
+                                    "tangent_to_face solver constraint (issue #7)")
+        tangent_face_btn.clicked.connect(self._apply_tangent_face)
+        rel_row.addWidget(tangent_face_btn)
         self.adv_tools.content_layout.addLayout(rel_row)
+
+        # --- multi-plane 3D sketch (issues.md #11) -------------------------- #
+        plane_row = QtWidgets.QHBoxLayout()
+        plane_row.addWidget(QtWidgets.QLabel("Planes:"))
+        self.plane_create = QtWidgets.QComboBox()
+        self.plane_create.addItems(["Through 3 points", "Offset from face", "Angle to plane"])
+        self.plane_create.setToolTip("Create a new local construction plane")
+        plane_row.addWidget(self.plane_create)
+        create_plane_btn = QtWidgets.QPushButton("Create plane")
+        create_plane_btn.clicked.connect(self._create_local_plane)
+        plane_row.addWidget(create_plane_btn)
+        self.plane_switch = QtWidgets.QPushButton("Switch: Global")
+        self.plane_switch.setCheckable(True)
+        self.plane_switch.setToolTip("Tab: cycle through planes used in this sketch")
+        self.plane_switch.toggled.connect(self._toggle_plane_switch)
+        plane_row.addWidget(self.plane_switch)
+        self.adv_tools.content_layout.addLayout(plane_row)
 
         # --- templates / break-apart/merge / section view ------------------- #
         tool_row2 = QtWidgets.QHBoxLayout()
@@ -1337,13 +1373,15 @@ class Sketch3DPanel(object):
 
     # ------------------------------------------------------------------ #
     # point table
-    def _add_row(self, p=(0.0, 0.0, 0.0)):
+    def _add_row(self, p=(0.0, 0.0, 0.0), plane_idx=0):
         if not getattr(self, "_undo_guard", False):
             self._push_undo()
-        r = _PointRow(self, *p)
+        r = _PointRow(self, *p, plane_idx=plane_idx)
         self._rows.append(r)
         if len(self._proj_refs) < len(self._rows):
             self._proj_refs.append("")   # new rows start free (issue #14)
+        if len(self._point_planes) < len(self._rows):
+            self._point_planes.append(plane_idx)
         self.rows_lay.addWidget(r.widget)
         # Live mirror: auto-append the mirrored counterpart (but never
         # during undo restore, which rebuilds rows under _undo_guard).
@@ -3404,6 +3442,136 @@ class Sketch3DPanel(object):
             self.status.setText(
                 "P%d lies on %s.%s -- follows the face on rebuild "
                 "(issue #7)" % (idx, name, sub))
+
+    def _apply_tangent_face(self):
+        """issues.md #7: add a tangent_to_face solver constraint between
+        pt# and pt#+1 to the selected face. This is a true solver
+        constraint (Jacobian via numeric differentiation), not a
+        re-derive like pierce/onsurf."""
+        idx = self.rel_point.value()
+        if not (0 <= idx < len(self._rows) - 1):
+            self.status.setText(
+                "Tangent to face: pt# %d needs a next point (pt# %d) "
+                "to define the direction" % (idx, idx + 1))
+            return
+        name, sub, face_shape = self._selected_sub()
+        if name is None:
+            self.status.setText("Tangent to face: select a face in the 3D view first")
+            return
+        if not sub.startswith("Face"):
+            self.status.setText("Tangent to face: selection is %r -- pick a FACE" % sub)
+            return
+        # Get the actual face shape
+        try:
+            doc = FreeCAD.ActiveDocument or FreeCAD.newDocument()
+            src = doc.getObject(name)
+            face = src.Shape.getElement(sub)
+        except Exception:
+            self.status.setText("Tangent to face: could not get face geometry")
+            return
+        self._push_undo()
+        # Add constraint: ("tangent_to_face", i, j, face_shape)
+        c = ("tangent_to_face", idx, idx + 1, face)
+        self._constraints.append(c)
+        self.dim_list.addItem("tangent P%d->P%d to %s.%s (solver)"
+                              % (idx, idx + 1, name, sub))
+        self._update_status()
+        self.status.setText("P%d->P%d tangent to %s.%s -- solver constraint"
+                            % (idx, idx + 1, name, sub))
+
+    # --- multi-plane 3D sketch (issues.md #11) -------------------------- #
+    def _create_local_plane(self):
+        """Create a new local construction plane from selection."""
+        mode = self.plane_create.currentText()
+        try:
+            sel = FreeCADGui.Selection.getSelectionEx()
+        except Exception:
+            sel = []
+        if not sel:
+            self.status.setText("Select geometry first (3 points, a face, or face+direction)")
+            return
+
+        if mode == "Through 3 points":
+            pts = []
+            for so in sel:
+                for sub in getattr(so, "SubObjects", []) or []:
+                    if getattr(sub, "ShapeType", "") == "Vertex":
+                        pts.append(FreeCAD.Vector(sub.X, sub.Y, sub.Z))
+            if len(pts) < 3:
+                self.status.setText("Need 3 vertices (points) selected")
+                return
+            p0, p1, p2 = pts[0], pts[1], pts[2]
+            u = (p1 - p0).normalize()
+            v = (p2 - p0).cross(u).normalize()
+            n = u.cross(v).normalize()
+            origin = (p0 + p1 + p2) * (1.0/3.0)
+
+        elif mode == "Offset from face":
+            face_shape = None
+            for so in sel:
+                for sub in getattr(so, "SubObjects", []) or []:
+                    if getattr(sub, "ShapeType", "") == "Face":
+                        face_shape = sub
+                        break
+            if face_shape is None:
+                self.status.setText("Select a face for offset plane")
+                return
+            u0, u1, v0, v1 = face_shape.ParameterRange
+            n = face_shape.normalAt((u0+u1)/2.0, (v0+v1)/2.0)
+            origin = face_shape.CenterOfMass
+            u = n.cross(FreeCAD.Vector(0,0,1)).normalize()
+            if u.Length < 1e-9:
+                u = n.cross(FreeCAD.Vector(0,1,0)).normalize()
+            v = n.cross(u).normalize()
+
+        elif mode == "Angle to plane":
+            face_shape = None
+            for so in sel:
+                for sub in getattr(so, "SubObjects", []) or []:
+                    if getattr(sub, "ShapeType", "") == "Face":
+                        face_shape = sub
+                        break
+            if face_shape is None:
+                self.status.setText("Select a face for angle plane")
+                return
+            u0, u1, v0, v1 = face_shape.ParameterRange
+            n = face_shape.normalAt((u0+u1)/2.0, (v0+v1)/2.0)
+            origin = face_shape.CenterOfMass
+            u = n.cross(FreeCAD.Vector(0,0,1)).normalize()
+            if u.Length < 1e-9:
+                u = n.cross(FreeCAD.Vector(0,1,0)).normalize()
+            v = n.cross(u).normalize()
+
+        else:
+            self.status.setText("Unknown plane creation mode")
+            return
+
+        # Store the new local plane
+        self._local_planes.append((origin, n, u, v))
+        # Update all row plane combos
+        self._refresh_plane_combos()
+        self.status.setText(f"Created local plane #{len(self._local_planes)}")
+
+    def _refresh_plane_combos(self):
+        """Update all point row plane combos with available local planes."""
+        for r in self._rows:
+            current = r.plane.currentText()
+            r.plane.blockSignals(True)
+            r.plane.clear()
+            r.plane.addItem("Global")
+            for i in range(len(self._local_planes)):
+                r.plane.addItem(f"Local {i+1}")
+            idx = r.plane.findText(current)
+            if idx >= 0:
+                r.plane.setCurrentIndex(idx)
+            r.plane.blockSignals(False)
+
+    def _toggle_plane_switch(self, checked):
+        """Toggle plane switching mode (Tab cycles through used planes)."""
+        if checked:
+            self.plane_switch.setText("Switch: Local")
+        else:
+            self.plane_switch.setText("Switch: Global")
 
     # ------------------------------------------------------------------ #
     # task-panel API

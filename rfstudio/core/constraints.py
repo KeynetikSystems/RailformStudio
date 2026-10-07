@@ -58,6 +58,8 @@ def _constraint_point_indices(c):
         return (c[1], c[2], c[3], c[4])
     if kind == "fix":
         return (c[1],)
+    if kind == "tangent_to_face":
+        return (c[1], c[2])
     if kind in ("tangent", "symmetric"):
         return (c[1], c[2], c[3])
     if kind == "concentric":
@@ -109,6 +111,35 @@ def _constraint_residuals(pts, constraints):
             except Exception:
                 d = 0.0
             res.append(d)
+        elif kind == "tangent_to_face":
+            # Tangent to Face: the direction from point i to point j
+            # (i.e., edge i->j) must be tangent to the given face at the
+            # closest point on that face to point i. Residual = dot(dir, n)
+            # where dir = normalize(p_j - p_i) and n = face normal at
+            # closest point on face to p_i. Zero residual -> tangent.
+            try:
+                p_i = pts[c[1]]
+                p_j = pts[c[2]]
+                face = c[3]
+                # Direction vector
+                v = p_j - p_i
+                v_len = v.Length
+                if v_len > 1e-9:
+                    dir_vec = v * (1.0 / v_len)
+                    # Closest point on face to p_i
+                    d = Part.Vertex(p_i).distToShape(face)[0]
+                    closest_on_face = d[1][0][1]  # point on face
+                    # Face normal at closest point
+                    n = face.normalAt(*face.Surface.parameter(closest_on_face))
+                    if n.Length > 1e-9:
+                        n = n * (1.0 / n.Length)
+                        res.append(dir_vec.dot(n))  # zero = tangent
+                    else:
+                        res.append(0.0)
+                else:
+                    res.append(0.0)
+            except Exception:
+                res.append(0.0)
         elif kind == "equal":
             # |p_i - p_j| == |p_k - p_l|: the 'equal-length' relation.
             d1 = pts[c[1]].distanceToPoint(pts[c[2]])
@@ -310,6 +341,32 @@ def _relax_point_constraints(pts, constraints, pinned, max_iter):
                     pts[j] = pts[j] + (want_j - pts[j]) * 0.5; changed = True
             elif kind == "fix":
                 pass   # pinning is handled via the caller's `pinned` set
+            elif kind == "tangent_to_face":
+                # Relaxation: move p_j to make direction tangent to face at p_i
+                i, j = c[1], c[2]
+                if i in pinned or j in pinned:
+                    continue
+                try:
+                    p_i = pts[i]
+                    p_j = pts[j]
+                    face = c[3]
+                    v = p_j - p_i
+                    v_len = v.Length
+                    if v_len > 1e-9:
+                        dir_vec = v * (1.0 / v_len)
+                        closest_on_face = Part.Vertex(p_i).distToShape(face)[1][0][1]
+                        n = face.normalAt(*face.Surface.parameter(closest_on_face))
+                        if n.Length > 1e-9:
+                            n = n * (1.0 / n.Length)
+                            # Project dir onto tangent plane
+                            proj = dir_vec - n * dir_vec.dot(n)
+                            if proj.Length > 1e-9:
+                                proj = proj * (1.0 / proj.Length)
+                                # Move p_j to p_i + proj * |v|
+                                pts[j] = p_i + proj * v_len
+                                changed = True
+                except Exception:
+                    pass
         if not changed:
             break
     return pts
@@ -335,6 +392,8 @@ def solve_point_constraints(points, constraints, pinned=None, tol=1e-16,
       ("fix", i)                    -- pin point i
       ("mirror", i, j, nx, ny, nz, d) -- p_j == reflection of p_i
                                          across plane n.q + d == 0
+      ("tangent_to_face", i, j, face) -- direction p_i->p_j tangent to
+                                          face at closest point to p_i
 
     `pinned`: iterable of point indices to hold fixed (e.g. the point the
                  user is dragging). Points not referenced by ANY constraint
