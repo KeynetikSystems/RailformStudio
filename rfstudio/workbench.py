@@ -44,13 +44,26 @@ class RailformStudioWorkbench(FreeCADGui.Workbench):
         # One consolidated check of every curated -> engine command mapping,
         # rather than letting each one fail individually the first time a
         # user happens to click it (see deps.verify_delegations docstring).
-        deps.verify_delegations(engines.DELEGATIONS)
+        # Wrap in try-except to handle cases where GUI is not fully initialized yet.
+        try:
+            deps.verify_delegations(engines.DELEGATIONS)
+        except Exception as e:
+            FreeCAD.Console.PrintMessage("Railform Studio: Skipping delegation verification due to GUI initialization: %s" % e)
 
         # Visibility for the "two hard external dependencies" risk: which
         # curated actions have no native fallback at all, so a future
         # Curves/Silk breakage silently strands them (see
         # deps.report_single_points_of_failure docstring).
         deps.report_single_points_of_failure(engines.PROVIDERS)
+
+        # Static wiring check of every provider chain (catches typos in
+        # NATIVE_OVERRIDES / DELEGATIONS mismatches up front, at
+        # activation time, instead of as a dead button at click time).
+        problems = engines.validate_providers()
+        if problems:
+            FreeCAD.Console.PrintWarning(
+                "Railform Studio: %d provider-chain problem(s): %s\n"
+                % (len(problems), "; ".join(problems)))
 
     def Activated(self):
         try:

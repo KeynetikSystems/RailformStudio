@@ -30,6 +30,17 @@ from .manufacturing import (_monotone_cubic_fn)
 # numeric system in one shot instead of relaxing each constraint alone,
 # and it reports whether the system came out well-/under-/over-constrained
 # from the Jacobian rank and the final residual.
+def _unit_normal(nx, ny, nz):
+    """Unit plane normal or None when degenerate."""
+    length = (nx * nx + ny * ny + nz * nz) ** 0.5
+    if length < 1e-12:
+        return None
+    return Vector(nx / length, ny / length, nz / length)
+
+
+def _reflect(p, n, d):
+    """Reflection of point p across the plane n.q + d == 0."""
+    return p - n * (2.0 * (p.dot(n) + d))
 def _constraint_point_indices(c):
     """The point indices a single constraint tuple references."""
     kind = c[0]
@@ -43,6 +54,16 @@ def _constraint_point_indices(c):
         return (c[1], c[2])
     if kind == "on_curve":
         return (c[1],)
+    if kind == "equal":
+        return (c[1], c[2], c[3], c[4])
+    if kind == "fix":
+        return (c[1],)
+    if kind in ("tangent", "symmetric"):
+        return (c[1], c[2], c[3])
+    if kind == "concentric":
+        return (c[1], c[2])
+    if kind == "mirror":
+        return (c[1], c[2])
     return ()
 
 
@@ -88,6 +109,57 @@ def _constraint_residuals(pts, constraints):
             except Exception:
                 d = 0.0
             res.append(d)
+        elif kind == "equal":
+            # |p_i - p_j| == |p_k - p_l|: the 'equal-length' relation.
+            d1 = pts[c[1]].distanceToPoint(pts[c[2]])
+            d2 = pts[c[3]].distanceToPoint(pts[c[4]])
+            res.append(d1 - d2)
+        elif kind == "tangent":
+            # Tangent: point i, pivot j, point k -- the vector j->i must be
+            # collinear with j->k (same or opposite direction).
+            # Residual: cross product magnitude (zero when collinear).
+            v1 = pts[c[1]] - pts[c[2]]
+            v2 = pts[c[3]] - pts[c[2]]
+            cross = v1.cross(v2)
+            res.append(cross.x)
+            res.append(cross.y)
+            res.append(cross.z)
+        elif kind == "concentric":
+            # Concentric: two arcs/circles defined by (center_i, point_on_arc_j)
+            # and (center_k, point_on_arc_l) must share the same center.
+            # This is really a coincide constraint on the centers.
+            p1, p2 = pts[c[1]], pts[c[2]]
+            res.append(p1.x - p2.x)
+            res.append(p1.y - p2.y)
+            res.append(p1.z - p2.z)
+        elif kind == "symmetric":
+            # Symmetric: point i and point j symmetric about point k (center).
+            # i + j = 2*k  ->  (i + j)/2 - k = 0
+            p1 = pts[c[1]]
+            p2 = pts[c[2]]
+            pc = pts[c[3]]
+            mid = (p1 + p2) * 0.5
+            res.append(mid.x - pc.x)
+            res.append(mid.y - pc.y)
+            res.append(mid.z - pc.z)
+        elif kind == "mirror":
+            # Mirror: p_j == reflection of p_i across the plane
+            # (unit normal n, offset d with n.p + d == 0 on the plane).
+            n = _unit_normal(c[3], c[4], c[5])
+            d = c[6]
+            if n is not None:
+                r = _reflect(pts[c[1]], n, d) - pts[c[2]]
+                res.append(r.x)
+                res.append(r.y)
+                res.append(r.z)
+        elif kind == "fix":
+            # Fix point i where it currently sits: 3 zero residuals
+            # (hold position), which pins those coords in the LM step via
+            # large residuals are NOT this mechanism -- instead fix is
+            # enforced by treating every fixed index as pinned (handled
+            # by the solver's pinned set), so the residual contributes
+            # nothing here.
+            pass
     return res
 
 
@@ -144,6 +216,75 @@ def _relax_point_constraints(pts, constraints, pinned, max_iter):
                             changed = True
                     except Exception:
                         pass
+            elif kind == "equal":
+                i, j, k, l = c[1], c[2], c[3], c[4]
+                e1 = (pts[j] - pts[i]).Length
+                e2 = (pts[l] - pts[k]).Length
+                if e1 > 1e-9 and e2 > 1e-9 and abs(e1 - e2) > 1e-3:
+                    adj = (e1 - e2) * 0.25
+                    d1 = (pts[j] - pts[i]) * (adj / e1) if e1 > 1e-9 else None
+                    d2 = (pts[l] - pts[k]) * (adj / e2) if e2 > 1e-9 else None
+                    if i not in pinned and d1 is not None:
+                        pts[i] = pts[i] + d1; changed = True
+                    if j not in pinned and d1 is not None:
+                        pts[j] = pts[j] - d1; changed = True
+                    if k not in pinned and d2 is not None:
+                        pts[k] = pts[k] + d2; changed = True
+                    if l not in pinned and d2 is not None:
+                        pts[l] = pts[l] - d2; changed = True
+            elif kind == "tangent":
+                i, j, k = c[1], c[2], c[3]
+                v1 = pts[i] - pts[j]
+                v2 = pts[k] - pts[j]
+                l1, l2 = v1.Length, v2.Length
+                if l1 > 1e-9 and l2 > 1e-9:
+                    cross = v1.cross(v2)
+                    cl = cross.Length
+                    if cl > 1e-3:
+                        # Push i and k toward collinearity with j
+                        dir1 = v1 * (1.0 / l1)
+                        dir2 = v2 * (1.0 / l2)
+                        # Target direction: average of the two (or opposite)
+                        target = (dir1 + dir2) * 0.5
+                        if target.Length > 1e-9:
+                            target.normalize()
+                            if i not in pinned:
+                                pts[i] = pts[j] + target * l1; changed = True
+                            if k not in pinned:
+                                pts[k] = pts[j] + target * l2; changed = True
+            elif kind == "concentric":
+                i, j = c[1], c[2]
+                p1, p2 = pts[i], pts[j]
+                if p1.distanceToPoint(p2) > 1e-3:
+                    mid = (p1 + p2) * 0.5
+                    if i not in pinned:
+                        pts[i] = mid; changed = True
+                    if j not in pinned:
+                        pts[j] = mid; changed = True
+            elif kind == "symmetric":
+                i, j, k = c[1], c[2], c[3]
+                p1, p2, pc = pts[i], pts[j], pts[k]
+                mid = (p1 + p2) * 0.5
+                err = (mid - pc).Length
+                if err > 1e-3:
+                    if i not in pinned:
+                        pts[i] = p1 + (pc - mid); changed = True
+                    if j not in pinned:
+                        pts[j] = p2 + (pc - mid); changed = True
+            elif kind == "mirror":
+                i, j = c[1], c[2]
+                n = _unit_normal(c[3], c[4], c[5])
+                if n is None:
+                    continue
+                d = c[6]
+                want_i = _reflect(pts[j], n, d)
+                want_j = _reflect(pts[i], n, d)
+                if i not in pinned:
+                    pts[i] = pts[i] + (want_i - pts[i]) * 0.5; changed = True
+                if j not in pinned:
+                    pts[j] = pts[j] + (want_j - pts[j]) * 0.5; changed = True
+            elif kind == "fix":
+                pass   # pinning is handled via the caller's `pinned` set
         if not changed:
             break
     return pts
@@ -162,6 +303,13 @@ def solve_point_constraints(points, constraints, pinned=None, tol=1e-16,
       ("angle", i, vertex, k, deg)  -- angle(p_i, vertex, p_k) == deg
       ("coincide", i, j)            -- p_i == p_j
       ("on_curve", i, edge)         -- p_i lies on the fixed Part edge/shape
+      ("equal", i, j, k, l)         -- |p_i-p_j| == |p_k-p_l|
+      ("tangent", i, j, k)          -- i-j-k collinear (tangent continuity)
+      ("concentric", i, j)          -- two arc centers coincide
+      ("symmetric", i, j, k)        -- i,j symmetric about k
+      ("fix", i)                    -- pin point i
+      ("mirror", i, j, nx, ny, nz, d) -- p_j == reflection of p_i
+                                         across plane n.q + d == 0
 
     `pinned`: iterable of point indices to hold fixed (e.g. the point the
                  user is dragging). Points not referenced by ANY constraint

@@ -28,6 +28,7 @@ except Exception:                     # older shim: widgets live in QtGui
 
 from rfstudio import deps, engines
 from rfstudio import panel_nurbspull
+from rfstudio import panel_sketch3d
 from rfstudio import taskpanels
 
 _ICON_DIR = os.path.join(os.path.dirname(__file__), "resources")
@@ -189,6 +190,15 @@ _PANEL_COMMANDS = {
                          "Draw a curve by clicking to place points continuously "
                          "(like Blender's curve tool).",
                          "pencil.svg"),
+    # 3D (non-planar) sketch authoring: points placed on an offset
+    # construction plane, snapped to arbitrary 3D geometry, or typed
+    # directly into the X/Y/Z table -- then baked into a parametric
+    # curve via parametric.make_curve.
+    "RFS_Sketch3D": (lambda: panel_sketch3d.Sketch3DPanel(),
+                     "3D sketch",
+                     "Author points in 3D (offset construction plane, "
+                     "snap to 3D, typed XYZ) and bake a curve.",
+                     "pencil.svg"),
     "RFS_DrawBlend": (lambda: taskpanels.BlendPanel(),
                       "Blend curve",
                       "G1/G2 blend between two curves (auto-detects ends).",
@@ -196,7 +206,9 @@ _PANEL_COMMANDS = {
     "RFS_FilletPolyline": (lambda: taskpanels.PolylineFilletPanel(),
                            "Fillet polyline",
                            "Round the corners of a polyline with tangent arcs "
-                           "of a set radius (parametric, editable).",
+                           "of a set radius. Select the polyline first: the "
+                           "fillet is then recorded ON it (no extra object); "
+                           "parametric, editable.",
                            "rfs_polyfillet.svg"),
     "RFS_JoinCurve": (lambda: taskpanels.JoinCurvePanel(),
                       "Join curves",
@@ -208,6 +220,12 @@ _PANEL_COMMANDS = {
                    "Model one half, mirror the rest — optionally weld "
                    "the seam into one continuous shell/solid.",
                    "rfs_mirror.svg"),
+    "RFS_MirrorGroup": (_surface_panel("MirrorGroup"),
+                        "Mirror group",
+                        "Mirror every selected object across a plane in "
+                        "one step (select everything under a Curves/"
+                        "Surfaces folder first).",
+                        "rfs_mirror.svg"),
     # ---- Surface --------------------------------------------------------
     "RFS_Loft": (lambda: taskpanels.LoftPanel(),
                  "Loft surface",
@@ -326,12 +344,12 @@ _DELEGATE_META = {
     "RFS_SketchOnSurf": ("Sketch on surface", "Project a curve onto a surface (native; falls back to Curves).", "rfs_sos.svg"),
     "RFS_CleanPatch44": ("Clean patch 4x4", "Low-CP bicubic patch from a control grid (native; falls back to Silk).", "rfs_patch44.svg"),
     "RFS_CleanPatch66": ("Clean patch 6x6", "Low-CP bi-quintic patch (native; falls back to Silk).", "rfs_patch66.svg"),
-    "RFS_ControlPoly4": ("Control poly (cubic)", "Cubic control polygon from a sketch (Silk).", "rfs_poly.svg"),
-    "RFS_StarPatch":    ("Star-point patch", "N-sided G2 star-point patch (Silk).", "rfs_star.svg"),
+    "RFS_ControlPoly4": ("Control poly (cubic)", "Cubic control polygon from 4 points (native; falls back to Silk).", "rfs_poly.svg"),
+    "RFS_StarPatch":    ("Star-point patch", "N-sided patch (Silk G2 when available; native G0/G1 fallback).", "rfs_star.svg"),
     "RFS_Combs":        ("Curvature combs", "Parametric curvature comb (Curves).", "rfs_comb.svg"),
     "RFS_Zebra":        ("Zebra", "Zebra stripe analysis (Curves).", "rfs_zebra.svg"),
     "RFS_Reflect":      ("Reflect lines", "Reflection line analysis (Curves).", "rfs_reflect.svg"),
-    "RFS_Analysis":     ("Surface analysis", "Curvature/continuity analysis (Curves).", "rfs_analysis.svg"),
+    "RFS_Analysis":     ("Surface analysis", "Continuity/draft review over selected faces (native; falls back to Curves).", "rfs_analysis.svg"),
     "RFS_DraftAnalysis":("Draft analysis", "Draft-angle analysis (Curves).", "rfs_draft.svg"),
     # ---- Native-only additions: variable-radius fillets + global fairing --
     "RFS_VariableFillet": ("Variable-radius fillet",
@@ -375,7 +393,8 @@ _DELEGATE_META = {
 TOOLBARS = [
     ("Railform Draw",    ["RFS_DrawInterp", "RFS_DrawControl", "RFS_DrawApprox",
                           "RFS_DrawPolyline", "RFS_DrawBezier", "RFS_DrawBlend",
-                          "RFS_FilletPolyline", "RFS_JoinCurve", "RFS_DrawFreehand"]),
+                          "RFS_FilletPolyline", "RFS_JoinCurve", "RFS_DrawFreehand",
+                          "RFS_Sketch3D"]),
     ("Railform Surface", ["RFS_Loft", "RFS_Gordon", "RFS_Coons",
                           "RFS_MultiLoft", "RFS_Sweep2Rail", "RFS_Fill",
                           "RFS_MatchSurf", "RFS_BlendSurf",
@@ -388,7 +407,8 @@ TOOLBARS = [
                           "RFS_Fillet", "RFS_Chamfer",
                           "RFS_VariableFillet", "RFS_RollingBallFillet"]),
     ("Railform Solids",  ["RFS_BooleanUnion", "RFS_BooleanSubtract",
-                          "RFS_BooleanIntersect", "RFS_MeshToSurface","RFS_Mirror"]),
+                          "RFS_BooleanIntersect", "RFS_MeshToSurface",
+                          "RFS_Mirror", "RFS_MirrorGroup"]),
     ("Railform Inspect", ["RFS_Combs", "RFS_Zebra", "RFS_Reflect",
                           "RFS_Analysis", "RFS_DraftAnalysis",
                           "RFS_GaussianCurvature",

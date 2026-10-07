@@ -26,7 +26,16 @@ def run_engine_command(mod_name, cmd_id):
             "Railform Studio: command '%s' not found after loading %s.\n"
             % (cmd_id, mod_name))
         return False
-    FreeCADGui.runCommand(cmd_id, 0)
+    try:
+        FreeCADGui.runCommand(cmd_id, 0)
+    except Exception as exc:
+        # A renamed/broken engine command must not wedge the curated
+        # button's provider chain -- report and let ProviderCommand fall
+        # through to the next provider.
+        FreeCAD.Console.PrintWarning(
+            "Railform Studio: '%s' raised while running -- trying next "
+            "provider (%s)\n" % (cmd_id, exc))
+        return False
     return True
 
 
@@ -75,10 +84,21 @@ DELEGATIONS = {
 #     CAGD novelty required, so unlike the star-point G2 problem this was
 #     a genuinely closeable gap. The Curves delegation is kept as a
 #     fallback for each in case a selection/geometry edge case the native
-#     path doesn't yet handle comes up. RFS_Analysis (generic curvature/
-#     continuity overlay) is intentionally left on the Curves delegation
-#     for now; the native equivalent for seam QA already exists as
-#     core.surface_deviation / classify_continuity.
+#     path doesn't yet handle comes up. RFS_Analysis is likewise now
+#     native-first (core.surface_review_summary); the Curves delegation
+#     remains as its fallback.
+#   - RFS_Analysis (generic surface review) got its native path too:
+#     core.surface_review_summary / review_recommendation drive
+#     native_analysis below, with the Curves delegation kept as fallback.
+#   - RFS_ControlPoly4 builds a degree-3 control-polygon curve natively
+#     from the same core.control_poly_curve technique, with Silk kept as
+#     fallback.
+#   - RFS_StarPatch is different: true G2 N-sided patching stays Silk-only,
+#     but it is no longer a single point of failure -- it has a degraded
+#     native last resort (native_star_patch over core.n_sided_patch, exact
+#     G0/tangent-plane G1 only). If Silk is installed it always wins; the
+#     native path only runs when the engine command is unavailable or
+#     errors, and says so loudly.
 #   - RFS_CleanPatch44/66 and RFS_ControlPoly4 are the surface analog of
 #     core.control_poly_curve (already native for curves) -- same
 #     buildFromPolesMultsKnots technique on a 2D grid instead of 1D.
@@ -90,11 +110,11 @@ DELEGATIONS = {
 #     native nearest-facing-side search can't resolve.
 #   - RFS_StarPatch (true G2 N-sided star-point patching) is the one
 #     action NOT planned for a native reimplementation -- it's CAGD
-#     research-level work. If Silk disappears, the mitigation for this one
-#     specific command is vendoring a frozen snapshot of just that command,
-#     not reimplementing the algorithm. This limitation is inherent to
-#     n_sided_patch's construction (see core.py's module comment above
-#     n_sided_patch): exact G0 and tangent-plane G1 only, by design.
+#     research-level work. It is NOT, however, a single point of
+#     failure any more: native_star_patch (core.n_sided_patch, exact
+#     G0 + tangent-plane G1 by design) is chained as a last-resort
+#     provider, and vendoring a frozen snapshot of Silk's command is
+#     still the escape hatch for real G2 work.
 #
 # RFS_CleanPatch44/66 and RFS_Trim/RFS_SketchOnSurf are chained NATIVE
 # FIRST, then the original engine command as fallback -- unlike MultiLoft
@@ -125,6 +145,16 @@ NATIVE_OVERRIDES = {
     # nearest-facing-side search can't resolve cleanly).
     "RFS_BlendSurf":    [("native", "native_blend_surface"),
                          ("engine", "Curves", "Curves_BlendSurf2")],
+    # Last three actions that used to have NO native fallback at all
+    # (flagged by deps.report_single_points_of_failure):
+    "RFS_Analysis":     [("native", "native_analysis"),
+                          ("engine", "Curves", "Curves_SurfaceAnalysis")],
+    "RFS_ControlPoly4": [("native", "native_control_poly4"),
+                          ("engine", "Silk", "ControlPoly4")],
+    # Star patch: engine FIRST (true G2 beats the degraded native path);
+    # native only runs when Silk is missing/broken.
+    "RFS_StarPatch":    [("engine", "Silk", "ControlGridNStar66"),
+                          ("native", "native_star_patch")],
     # Native visual-QA tools (fix for "no native fallback" gap #3) --
     # curvature comb / zebra stripes / reflection lines / draft-angle
     # analysis are all pure OCCT curvature/normal evaluation (see the
@@ -641,3 +671,155 @@ def native_draft_analysis():
             "be entirely above or below every band.\n"
             % (result["thresholds"],))
     doc.recompute()
+
+
+# --- native analysis / control-polygon curve / star-patch fallback -------- #
+def _selected_faces():
+    """All (face, source_label) from the current selection: sub-face
+    picks first, else the first face of each whole-object pick. Raises
+    ValueError on nothing usable -- same convention as _selected_face()."""
+    import FreeCADGui
+    faces = []
+    for so in FreeCADGui.Selection.getSelectionEx():
+        label = getattr(so.Object, "Label", so.Object.Name)
+        subs = [s for s in (so.SubObjects or [])
+                if getattr(s, "ShapeType", "") == "Face"]
+        if subs:
+            faces.extend((s, label) for s in subs)
+        else:
+            shp = getattr(so.Object, "Shape", None)
+            if shp is not None and shp.Faces:
+                faces.append((shp.Faces[0], label))
+    if not faces:
+        raise ValueError("select one or more faces/surfaces first")
+    return faces
+
+
+def native_analysis():
+    """Native provider for RFS_Analysis -- the generic curvature/
+    continuity review Curves' Curves_SurfaceAnalysis used to own.
+    Runs core.surface_review_summary (adjacency graph + per-seam
+    deviation/continuity grading) over every selected face and prints
+    the worst seam + recommendation to the Report view. Raises
+    ValueError on bad selection so ProviderCommand falls through to the
+    Curves delegation instead of silently doing nothing."""
+    import FreeCAD
+    from rfstudio import core
+    picked = _selected_faces()
+    faces = [f for f, _ in picked]
+    summary = core.surface_review_summary(faces, pull_dir=FreeCAD.Vector(0, 0, 1))
+    rec = core.review_recommendation(summary)
+    worst = summary["continuity"]["worst_grade"]
+    n_seams = len(summary["continuity"]["seams"])
+    n_iso = len(summary["continuity"]["isolated"])
+    FreeCAD.Console.PrintMessage(
+        "Railform Studio -- surface analysis over %d face(s):\n"
+        "  seams checked: %d, worst grade: %s, isolated patches: %d\n"
+        "  worst draft angle (deg): %s\n"
+        "  recommendation: %s\n"
+        % (len(faces), n_seams, worst, n_iso,
+           summary["draft"]["worst_angle"], rec))
+
+
+def native_control_poly4():
+    """Native provider for RFS_ControlPoly4 -- replaces Silk's
+    ControlPoly4 with core.control_poly_curve (the same
+    buildFromPolesMultsKnots technique already native for curves).
+    Takes exactly 4 control points (the 2x2 grid convention used by
+    _grid_points_from_selection) and builds a degree-3 clamped-uniform
+    B-spline whose control polygon is those 4 points."""
+    import FreeCAD
+    from rfstudio import core
+    pts = _grid_points_from_selection(2)   # raises on bad selection
+    edge = core.control_poly_curve(pts, degree=3)
+    doc = FreeCAD.ActiveDocument or FreeCAD.newDocument()
+    obj = doc.addObject("Part::Feature", "ControlPoly4")
+    obj.Shape = edge
+    doc.recompute()
+
+
+def native_star_patch():
+    """Native last-resort provider for RFS_StarPatch -- NOT a G2
+    replacement for Silk's ControlGridNStar66. core.n_sided_patch gives
+    exact G0 + tangent-plane G1 only (see its docstring); this provider
+    exists so the curated button degrades to a working tool instead of a
+    dead button when Silk is missing/broken. If you need true G2 star
+    points, install Silk or vendor its ControlGridNStar66.
+
+    Selection: the >= 3 boundary edges of one closed loop, picked as
+    edge sub-objects (or one object whose shape is the loop itself).
+    Raises ValueError on a bad selection so ProviderCommand reports the
+    failure chain clearly."""
+    import FreeCAD
+    import FreeCADGui
+    import Part
+    from rfstudio import core
+    sel = FreeCADGui.Selection.getSelectionEx()
+    edges = []
+    for so in sel:
+        shp = getattr(so.Object, "Shape", None)
+        if shp is None:
+            continue
+        for sub in (so.SubObjects or []):
+            if getattr(sub, "ShapeType", "") == "Edge":
+                edges.append(sub)
+        if not so.SubObjects:
+            edges.extend(shp.Edges)
+    if len(edges) < 3:
+        raise ValueError(
+            "star patch needs >= 3 boundary edges selected (got %d)"
+            % len(edges))
+    FreeCAD.Console.PrintWarning(
+        "Railform Studio: Silk not available -- using native n-sided "
+        "patch (exact G0/G1, NOT G2-continuous like Silk's star "
+        "patch).\n")
+    patch = core.n_sided_patch(edges)
+    doc = FreeCAD.ActiveDocument or FreeCAD.newDocument()
+    obj = doc.addObject("Part::Feature", "StarPatch_Native")
+    obj.Shape = patch
+    doc.recompute()
+
+
+def validate_providers(providers=None, engines_module=None):
+    """Static sanity check of the provider-chain wiring, runnable
+    headlessly (no FreeCADGui needed) so it can be exercised by
+    test_core.py and catches dead buttons at test time instead of at
+    click time:
+
+      * every chain entry is a known ("engine"|"native", ...) shape;
+      * every ("native", name) resolves to an attribute on the engines
+        module (a typo here yields a permanently dead provider);
+      * every ("engine", mod, _) uses a mod name in deps.ENGINES;
+      * every action in DELEGATIONS has a non-empty chain.
+
+    Returns the list of problems found (empty list = healthy). Also
+    called once from the workbench health check path, mirroring
+    deps.verify_delegations' "fail loudly, up front" approach."""
+    import sys
+    providers = PROVIDERS if providers is None else providers
+    engines_module = sys.modules[__name__] if engines_module is None \
+        else engines_module
+    problems = []
+    for cmd_id, chain in providers.items():
+        if not chain:
+            problems.append("%s: empty provider chain" % cmd_id)
+            continue
+        for p in chain:
+            if not isinstance(p, tuple) or len(p) < 2:
+                problems.append("%s: malformed provider %r" % (cmd_id, p))
+                continue
+            if p[0] == "native":
+                if not hasattr(engines_module, p[1]):
+                    problems.append(
+                        "%s: native provider %r missing" % (cmd_id, p[1]))
+            elif p[0] == "engine":
+                if len(p) != 3 or p[1] not in deps.ENGINES or not p[2]:
+                    problems.append(
+                        "%s: bad engine provider %r" % (cmd_id, p))
+            else:
+                problems.append(
+                    "%s: unknown provider kind %r" % (cmd_id, p[0]))
+    for cmd_id in DELEGATIONS:
+        if cmd_id not in providers:
+            problems.append("%s: no provider chain" % cmd_id)
+    return problems

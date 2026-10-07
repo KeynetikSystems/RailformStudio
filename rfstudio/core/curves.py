@@ -4,13 +4,245 @@
 import math
 import Part
 import FreeCAD                      # Console only -- not Gui, works headless
-from FreeCAD import Vector
+from FreeCAD import Vector, Matrix, Placement, Rotation
 
 from .util import (_clamped_knots, _clamped_mults, _eval01, _hermite7)
 
 
 
 # --- curve drawing / modeling (our own, Gui-free) ------------------------- #
+def sketch3d_wire(points, seg_types=None, bulges=None):
+    """A single Wire built from a point list where each segment
+    (i -> i+1) can be its own drafting entity:
+
+      "Line"      -- straight edge (G0 break at every point)
+      "Arc"       -- circular arc through the two endpoints, pushed off the
+                     chord by `bulge` * (chord_len/2) perpendicular to it
+                     (AutoCAD polyline bulge semantics: bulge > 0 bulges one
+                     side, < 0 the other, 0 degenerates to a line)
+      "Spline"    -- contiguous runs are one clamped-interpolating B-spline
+                     through the run's points
+      "Ellipse"   -- elliptical arc through the two endpoints. The chord
+                     defines the major axis; `bulge` is the minor/major
+                     axis ratio (0 = circular arc, >0 = elliptical, <0
+                     flips the ellipse side). Uses Part.Ellipse + trimmed
+                     arc between the endpoints.
+      "Rectangle" -- right-angled corner: two perpendicular edges from
+                     a to b via an intermediate corner point. `bulge`
+                     chooses the corner direction (+1 = right turn in
+                     the construction plane, -1 = left turn, 0 = straight).
+                     Creates two Line edges.
+      "Bezier"    -- contiguous runs become cubic Bezier spans through
+                     the run's points (same construction as
+                     bezier_curve_shape's Auto handles). `bulge` scales
+                     the handle length as a fraction of the chord
+                     (<= 0 means the default 1/3), i.e. per-segment
+                     tension control without a handle editor.
+
+    Mixed-entity 3D sketch: this is what makes one RFS_Sketch3D hold a
+    polyline + arc + spline combo instead of exactly one curve per use.
+
+    Returns a Part.Wire. Raises ValueError on a bad/ambiguous
+    (types/bulges) input -- the caller maps that to a QMessageBox."""
+    pts = [Vector(*p) if not isinstance(p, Vector) else p for p in points]
+    n = len(pts)
+    if n < 2:
+        raise ValueError("sketch3d_wire: need >= 2 points")
+    seg_types = list(seg_types) if seg_types is not None else ["Spline"] * (n - 1)
+    bulges = list(bulges) if bulges is not None else [0.0] * (n - 1)
+    if len(seg_types) != n - 1 or len(bulges) != n - 1:
+        raise ValueError(
+            "sketch3d_wire: seg_types/bulges must have one entry per "
+            "segment (got %d/%d for %d points)"
+            % (len(seg_types), len(bulges), n))
+    edges = []
+    i = 0
+    while i < n - 1:
+        if seg_types[i] == "Spline":
+            # Absorb the maximal run of consecutive Spline segments into
+            # ONE interpolating B-spline edge through the run's points.
+            j = i
+            while j < n - 1 and seg_types[j] == "Spline":
+                j += 1
+            run = pts[i:j + 1]
+            edges.append(interpolate_curve(run))
+            i = j
+            continue
+        if seg_types[i] == "Bezier":
+            # Absorb the run; each span is a cubic Bezier whose handles
+            # follow the polyline direction at the shared points
+            # (Catmull-Rom-style tangents), scaled by `bulge` (default
+            # 1/3) of the span chord -- tension control per span.
+            j = i
+            while j < n - 1 and seg_types[j] == "Bezier":
+                j += 1
+            run = pts[i:j + 1]
+            m = len(run)
+
+            def _tan(k):
+                if k <= 0:
+                    d = run[1] - run[0]
+                elif k >= m - 1:
+                    d = run[m - 1] - run[m - 2]
+                else:
+                    d = run[k + 1] - run[k - 1]
+                return d * (1.0 / d.Length) if d.Length > 1e-9 else None
+
+            tans = [_tan(k) for k in range(m)]
+            for k in range(i, j):
+                f = bulges[k] if bulges[k] > 1e-9 else (1.0 / 3.0)
+                p0, p3 = pts[k], pts[k + 1]
+                L = (p3 - p0).Length
+                if L < 1e-9:
+                    continue
+                t0 = tans[k - i] or (p3 - p0) * (1.0 / L)
+                t1 = tans[k - i + 1] or (p3 - p0) * (1.0 / L)
+                bz = Part.BezierCurve()
+                bz.setPoles([p0, p0 + t0 * (f * L),
+                             p3 - t1 * (f * L), p3])
+                edges.append(bz.toShape())
+            i = j
+            continue
+        a, b = pts[i], pts[i + 1]
+        if seg_types[i] == "Line" or (seg_types[i] == "Arc" and
+                                      abs(bulges[i]) < 1e-9):
+            if (b - a).Length > 1e-9:
+                edges.append(Part.LineSegment(a, b).toShape())
+        elif seg_types[i] == "Arc":
+            chord = b - a
+            length = chord.Length
+            if length < 1e-9:
+                i += 1
+                continue
+            mid = (a + b) * 0.5
+            axis = min(((1.0, 0.0, 0.0), abs(chord.x)),
+                       ((0.0, 1.0, 0.0), abs(chord.y)),
+                       ((0.0, 0.0, 1.0), abs(chord.z)),
+                       key=lambda t: t[1])[0]
+            n_perp = chord.cross(Vector(*axis))
+            if n_perp.Length < 1e-12:
+                n_perp = Vector(0, 0, 1)
+            n_perp.normalize()
+            mid += n_perp * (bulges[i] * length * 0.5)
+            try:
+                edges.append(Part.Arc(a, mid, b).toShape())
+            except Exception:
+                edges.append(Part.LineSegment(a, b).toShape())
+        elif seg_types[i] == "Ellipse":
+            # Elliptical arc: chord is major axis, bulge = minor/major ratio
+            chord = b - a
+            length = chord.Length
+            if length < 1e-9:
+                i += 1
+                continue
+            center = (a + b) * 0.5
+            # Major axis along chord direction
+            major_dir = chord * (1.0 / length)
+            # Normal: same logic as Arc (perpendicular to chord)
+            axis = min(((1.0, 0.0, 0.0), abs(chord.x)),
+                       ((0.0, 1.0, 0.0), abs(chord.y)),
+                       ((0.0, 0.0, 1.0), abs(chord.z)),
+                       key=lambda t: t[1])[0]
+            n_perp = chord.cross(Vector(*axis))
+            if n_perp.Length < 1e-12:
+                n_perp = Vector(0, 0, 1)
+            n_perp.normalize()
+            # Minor axis in the plane perpendicular to chord
+            minor_dir = n_perp.cross(major_dir)
+            minor_dir.normalize()
+            major_radius = length * 0.5
+            ratio = abs(bulges[i])  # minor/major ratio
+            if ratio < 1e-9:
+                ratio = 1.0
+            minor_radius = major_radius * ratio
+            # Choose side based on bulge sign
+            side = 1.0 if bulges[i] >= 0 else -1.0
+            # Build rotation to align XY-plane ellipse to the target plane:
+            # source basis (X=major, Y=minor, Z=normal) -> target basis
+            normal = major_dir.cross(minor_dir)
+            if normal.Length < 1e-12:
+                normal = Vector(0, 0, 1)
+            normal.normalize()
+            # Rotation matrix columns = target basis vectors in source coordinates
+            # Source basis: X=major, Y=minor, Z=normal
+            # Target basis: major_dir, minor_dir, normal
+            m = Matrix()
+            m.A11 = major_dir.x; m.A12 = minor_dir.x; m.A13 = normal.x
+            m.A21 = major_dir.y; m.A22 = minor_dir.y; m.A23 = normal.y
+            m.A31 = major_dir.z; m.A32 = minor_dir.z; m.A33 = normal.z
+            rot = Rotation(m)
+            try:
+                # Create ellipse in XY plane at origin with given radii
+                ellipse = Part.Ellipse(Vector(0, 0, 0), major_radius, minor_radius)
+                edge = ellipse.toShape()
+                # Apply rotation and translation via Placement
+                place = Placement(center, rot)
+                edge.Placement = place
+                # Trim to half-ellipse connecting a to b (parameter pi to 2pi = a to b via lower half)
+                e_curve = edge.Curve
+                u1 = math.pi
+                u2 = 2.0 * math.pi
+                trimmed = e_curve.trim(u1, u2)
+                edges.append(trimmed.toShape())
+            except Exception:
+                edges.append(Part.LineSegment(a, b).toShape())
+        elif seg_types[i] == "Rectangle":
+            # Right-angled corner via intermediate point
+            chord = b - a
+            length = chord.Length
+            if length < 1e-9:
+                i += 1
+                continue
+            # Corner point: offset from a along chord normal by bulge * length
+            axis = min(((1.0, 0.0, 0.0), abs(chord.x)),
+                       ((0.0, 1.0, 0.0), abs(chord.y)),
+                       ((0.0, 0.0, 1.0), abs(chord.z)),
+                       key=lambda t: t[1])[0]
+            n_perp = chord.cross(Vector(*axis))
+            if n_perp.Length < 1e-12:
+                n_perp = Vector(0, 0, 1)
+            n_perp.normalize()
+            # bulge: +1 = right turn, -1 = left turn, 0 = straight (no corner)
+            turn = bulges[i]
+            if abs(turn) < 1e-9:
+                if (b - a).Length > 1e-9:
+                    edges.append(Part.LineSegment(a, b).toShape())
+                i += 1
+                continue
+            corner = a + chord * 0.5 + n_perp * (turn * length * 0.5)
+            # Two edges: a->corner, corner->b
+            edges.append(Part.LineSegment(a, corner).toShape())
+            edges.append(Part.LineSegment(corner, b).toShape())
+        else:
+            raise ValueError(
+                "sketch3d_wire: unknown segment type %r "
+                "(want Line/Arc/Spline/Ellipse/Rectangle/Bezier)"
+                % (seg_types[i],))
+        i += 1
+    if not edges:
+        raise ValueError("sketch3d_wire: no segments produced")
+    return Part.Wire(edges)
+
+
+def extrude_closed_wire(edges, height):
+    """SW-style 'closed region drives a boss' for a closed 3D loop:
+    planar loop -> Part.Face(wire) extruded along its normal by `height`
+    to a real solid. Non-planar loop -> cannot make a planar Face, so
+    raise ValueError asking the caller to fall back to n_sided_patch +
+    thicken_surface (a fill sheet + wall is the honest answer there)."""
+    wire = edges if hasattr(edges, "Edges") else Part.Wire(edges)
+    try:
+        face = Part.Face(wire)
+    except Exception:
+        raise ValueError(
+            "extrude_closed_wire: loop is not planar -- use "
+            "core.n_sided_patch + core.thicken_surface instead")
+    if height <= 0:
+        raise ValueError("extrude_closed_wire: height must be positive")
+    n = face.Surface.Axis           # plane normal
+    return face.extrude(n * height)
+
+
 def interpolate_curve(points, closed=False):
     """Smooth B-spline that PASSES THROUGH the given points."""
     pts = [Vector(*p) if not isinstance(p, Vector) else p for p in points]
@@ -458,6 +690,8 @@ __all__ = [
     '_run_clean_patch',
     'knots_from_shape',
     'polyline',
+    'sketch3d_wire',
+    'extrude_closed_wire',
     '_end_pos_dir',
     '_end_pos_dir_d3',
     'blend_curve',

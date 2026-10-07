@@ -18,13 +18,23 @@ GUI-only.
 """
 
 import FreeCAD
-import FreeCADGui
+# Delay GUI imports until actually needed to improve headless compatibility
+FreeCADGui = None
 
-from PySide import QtCore, QtGui
-try:                                  # Qt5/PySide2: widgets are separate
-    from PySide import QtWidgets
-except Exception:                     # older shim: widgets live in QtGui
-    QtWidgets = QtGui
+def _get_qt_widgets():
+    """Get QtWidgets module with compatibility handling."""
+    global QtWidgets
+    if 'QtWidgets' not in globals():
+        from rfstudio.compat import get_qt_widgets
+        QtWidgets = get_qt_widgets()
+    return QtWidgets
+
+def _ensure_freecadgui():
+    """Ensure FreeCADGui is imported and available."""
+    global FreeCADGui
+    if FreeCADGui is None:
+        import FreeCADGui
+    return FreeCADGui
 
 
 # ---------------------------------------------------------------------- #
@@ -38,53 +48,66 @@ def _std_buttons():
     longer accepts directly (it raises TypeError), so read its ``.value``
     when present; on PySide2/Qt5 there is no ``.value`` and ``int()`` on
     the flag works. This keeps the helper working on both bindings."""
+    QtWidgets = _get_qt_widgets()
     btns = QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
     return int(getattr(btns, "value", btns))
 
 
 def _selected_objects():
     """Currently selected document objects (whole-object selection)."""
-    return list(FreeCADGui.Selection.getSelection())
+    try:
+        _ensure_freecadgui()
+        return list(FreeCADGui.Selection.getSelection())
+    except Exception:
+        return []
 
 
 def _selected_faces():
     """[(face, owning_object), ...] for every face in the current
     selection -- sub-face picks first, else every face of a whole-object
     pick."""
-    out = []
-    for so in FreeCADGui.Selection.getSelectionEx():
-        obj = so.Object
-        subs = so.SubObjects or []
-        got_face = False
-        for sub in subs:
-            if getattr(sub, "ShapeType", "") == "Face":
-                out.append((sub, obj))
-                got_face = True
-        if not got_face:
-            shp = getattr(obj, "Shape", None)
-            if shp is not None:
-                for f in shp.Faces:
-                    out.append((f, obj))
-    return out
+    try:
+        _ensure_freecadgui()
+        out = []
+        for so in FreeCADGui.Selection.getSelectionEx():
+            obj = so.Object
+            subs = so.SubObjects or []
+            got_face = False
+            for sub in subs:
+                if getattr(sub, "ShapeType", "") == "Face":
+                    out.append((sub, obj))
+                    got_face = True
+            if not got_face:
+                shp = getattr(obj, "Shape", None)
+                if shp is not None:
+                    for f in shp.Faces:
+                        out.append((f, obj))
+        return out
+    except Exception:
+        return []
 
 
 def _selected_points():
     """Vector points from the current selection: sub-vertex picks first,
     else every vertex of a whole-object pick."""
-    pts = []
-    for so in FreeCADGui.Selection.getSelectionEx():
-        obj = so.Object
-        subs = so.SubObjects or []
-        got = False
-        for sub in subs:
-            if getattr(sub, "ShapeType", "") == "Vertex":
-                pts.append(sub.Point)
-                got = True
-        if not got:
-            shp = getattr(obj, "Shape", None)
-            if shp is not None:
-                pts.extend(v.Point for v in shp.Vertexes)
-    return pts
+    try:
+        _ensure_freecadgui()
+        pts = []
+        for so in FreeCADGui.Selection.getSelectionEx():
+            obj = so.Object
+            subs = so.SubObjects or []
+            got = False
+            for sub in subs:
+                if getattr(sub, "ShapeType", "") == "Vertex":
+                    pts.append(sub.Point)
+                    got = True
+            if not got:
+                shp = getattr(obj, "Shape", None)
+                if shp is not None:
+                    pts.extend(v.Point for v in shp.Vertexes)
+        return pts
+    except Exception:
+        return []
 
 
 def _notify_overlay_unavailable(panel, feature_name, exc):
@@ -92,6 +115,7 @@ def _notify_overlay_unavailable(panel, feature_name, exc):
     (highlight ring, drag gizmo, ...) could not be built on this system --
     the panel keeps working, just without that visual aid. Never raises."""
     try:
+        _ensure_freecadgui()
         FreeCAD.Console.PrintWarning(
             "Railform: %s unavailable (%s) -- continuing without it.\n"
             % (feature_name, exc))
@@ -120,33 +144,26 @@ class _EditPanelBase(object):
         _pre_reject()      -- called just before the transaction aborts
         _post_abort()      -- called after abort (e.g. undo extra per-pick
                              transactions -- see CurvePanel._pick_count)
-        _extra_teardown()  -- called on BOTH accept and reject, before the
-                             dialog is closed (Coin overlay/gizmo teardown)
+        _extra_teardown()     -- extra cleanup after closing dialog
     """
 
+    def __init__(self):
+        # These will be set by subclasses
+        self.doc = None
+        self.creating = False
+        self.obj = None
+
     def _start_edit(self, edit_obj, title, factory):
+        """Initialize the edit session: open the undo transaction, then
+        create/attach the object being edited."""
+        _ensure_freecadgui()
         self.doc = FreeCAD.ActiveDocument or FreeCAD.newDocument()
         self.creating = edit_obj is None
         self.doc.openTransaction(title)
         self.obj = edit_obj if edit_obj is not None else factory()
-        self._edit_title = title
-
-    def _pre_accept(self):
-        pass
-
-    def _pre_reject(self):
-        pass
-
-    def _post_abort(self):
-        pass
-
-    def _extra_teardown(self):
-        pass
-
-    def getStandardButtons(self):
-        return _std_buttons()
 
     def accept(self):
+        """Accept changes and close dialog."""
         try:
             self._pre_accept()
         except Exception as exc:
@@ -156,40 +173,202 @@ class _EditPanelBase(object):
             self.obj.recompute()
         except Exception:
             pass
-        self._extra_teardown()
         try:
             self.doc.commitTransaction()
         except Exception as exc:
-            FreeCAD.Console.PrintWarning(
-                "Railform: commit failed (%s)\n" % exc)
+            FreeCAD.Console.PrintWarning("Railform: commit failed (%s)\n" % exc)
+        self._extra_teardown()
         self._close()
         return True
 
     def reject(self):
+        """Reject changes and close dialog."""
         try:
             self._pre_reject()
         except Exception as exc:
             FreeCAD.Console.PrintWarning(
                 "Railform: pre-reject hook failed (%s)\n" % exc)
-        self._extra_teardown()
         try:
             self.doc.abortTransaction()
         except Exception as exc:
-            FreeCAD.Console.PrintWarning(
-                "Railform: abort failed (%s)\n" % exc)
+            FreeCAD.Console.PrintWarning("Railform: abort failed (%s)\n" % exc)
+        # _post_abort is abort-ONLY (e.g. CurvePanel undoes its extra
+        # per-pick transactions here) -- it must never run on the accept
+        # path, so it's called directly here rather than from _close(),
+        # which both accept() and reject() call.
         try:
             self._post_abort()
         except Exception as exc:
             FreeCAD.Console.PrintWarning(
                 "Railform: post-abort hook failed (%s)\n" % exc)
+        self._extra_teardown()
         self._close()
         return True
 
+    def _pre_accept(self):
+        """Hook called before accepting changes."""
+        pass
+
+    def _pre_reject(self):
+        """Hook called before rejecting changes."""
+        pass
+
+    def _post_abort(self):
+        """Hook called after abort ONLY -- e.g. undo extra per-pick
+        transactions (see CurvePanel._pick_count). Never called on accept."""
+        pass
+
+    def _extra_teardown(self):
+        """Extra teardown after closing dialog. Runs on both accept and
+        reject."""
+        pass
+
     def _close(self):
+        """Close the dialog."""
         try:
+            _ensure_freecadgui()
             FreeCADGui.Control.closeDialog()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------- #
+# Shared UI helpers (used by multiple panels)
+# ---------------------------------------------------------------------- #
+# NOTE: this module loads Qt LAZILY (_get_qt_widgets) so plain
+# `import panel_base` works headless and at workbench startup. The
+# helpers below are therefore factory FUNCTIONS, not classes: a
+# `class X(QtWidgets.QGroupBox)` body would evaluate QtWidgets at
+# import time and break workbench loading with
+# "name 'QtWidgets' is not defined". Call sites are unaffected --
+# `_CollapsibleGroup("Advanced")` etc. work exactly as before.
+
+def _CollapsibleGroup(title, collapsed=True):
+    """A checkable group box whose content area collapses on toggle.
+
+    Usage: g = _CollapsibleGroup("Advanced"); g.content_layout.addWidget(...)
+    Returns the QGroupBox with a `.content_layout` attribute.
+    """
+    QtWidgets = _get_qt_widgets()
+    box = QtWidgets.QGroupBox(title)
+    box.setCheckable(True)
+    box.setChecked(not collapsed)
+    box.setStyleSheet("QGroupBox::indicator { width: 14px; height: 14px; }")
+    inner = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(inner)
+    layout.setContentsMargins(8, 4, 8, 8)
+    layout.setSpacing(4)
+    main = QtWidgets.QVBoxLayout(box)
+    main.setContentsMargins(0, 0, 0, 0)
+    main.addWidget(inner)
+    box.toggled.connect(inner.setVisible)
+    inner.setVisible(not collapsed)
+    box.content_layout = layout
+    return box
+
+
+def _ShortcutHintBar(shortcuts_text="X/Y/Z: lock  |  Tab: plane  |  Esc: drop  |  hover+Enter: edit constraint"):
+    """A one-line bar showing viewport shortcuts. Fixed height, light style.
+
+    Returns the QWidget with `.lbl` and a `.set_shortcuts(text)` helper.
+    """
+    QtWidgets = _get_qt_widgets()
+    bar = QtWidgets.QWidget()
+    bar.setFixedHeight(28)
+    lay = QtWidgets.QHBoxLayout(bar)
+    lay.setContentsMargins(8, 4, 8, 4)
+    lay.setSpacing(8)
+    lbl = QtWidgets.QLabel(shortcuts_text)
+    lbl.setStyleSheet("color:#9aa6b2;font-size:10px;")
+    lay.addWidget(lbl)
+    lay.addStretch(1)
+    bar.lbl = lbl
+
+    def set_shortcuts(text):
+        lbl.setText(text)
+    bar.set_shortcuts = set_shortcuts
+    return bar
+
+
+# Shared status-line styling: one source for the grey/red status text
+# that used to be inlined ~20 times across panels (see _status_label).
+_STATUS_STYLE = "color:#9aa6b2;font-size:11px;padding:4px 0;"
+_ERROR_STYLE = "color:#c0392b;font-size:11px;padding:4px 0;"
+
+
+def _status_label(text=""):
+    """Shared wrapping status line (grey, 11px) for task panels.
+
+    This exact QLabel + word-wrap + stylesheet block was inlined in
+    ~20 panel builds with drifting padding values; the factory is the
+    single source (W3 -- shared widget builders). A FACTORY, not a Qt
+    subclass, so this module keeps its lazy-Qt property: no Qt name is
+    evaluated at import time (guarded by test_gui_imports check #5)."""
+    qw = _get_qt_widgets()
+    lbl = qw.QLabel(text)
+    lbl.setWordWrap(True)
+    lbl.setStyleSheet(_STATUS_STYLE)
+    return lbl
+
+
+def _panel_status(panel, text, is_error=False):
+    """Route a message to a panel's status label if it has one,
+    otherwise fall back to Console (never silent)."""
+    if hasattr(panel, "status") and panel.status is not None:
+        if is_error:
+            panel.status.setStyleSheet(_ERROR_STYLE)
+        else:
+            panel.status.setStyleSheet(_STATUS_STYLE)
+        panel.status.setText(text)
+    elif is_error:
+        FreeCAD.Console.PrintError("Railform: " + text + "\n")
+    else:
+        FreeCAD.Console.PrintWarning("Railform: " + text + "\n")
+
+
+def _panel_warning(panel, text):
+    _panel_status(panel, text, is_error=False)
+
+
+def _panel_error(panel, text):
+    _panel_status(panel, text, is_error=True)
+
+
+def drop_callbacks(view, specs):
+    """Defensively remove Coin event callbacks and clear their IDs.
+
+    specs: sequence of (event_type, owner, attr_name) -- e.g.
+    ``("SoMouseButtonEvent", self, "_cb_btn")``.
+
+    Three invariants the raw ``view.removeEventCallback`` call sites kept
+    violating, each a known crash/AV ingredient:
+
+    * **Per-callback isolation** -- the old pattern wrapped all removals
+      in ONE try/except, so the first failure leaked every callback
+      after it (and the missing-attr AttributeError of a half-built
+      editor aborted the whole teardown).
+    * **Null after remove** -- IDs are always cleared, even when removal
+      raises, so a second teardown (panel close + document close) can
+      never hand a STALE id back: FreeCAD callback ids are numeric and
+      reused, so a stale one can unregister someone else's handler.
+    * **Idempotent** -- calling it twice is a no-op.
+
+    Duck-typed on `view`; safe under freecadcmd mocks (no Qt needed)."""
+    for etype, owner, attr in specs:
+        cb = getattr(owner, attr, None)
+        if cb is None:
+            continue
+        try:
+            view.removeEventCallback(etype, cb)
+        except Exception as exc:
+            try:
+                FreeCAD.Console.PrintWarning(
+                    "Railform: removing %s callback failed (%s)\n"
+                    % (etype, exc))
+            except Exception:
+                pass
+        finally:
+            setattr(owner, attr, None)
 
 
 # ---------------------------------------------------------------------- #
@@ -203,6 +382,7 @@ class _ReportPanelBase(object):
     so they only need a Close button, no transaction."""
 
     def getStandardButtons(self):
+        QtWidgets = _get_qt_widgets()
         return int(QtWidgets.QDialogButtonBox.Close)
 
     def accept(self):
@@ -215,6 +395,7 @@ class _ReportPanelBase(object):
 
     def _close(self):
         try:
+            _ensure_freecadgui()
             FreeCADGui.Control.closeDialog()
         except Exception:
             pass
@@ -243,6 +424,7 @@ class _CurveGroup(object):
         self.max_items = max_items
         self.objs = list(getattr(panel.obj, prop, []) or [])
 
+        QtWidgets = _get_qt_widgets()
         self.box = QtWidgets.QGroupBox(title)
         lay = QtWidgets.QVBoxLayout(self.box)
         if hint:

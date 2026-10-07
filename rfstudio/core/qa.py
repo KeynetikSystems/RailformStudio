@@ -16,6 +16,33 @@ from .util import (_nearest_facing_sides, _side_uv_trimmed, cross, dot, norm)
 # actually achieved. Class-A surfacing lives and dies on exactly that
 # number, not a visual guess -- these two functions are the measurement
 # layer that was missing.
+def _analytic_cross_d2(face, side, u, v):
+    """Exact cross-boundary 2nd derivative via BSplineSurface.getDN,
+    or None when the face can't provide one. Finite differences carry
+    O(J*eps) truncation error from the cross-seam JERK -- which every
+    control-row match leaves unmatched by design (rows 0-2 equalized,
+    row 3+ original), so on a genuinely G2 seam they report O(10)
+    deviations that are pure measurement artifact. The analytic
+    derivative has no such error. (No import from surfacing._surf_dn:
+    that module already imports THIS one, so the ~15 lines are
+    repeated here instead of creating a circular import.)"""
+    try:
+        surf = face.Surface
+        if not isinstance(surf, Part.BSplineSurface):
+            try:
+                surf = surf.toBSpline()
+            except Exception:
+                return None
+        du, dv = (2, 0) if side < 2 else (0, 2)
+        if surf.UDegree < du or surf.VDegree < dv:
+            return None
+        # Second derivatives are even-order: inward (-u) vs outward
+        # (+u) stepping needs no sign flip, unlike odd orders.
+        return surf.getDN(u, v, du, dv)
+    except Exception:
+        return None
+
+
 def surface_deviation(face_a, face_b, samples=24):
     """Numeric G0/G1/G2 deviation between two faces across their nearest
     facing boundary -- the QA counterpart to match_surface().
@@ -56,16 +83,27 @@ def surface_deviation(face_a, face_b, samples=24):
         return {0: du.negative(), 1: du, 2: dv.negative(), 3: dv}[side]
 
     def _cross_d2(face, pr, side, u, v):
+        # Analytic path first (exact, off the face's own control net);
+        # finite differences only when no BSpline conversion succeeds.
+        analytic = _analytic_cross_d2(face, side, u, v)
+        if analytic is not None:
+            return analytic
+        # One-sided finite difference stepping INTO the face material:
+        # stepping outward past the boundary evaluates outside the
+        # parameter domain, where OCCT extrapolates (wrong) values --
+        # invisible on planar faces (linear extrapolation is exact, so
+        # every plane-based QA test passed) but a large systematic
+        # error on curved ones, where it swamped genuine G2 matches.
         u0, u1, v0, v1 = pr
         if side < 2:
             eps = max(1e-6, (u1 - u0) * 1e-3)
-            sgn = -1.0 if side == 0 else 1.0
+            sgn = 1.0 if side == 0 else -1.0
             p0 = face.valueAt(u, v)
             p1 = face.valueAt(u + sgn * eps, v)
             p2 = face.valueAt(u + sgn * 2 * eps, v)
         else:
             eps = max(1e-6, (v1 - v0) * 1e-3)
-            sgn = -1.0 if side == 2 else 1.0
+            sgn = 1.0 if side == 2 else -1.0
             p0 = face.valueAt(u, v)
             p1 = face.valueAt(u, v + sgn * eps)
             p2 = face.valueAt(u, v + sgn * 2 * eps)

@@ -107,6 +107,252 @@ def test_infer_pull_direction_no_faces_is_none():
     out("  pull dir empty      OK  None")
 
 
+def test_construction_plane_offsets_along_normal():
+    origin, normal = panel_logic.construction_plane(
+        (0, 0, 0), (0, 0, 2), offset=10)
+    assert abs(normal[2] - 1.0) < 1e-9
+    assert abs(origin[2] - 10.0) < 1e-9
+    # Zero-length view dir falls back to +Z, never raises
+    origin2, normal2 = panel_logic.construction_plane((1, 2, 3), (0, 0, 0))
+    assert normal2 == (0.0, 0.0, 1.0)
+    assert origin2 == (1, 2, 3)
+    out("  construction plane OK")
+
+
+def test_ray_plane_intersect_hit_and_parallel():
+    hit = panel_logic.ray_plane_intersect(
+        (0, 0, 10), (0, 0, -1), (0, 0, 0), (0, 0, 1))
+    assert hit is not None and abs(hit[2]) < 1e-9, hit
+    assert abs(hit[0]) < 1e-9 and abs(hit[1]) < 1e-9
+    # Ray parallel to the plane -> None
+    miss = panel_logic.ray_plane_intersect(
+        (0, 0, 10), (1, 0, 0), (0, 0, 0), (0, 0, 1))
+    assert miss is None
+    # Off-plane ray through a tilted plane still lands ON the plane
+    hit2 = panel_logic.ray_plane_intersect(
+        (0, 0, 10), (0.5, 0, -1), (0, 0, 0), (0, 0, 1))
+    assert hit2 is not None and abs(hit2[2]) < 1e-9, hit2
+    out("  ray->plane intersect OK")
+
+
+def test_sketch3d_readiness():
+    ok, msg = panel_logic.sketch3d_readiness("InterpCurve", 1)
+    assert not ok and "at least 2 points" in msg
+    ok, msg = panel_logic.sketch3d_readiness("InterpCurve", 4)
+    assert ok and "4 point(s)" in msg
+    out("  sketch3d readiness OK")
+
+
+def test_solver_status_text():
+    # over-defined -> actionable conflict, includes the residual
+    t = panel_logic.solver_status_text(
+        {"state": "over", "residual": 3.2e-3, "dof": 6, "rank": 6})
+    assert "over-defined" in t and "remove" in t and "3.2e-03" in t, t
+    # under-defined -> remaining DOF derived from dof - rank
+    t = panel_logic.solver_status_text(
+        {"state": "under", "residual": 0.0, "dof": 6, "rank": 4})
+    assert "under-defined" in t and "2 of 6" in t, t
+    # well-defined -> fully constrained, shows the DOF count
+    t = panel_logic.solver_status_text(
+        {"state": "well", "residual": 1e-9, "dof": 6, "rank": 6})
+    assert "well-defined" in t and "6 DOF" in t, t
+    # graceful degradation: numpy fallback and empty input
+    assert "numpy" in panel_logic.solver_status_text({"state": "unknown"})
+    assert panel_logic.solver_status_text({}) == ""
+    assert panel_logic.solver_status_text(None) == ""
+    out("  solver status   OK")
+
+
+def test_points_are_planar():
+    sq = [(0, 0, 0), (10, 0, 0), (10, 10, 0), (0, 10, 0)]
+    assert panel_logic.points_are_planar(sq)
+    skew = [(0, 0, 0), (10, 0, 0), (10, 10, 0), (0, 10, 5)]
+    assert not panel_logic.points_are_planar(skew)
+    out("  planar check    OK")
+
+
+def test_plane_normal_for_and_basis():
+    assert panel_logic.plane_normal_for("XY") == (0.0, 0.0, 1.0)
+    assert panel_logic.plane_normal_for("YZ") == (1.0, 0.0, 0.0)
+    assert panel_logic.plane_normal_for("ZX") == (0.0, 1.0, 0.0)
+    n = panel_logic.plane_normal_for("Camera", (0, 0, -2))
+    assert abs(n[2] + 1.0) < 1e-9
+    n_floor = panel_logic.plane_normal_for("Camera", (0, 0, 0))
+    assert n_floor == (0.0, 0.0, 1.0)   # degenerate -> safe fallback
+    # Basis must be a right-handed-ish orthonormal pair spanning the plane
+    u, v = panel_logic.plane_basis((0, 0, 1))
+    assert abs(u[0] * 0 + u[1] * 0 + u[2] * 1) < 1e-9       # u perp to n
+    assert abs(v[0] * 0 + v[1] * 0 + v[2] * 1) < 1e-9       # v perp to n
+    assert abs(u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) < 1e-9  # u perp v
+    assert abs(sum(c * c for c in u) - 1) < 1e-9 and abs(sum(c * c for c in v) - 1) < 1e-9
+    out("  plane normal/basis OK")
+
+
+def test_points_form_closed_loop():
+    open_pts = [(0, 0, 0), (1, 0, 0), (1, 1, 0)]
+    assert not panel_logic.points_form_closed_loop(open_pts)
+    closed = open_pts + [(0, 0, 0)]
+    assert panel_logic.points_form_closed_loop(closed)
+    near = open_pts + [(1e-3, 0, 0)]
+    assert not panel_logic.points_form_closed_loop(near)
+    assert panel_logic.points_form_closed_loop(near, tol=1e-2)
+    out("  closed-loop check OK")
+
+
+def test_auto_plane_normal():
+    # Segment along +Z -> new plane must contain Z -> normal is X or Y
+    n = panel_logic.auto_plane_normal((0, 0, 5), (0, 0, 1))
+    assert n in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)), n
+    # Segment along +X -> normal is Y or Z
+    n = panel_logic.auto_plane_normal((5, 0, 0), (0, 0, 1))
+    assert n in ((0.0, 1.0, 0.0), (0.0, 0.0, 1.0)), n
+    # Degenerate chord -> keep previous
+    assert panel_logic.auto_plane_normal((0, 0, 0), (0, 0, 1)) == (0, 0, 1)
+    out("  auto plane flip OK")
+
+
+def test_apply_axis_lock():
+    assert panel_logic.apply_axis_lock((5, 6, 7), (1, 2, 3), "X") == (5, 2, 3)
+    assert panel_logic.apply_axis_lock((5, 6, 7), (1, 2, 3), "Y") == (1, 6, 3)
+    assert panel_logic.apply_axis_lock((5, 6, 7), (1, 2, 3), "Z") == (1, 2, 7)
+    assert panel_logic.apply_axis_lock((5, 6, 7), (1, 2, 3), None) == (5, 6, 7)
+    assert panel_logic.apply_axis_lock((5, 6, 7), (1, 2, 3), "bogus") == (5, 6, 7)
+    out("  axis lock       OK")
+
+
+def test_cycle_plane():
+    assert panel_logic.cycle_plane("Camera") == "XY"
+    assert panel_logic.cycle_plane("ZX") == "Auto"
+    assert panel_logic.cycle_plane("Auto") == "Camera"  # wraps
+    assert panel_logic.cycle_plane("bogus") == "Camera"  # safe fallback
+    out("  plane cycle     OK")
+
+
+def test_constraint_anchor_and_glyph():
+    pts = [(0, 0, 0), (10, 0, 0), (10, 10, 0)]
+    assert panel_logic.constraint_anchor(("distance", 0, 1, 10.0), pts) == (5.0, 0.0, 0.0)
+    assert panel_logic.constraint_anchor(("fix", 2, None), pts) == (10, 10, 0)
+    assert panel_logic.constraint_anchor(("angle", 0, 1, 2, 90.0), pts) == (10, 0, 0)
+    assert panel_logic.constraint_anchor(("distance", 0, 9, 1.0), pts) is None
+    assert panel_logic.constraint_glyph("distance") == "D"
+    assert panel_logic.constraint_glyph("symmetric") == "S"
+    assert panel_logic.constraint_glyph("bogus") == "?"
+    out("  anchor/glyph    OK")
+
+
+def test_constraint_tooltip():
+    pts = [(0, 0, 0), (10, 0, 0)]
+    tip = panel_logic.constraint_tooltip(("distance", 0, 1, 12.0), pts)
+    assert "target 12.00" in tip and "now 10.00" in tip, tip
+    tip = panel_logic.constraint_tooltip(("fix", 1, None), pts)
+    assert "fixed P1" in tip, tip
+    tip = panel_logic.constraint_tooltip(("distance", 0, 9, 1.0), pts)
+    assert "bad indices" in tip, tip
+    out("  tooltip         OK")
+
+
+def test_evaluate_expression():
+    assert panel_logic.evaluate_expression("2+3*4", {}) == 14.0
+    assert panel_logic.evaluate_expression("=10/4", {}) == 2.5
+    assert panel_logic.evaluate_expression("sqrt(16)+P0x", {"P0x": 3.0}) == 7.0
+    assert panel_logic.evaluate_expression("2*(width+1)", {"width": 4.0}) == 10.0
+    assert abs(panel_logic.evaluate_expression("sin(pi/2)", {}) - 1.0) < 1e-9
+    for bad in ("__import__('os')", "os.system('x')", "lambda: 1",
+                "a.b", "P9x", "1/0", "'str'", "[1,2]"):
+        try:
+            panel_logic.evaluate_expression(bad, {"P0x": 1.0})
+            assert False, "expected ValueError for %r" % bad
+        except ValueError:
+            pass
+    out("  expressions     OK")
+
+
+def test_resolve_constraint_expressions():
+    pts = [(0, 0, 0), (10, 0, 0)]
+    cs = [("distance", 0, 1, "=P1x*2"), ("distance", 0, 1, 5.0)]
+    got = panel_logic.resolve_constraint_expressions(cs, {}, pts)
+    assert got[0] == ("distance", 0, 1, 20.0), got
+    assert got[1] == ("distance", 0, 1, 5.0), got
+    try:
+        panel_logic.resolve_constraint_expressions(
+            [("distance", 0, 1, "=nope")], {}, pts)
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "distance" in str(exc), exc
+    out("  resolve exprs   OK")
+
+
+def test_mirror_plane_params_and_reflect():
+    assert panel_logic.mirror_plane_params("YZ") == (1.0, 0.0, 0.0, 0.0)
+    assert panel_logic.mirror_plane_params("bogus") is None
+    q = panel_logic.reflect_point((4, 1, 2), (1.0, 0.0, 0.0), 0.0)
+    assert q == (-4.0, 1.0, 2.0), q
+    assert panel_logic.reflect_point((1, 1, 1), (0, 0, 0), 0.0) is None
+    out("  mirror helpers  OK")
+
+
+def test_project_point_to_plane():
+    q = panel_logic.project_point_to_plane(
+        (1, 2, 5), (0, 0, 0), (0.0, 0.0, 1.0))
+    assert q == (1.0, 2.0, 0.0), q
+    assert panel_logic.project_point_to_plane(
+        (1, 1, 1), (0, 0, 0), (0, 0, 0)) is None
+    out("  plane project   OK")
+
+
+def test_project_point_along():
+    """Issue #14: direction projection. direction=None must be exactly
+    the legacy orthogonal drop; a real direction slides p along d until
+    it lands on the plane; parallel d never lands (None)."""
+    o, n = (0, 0, 0), (0.0, 0.0, 1.0)
+    # None mode == legacy project_point_to_plane
+    a = panel_logic.project_point_along((1, 2, 5), o, n, None)
+    b = panel_logic.project_point_to_plane((1, 2, 5), o, n)
+    assert a == b == (1.0, 2.0, 0.0), (a, b)
+    # along (0,1,-1): s solves 5 + s*(-1) = 0 -> s = 5 -> (1, 7, 0)
+    q = panel_logic.project_point_along((1, 2, 5), o, n, (0, 1, -1))
+    assert q is not None
+    assert abs(q[0] - 1.0) < 1e-9 and abs(q[1] - 7.0) < 1e-9 and \
+        abs(q[2]) < 1e-9, q
+    # non-unit direction normalizes to the same landing spot
+    q2 = panel_logic.project_point_along((1, 2, 5), o, n, (0, 2, -2))
+    assert q2 is not None and all(abs(x - y) < 1e-9 for x, y in zip(q, q2))
+    # direction parallel to the plane never lands
+    assert panel_logic.project_point_along((1, 2, 5), o, n, (1, 0, 0)) is None
+    # degenerate inputs
+    assert panel_logic.project_point_along((1, 2, 5), o, (0, 0, 0),
+                                           (0, 0, -1)) is None
+    assert panel_logic.project_point_along((1, 2, 5), o, n, (0, 0, 0)) is None
+    out("  project along   OK")
+
+
+def test_proj_ref_roundtrip():
+    """Issue #14: associative-ref encoding survives the string property
+    round trip; malformed input degrades to 'free point' (None), never
+    raises."""
+    edge = panel_logic.encode_proj_ref("edge", "Box001", "Edge3",
+                                       0.5, None)
+    assert edge == "edge|Box001|Edge3|0.5|n|", edge
+    info = panel_logic.parse_proj_ref(edge)
+    assert info == {"kind": "edge", "obj": "Box001", "locator": "Edge3",
+                    "t": 0.5, "direction": None}, info
+    # captured view direction round trip
+    sl = panel_logic.encode_proj_ref("slice", "Pad002", "7",
+                                     1.0 / 3.0, (1.0, 0.0, -1.0))
+    info = panel_logic.parse_proj_ref(sl)
+    assert info is not None and info["kind"] == "slice"
+    assert info["locator"] == "7" and abs(info["t"] - 1.0 / 3.0) < 1e-12
+    assert info["direction"] == (1.0, 0.0, -1.0), info
+    # free point + malformed inputs -> None (never an exception)
+    for bad in ("", None, "junk", "a|b", "edge|Box001|Edge3|x|n|",
+                "edge|Box001|Edge3|0.5|z|", "edge|Box001|Edge3|2.0|n|",
+                "edge|Box001|Edge3|0.5|d|1,2",
+                "edge|Box001|Edge3|0.5|d|a,b,c",
+                "other|Box001|Edge3|0.5|n|", "|Box001|Edge3|0.5|n|"):
+        assert panel_logic.parse_proj_ref(bad) is None, bad
+    out("  proj ref codec  OK")
+
+
 if __name__ == "__main__" or True:  # freecadcmd may not set __main__
     for t in (test_readiness_ok, test_readiness_no_inputs_yet,
               test_readiness_below_minimum, test_readiness_above_maximum,
@@ -114,7 +360,25 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_shell_readiness, test_blend_readiness,
               test_infer_pull_direction_averages_normals,
               test_infer_pull_direction_cancelling_normals_is_none,
-              test_infer_pull_direction_no_faces_is_none):
+              test_infer_pull_direction_no_faces_is_none,
+              test_construction_plane_offsets_along_normal,
+              test_ray_plane_intersect_hit_and_parallel,
+              test_sketch3d_readiness,
+              test_solver_status_text,
+              test_points_are_planar,
+              test_plane_normal_for_and_basis,
+              test_points_form_closed_loop,
+              test_auto_plane_normal,
+              test_apply_axis_lock,
+              test_cycle_plane,
+              test_constraint_anchor_and_glyph,
+              test_constraint_tooltip,
+              test_evaluate_expression,
+              test_resolve_constraint_expressions,
+              test_mirror_plane_params_and_reflect,
+              test_project_point_to_plane,
+              test_project_point_along,
+              test_proj_ref_roundtrip):
         try:
             t()
         except Exception as e:

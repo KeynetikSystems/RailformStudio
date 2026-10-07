@@ -220,6 +220,38 @@ def collect_snap_points(doc, exclude=None, sample_step=3.0,
     return pts
 
 
+def _valid_dist_shape(shape):
+    """False for shapes that must never reach OCCT distToShape: null
+    shapes, edges with no readable curve, and zero-length edges.
+    BRepExtrema segfaults (rather than raising) on such inputs, and the
+    per-mousemove snap loop calls distToShape on every collected edge --
+    so a single degenerate edge anywhere in the document crashed every
+    cursor move with 'Access violation' while Snap was on. The panel's
+    try/except cannot catch a segfault; filtering once here can."""
+    if shape is None:
+        return False
+    try:
+        if shape.isNull():
+            return False
+    except Exception:
+        return False
+    try:
+        if shape.ShapeType == "Edge":
+            try:
+                if shape.Length < 1e-9:
+                    return False
+            except Exception:
+                return False
+            try:
+                if getattr(shape, "Curve", None) is None:
+                    return False
+            except Exception:
+                return False
+    except Exception:
+        pass
+    return True
+
+
 def collect_snap_shapes(doc, exclude=None):
     """[(edge, owning_object), ...] for every edge of every other object in
     `doc` (including objects inside groups and parts) -- the SHAPE-level
@@ -245,8 +277,17 @@ def collect_snap_shapes(doc, exclude=None):
         shp = getattr(o, "Shape", None)
         if not shp:
             continue
-        for e in shp.Edges:
-            out.append((e, o))
+        try:
+            edges = shp.Edges
+        except Exception:
+            continue
+        for e in edges:
+            # Drop degenerate edges at collection time so the
+            # per-mousemove distToShape loop never sees them (see
+            # _valid_dist_shape: OCCT segfaults on them instead of
+            # raising, which try/except around the call cannot catch).
+            if _valid_dist_shape(e):
+                out.append((e, o))
     return out
 
 
@@ -287,6 +328,9 @@ def collect_intersection_points(shapes, tol=1e-6, max_edges=60):
         for j in range(i + 1, len(edges)):
             bj = boxes[j]
             if bj is None or not _bbox_overlap(bi, bj, tol):
+                continue
+            if not _valid_dist_shape(edges[i]) or \
+                    not _valid_dist_shape(edges[j]):
                 continue
             try:
                 d, pts_on, _info = edges[i].distToShape(edges[j])
@@ -335,6 +379,8 @@ def nearest_point_on_shapes(world_point, shapes, max_dist=None):
     import Part
     best_pt, best_d, best_shape = None, 1e18, None
     for shp in shapes:
+        if not _valid_dist_shape(shp):
+            continue
         try:
             d, pts_on, _info = Part.Vertex(world_point).distToShape(shp)
         except Exception:
@@ -348,6 +394,49 @@ def nearest_point_on_shapes(world_point, shapes, max_dist=None):
     if max_dist is not None and best_d > max_dist:
         return None, None, None
     return best_pt, best_d, best_shape
+
+
+def _bounded_ray_half_len(origin, shapes, fallback):
+    """Half-length for the stand-in ray/axis segment used by the
+    distToShape snap queries below, bounded by the candidates'
+    combined bounding box (eye-to-box distance + box span) instead of
+    the raw `fallback` (default 1e7). A 2e7-unit edge forces
+    BRepExtrema_DistShapeShape over an enormous parameter range --
+    slow, numerically fragile, and a segfault vector on awkward
+    geometry -- while the segment only ever needs to span the model
+    as seen from the ray origin. Returns `fallback` unchanged when no
+    usable box exists. `origin` is a FreeCAD Vector."""
+    try:
+        lo = [1e100, 1e100, 1e100]
+        hi = [-1e100, -1e100, -1e100]
+        found = False
+        for s in shapes:
+            try:
+                b = s.BoundBox
+            except Exception:
+                continue
+            try:
+                lo[0] = min(lo[0], b.XMin)
+                lo[1] = min(lo[1], b.YMin)
+                lo[2] = min(lo[2], b.ZMin)
+                hi[0] = max(hi[0], b.XMax)
+                hi[1] = max(hi[1], b.YMax)
+                hi[2] = max(hi[2], b.ZMax)
+                found = True
+            except Exception:
+                continue
+        if not found:
+            return fallback
+        cx = (lo[0] + hi[0]) / 2.0
+        cy = (lo[1] + hi[1]) / 2.0
+        cz = (lo[2] + hi[2]) / 2.0
+        span = ((hi[0] - lo[0]) ** 2 + (hi[1] - lo[1]) ** 2 +
+                (hi[2] - lo[2]) ** 2) ** 0.5
+        dist = ((origin.x - cx) ** 2 + (origin.y - cy) ** 2 +
+                (origin.z - cz) ** 2) ** 0.5
+        return dist + span + 1.0
+    except Exception:
+        return fallback
 
 
 def nearest_point_on_shapes_to_ray(ray_origin, ray_dir, shapes,
@@ -369,9 +458,9 @@ def nearest_point_on_shapes_to_ray(ray_origin, ray_dir, shapes,
 
     Implemented with the same exact OCCT primitive nearest_point_on_shapes
     uses -- Shape.distToShape -- against a long line segment standing in
-    for the (infinite) ray. `half_len` is how far the stand-in segment
-    extends either side of `ray_origin`; the default 1e7 dwarfs any real
-    model so the segment is effectively the full ray.
+    for the (infinite) ray. The segment spans the candidates' bounding
+    box as seen from the ray origin (see _bounded_ray_half_len); the
+    `half_len` argument is only a fallback when no usable box exists.
 
     Returns (point_on_shape, distance, shape) for the globally closest
     shape, or (None, None, None) if `shapes` is empty, `ray_dir` is
@@ -388,12 +477,18 @@ def nearest_point_on_shapes_to_ray(ray_origin, ray_dir, shapes,
         return None, None, None
     d.normalize()
     o = Vector(ray_origin)
+    shapes = list(shapes)
+    if not shapes:
+        return None, None, None
+    half_len = _bounded_ray_half_len(o, shapes, half_len)
     try:
         ray = Part.Edge(Part.LineSegment(o - d * half_len, o + d * half_len))
     except Exception:
         return None, None, None
     best_pt, best_d, best_shape = None, 1e18, None
     for shp in shapes:
+        if not _valid_dist_shape(shp):
+            continue
         try:
             dist, pts_on, _info = ray.distToShape(shp)
         except Exception:
@@ -420,10 +515,13 @@ def closest_point_on_axis_to_shapes(axis_origin, axis_dir, shapes,
     axis-locked dragging: there the point must stay on the drag axis, so we
     want the position ALONG THE AXIS at which a target curve is nearest --
     i.e. where the axis crosses (or comes closest to) the curve -- rather
-    than the point on the curve itself. Returns (point_on_axis, distance,
-    shape), or (None, None, None) if `shapes` is empty / the direction is
-    degenerate / every distToShape failed. `max_dist` rejects a target the
-    axis never passes within that many world units of.
+    than the point on the curve itself. The stand-in axis segment spans
+    the candidates' bounding box as seen from the axis origin (see
+    _bounded_ray_half_len); `half_len` is only a fallback. Returns
+    (point_on_axis, distance, shape), or (None, None, None) if `shapes`
+    is empty / the direction is degenerate / every distToShape failed.
+    `max_dist` rejects a target the axis never passes within that many
+    world units of.
 
     Gui-free -- headless-testable, same as the rest of this tier.
     """
@@ -434,12 +532,18 @@ def closest_point_on_axis_to_shapes(axis_origin, axis_dir, shapes,
         return None, None, None
     d.normalize()
     o = Vector(axis_origin)
+    shapes = list(shapes)
+    if not shapes:
+        return None, None, None
+    half_len = _bounded_ray_half_len(o, shapes, half_len)
     try:
         axis = Part.Edge(Part.LineSegment(o - d * half_len, o + d * half_len))
     except Exception:
         return None, None, None
     best_pt, best_d, best_shape = None, 1e18, None
     for shp in shapes:
+        if not _valid_dist_shape(shp):
+            continue
         try:
             dist, pts_on, _info = axis.distToShape(shp)
         except Exception:

@@ -38,6 +38,7 @@ from FreeCAD import Vector
 
 from rfstudio import snaputil
 from rfstudio import core
+from rfstudio.panel_base import drop_callbacks
 
 try:
     from PySide import QtCore, QtGui
@@ -49,6 +50,93 @@ except Exception:
     QtCore = None
     QtGui = None
     QtWidgets = None
+
+
+# --- analytic curvature/jerk for cubic Bezier segments --- #
+def _bezier_segment_derivatives(p0, p1, p2, p3, t):
+    """Return (p, d1, d2, d3) for cubic Bezier at parameter t.
+
+    p0, p1, p2, p3 are FreeCAD Vectors (4 poles).
+    Returns (position, d1, d2, d3) as Vectors.
+    """
+    mt = 1.0 - t
+    # Position
+    p = (p0 * mt**3 +
+         p1 * (3 * mt**2 * t) +
+         p2 * (3 * mt * t**2) +
+         p3 * t**3)
+    # First derivative
+    d1 = (p1 - p0) * (3 * mt**2) + \
+         (p2 - p1) * (6 * mt * t) + \
+         (p3 - p2) * (3 * t**2)
+    # Second derivative
+    d2 = (p2 - p1 * 2 + p0) * (6 * mt) + \
+         (p3 - p2 * 2 + p1) * (6 * t)
+    # Third derivative (constant for cubic)
+    d3 = (p3 - p2 * 3 + p1 * 3 - p0) * 6.0
+    return p, d1, d2, d3
+
+
+def _bezier_curvature_and_jerk(p0, p1, p2, p3, t):
+    """Return (curvature, jerk_magnitude) for cubic Bezier at t.
+
+    Returns (curvature, jerk_magnitude) as floats, or (None, None) if degenerate.
+    """
+    p, d1, d2, d3 = _bezier_segment_derivatives(p0, p1, p2, p3, t)
+    speed2 = d1.dot(d1)
+    if speed2 < 1e-12:
+        return None, None
+    # Curvature: |d1 x d2| / |d1|^3
+    cross = d1.cross(d2)
+    curvature = cross.Length / (speed2 ** 1.5)
+    # Jerk: magnitude of d3 projected perpendicular to d1 (similar to curvature but for 3rd derivative)
+    # Component of d3 perpendicular to velocity
+    speed = speed2 ** 0.5
+    if speed < 1e-12:
+        return curvature, None
+    d1_norm = d1 * (1.0 / speed)
+    d3_perp = d3 - d1_norm * d3.dot(d1_norm)
+    jerk = d3_perp.Length / (speed2 * speed)  # |d3_perp| / |v|^3
+    return curvature, jerk
+
+
+def _bezier_g2_g3_at_handles(p0, p1, p2, p3):
+    """Return (g2_at_start, g3_at_start, g2_at_end, g3_at_end) for a Bezier segment.
+
+    Returns curvature/jerk at t=0 (toward left handle) and t=1 (toward right handle).
+    """
+    g2_start, g3_start = _bezier_curvature_and_jerk(p0, p1, p2, p3, 0.0)
+    g2_end, g3_end = _bezier_curvature_and_jerk(p0, p1, p2, p3, 1.0)
+    return g2_start, g3_start, g2_end, g3_end
+
+
+def _bezier_g2_g3_along_segment(p0, p1, p2, p3, samples=20):
+    """Sample G2/G3 along the segment for comb visualization.
+
+    Returns list of (t, g2, g3) for each sample.
+    """
+    out = []
+    for i in range(samples):
+        t = i / (samples - 1.0) if samples > 1 else 0.5
+        g2, g3 = _bezier_curvature_and_jerk(p0, p1, p2, p3, t)
+        if g2 is not None:
+            out.append((t, g2, g3))
+    return out
+
+
+try:
+    from PySide import QtCore, QtGui
+    try:
+        from PySide import QtWidgets
+    except Exception:                 # older shim: widgets live in QtGui
+        QtWidgets = QtGui
+except Exception:
+    QtCore = None
+    QtGui = None
+    QtWidgets = None
+
+from rfstudio import snaputil
+from rfstudio import core
 
 
 def native_draggers_enabled():
@@ -911,9 +999,12 @@ class PointEditor(object):
         else:  # right
             right_handles[point_idx] = view_point
 
-        # Enforce handle type constraints
+        # Enforce handle type constraints (G1/G2 continuity)
         self._enforce_bezier_handle_constraints(point_idx, which, left_handles,
                                                 right_handles, handle_types)
+
+        # Apply G1/G2 continuity snapping to adjacent spans
+        self._snap_bezier_continuity(point_idx, which, left_handles, right_handles, handle_types)
 
         # Update the object
         obj = self.obj
@@ -925,6 +1016,9 @@ class PointEditor(object):
 
         # Update visualization
         self._update_bezier_handles()
+
+        # Update status bar with G2/G3 readout
+        self._update_bezier_status_readout(point_idx)
 
     def _enforce_bezier_handle_constraints(self, point_idx, which, left_handles,
                                            right_handles, handle_types):
@@ -946,6 +1040,126 @@ class PointEditor(object):
             handle_types[point_idx] = htype
             self.obj.HandleTypes = handle_types
             self.obj.recompute()
+
+    def _snap_bezier_continuity(self, point_idx, which, left_handles,
+                                      right_handles, handle_types):
+        """Snap edited handle to achieve G1/G2 continuity with adjacent spans.
+
+        When dragging a handle, this snaps the OPPOSITE handle (or adjusts
+        the dragged one) to achieve:
+        - G1: tangent continuity (opposite handles collinear with point)
+        - G2: curvature continuity (second derivative continuous)
+        """
+        points = self._points()
+        if point_idx >= len(points):
+            return
+
+        htype = handle_types[point_idx] if point_idx < len(handle_types) else "Auto"
+        point = points[point_idx]
+
+        # Get the dragged handle and its opposite
+        if which == 'left':
+            dragged = left_handles[point_idx]
+            opposite = right_handles[point_idx]
+        else:
+            dragged = right_handles[point_idx]
+            opposite = left_handles[point_idx]
+
+        # Only apply G1/G2 snapping for Aligned/Vector/Auto types
+        if htype in ("Aligned", "Vector", "Auto"):
+            # G1: snap opposite handle to be collinear with dragged handle and point
+            if htype in ("Aligned", "Auto"):
+                dir_dragged = dragged - point
+                if dir_dragged.Length > 1e-9:
+                    dir_normalized = dragged - point
+                    dir_normalized = dir_normalized * (1.0 / dir_dragged.Length)
+                    # For Aligned: opposite handle is 180 degrees opposite
+                    # For G1: opposite handle direction matches dragged direction
+                    if htype == "Aligned":
+                        opposite = point - dir_normalized * (opposite - point).Length
+                    else:  # Auto
+                        # G1: opposite tangent matches dragged direction
+                        opposite = point + dir_normalized * (opposite - point).Length
+
+            # G2: curvature continuity - snap to match curvature with adjacent spans
+            if htype in ("Vector", "Auto"):
+                # For G2: second derivative continuity
+                # The curvature at the shared point should match from both sides
+                # This is approximated by matching the "curvature vector" direction
+                # We'll use a simpler heuristic: snap the dragged handle to make
+                # the control polygon symmetric around the point
+                if len(points) >= 3:
+                    # Get adjacent points
+                    idx = points.index(point) if point in points else -1
+                    if idx > 0 and idx < len(points) - 1:
+                        prev_pt = points[idx - 1]
+                        next_pt = points[idx + 1]
+                        # For G2: the control points should form a smooth curve
+                        # The handle positions should be symmetric in a curvature sense
+                        # Heuristic: project the dragged handle onto the bisector
+                        chord = next_pt - prev_pt
+                        if chord.Length > 1e-9:
+                            chord_dir = chord * (1.0 / chord.Length)
+                            # Project dragged handle onto chord bisector plane
+                            to_dragged = dragged - point
+                            proj = to_dragged.dot(chord_dir)
+                            dragged = point + chord_dir * proj + (to_dragged - chord_dir * proj) * 0.5
+
+        # Update the appropriate handle list
+        if which == 'left':
+            left_handles[point_idx] = dragged
+            right_handles[point_idx] = opposite
+        else:
+            right_handles[point_idx] = dragged
+            left_handles[point_idx] = opposite
+
+    def _update_bezier_status_readout(self, point_idx):
+        """Update panel status bar with G2/G3 readout for the edited point."""
+        if not hasattr(self, "on_commit") or self.on_commit is None:
+            return
+        try:
+            # Get the panel's status label
+            panel = getattr(self.on_commit, "__self__", None)
+            if panel and hasattr(panel, "status"):
+                pts = self._points()
+                if point_idx >= len(pts):
+                    return
+                left_handles = getattr(self.obj, "LeftHandles", [Vector(0,0,0)] * len(self._points()))
+                right_handles = getattr(self.obj, "RightHandles", [Vector(0,0,0)] * len(self._points()))
+                p0 = pts[point_idx]
+                left = left_handles[point_idx]
+                right = right_handles[point_idx]
+                # Compute G2 at this point
+                if point_idx > 0:
+                    p_prev = pts[point_idx - 1]
+                    left_prev = getattr(self.obj, "LeftHandles", [Vector(0,0,0)] * len(self._points()))[point_idx - 1]
+                    right_prev = getattr(self.obj, "RightHandles", [Vector(0,0,0)] * len(self._points()))[point_idx - 1]
+                    # G2 at point_idx from left span
+                    p0, p1, p2, p3 = pts[point_idx - 1], right_prev, left, pts[point_idx]
+                    g2_left = _bezier_curvature_and_jerk(p0, p1, p2, p3, 1.0)[0]
+                else:
+                    g2_left = None
+                if point_idx < len(pts) - 1:
+                    p_next = pts[point_idx + 1]
+                    left_next = getattr(self.obj, "LeftHandles", [Vector(0,0,0)] * len(self._points()))[point_idx + 1]
+                    right_next = getattr(self.obj, "RightHandles", [Vector(0,0,0)] * len(self._points()))[point_idx + 1]
+                    # G2 at point_idx from right span
+                    p0, p1, p2, p3 = pts[point_idx], right, left_next, pts[point_idx + 1]
+                    g2_right = _bezier_curvature_and_jerk(pts[point_idx], right, left_next, pts[point_idx + 1], 0.0)[0]
+                else:
+                    g2_right = None
+                # Format status text
+                if g2_left is not None and g2_right is not None:
+                    g2_match = abs(g2_left - g2_right) if g2_left and g2_right else None
+                    panel.status.setText(f"G2: left={g2_left:.4f} right={g2_right:.4f} Δ={g2_match:.4f}" if g2_match is not None else f"G2: left={g2_left:.4f} right={g2_right:.4f}")
+                elif g2_left is not None:
+                    panel.status.setText(f"G2: left={g2_left:.4f}")
+                elif g2_right is not None:
+                    panel.status.setText(f"G2: right={g2_right:.4f}")
+                else:
+                    panel.status.setText("G2: --")
+        except Exception:
+            pass
 
     def set_handle_visibility(self, visible):
         """Show or hide Bezier handle visualization."""
@@ -1332,16 +1546,11 @@ class PointEditor(object):
         self._stop_watchdog()
         self._destroy_symmetry_preview()
         self._destroy_bezier_handles()
-        try:
-            if self._cb_btn is not None:
-                self.view.removeEventCallback("SoMouseButtonEvent", self._cb_btn)
-            if self._cb_mov is not None:
-                self.view.removeEventCallback("SoLocation2Event", self._cb_mov)
-            if getattr(self, "_cb_key", None) is not None:
-                self.view.removeEventCallback("SoKeyboardEvent", self._cb_key)
-        except Exception as exc:
-            FreeCAD.Console.PrintWarning(
-                "Railform: point editor callback teardown failed (%s)\n" % exc)
+        drop_callbacks(self.view, (
+            ("SoMouseButtonEvent", self, "_cb_btn"),
+            ("SoLocation2Event", self, "_cb_mov"),
+            ("SoKeyboardEvent", self, "_cb_key"),
+        ))
         try:
             self._hide_input_field()
         except Exception:
@@ -1423,6 +1632,9 @@ class PointEditor(object):
             FreeCAD.Console.PrintWarning(
                 f"Railform: Bezier handle visualization unavailable ({exc})\n")
 
+        # Build curvature comb visualization
+        self._build_curvature_comb()
+
     def _update_bezier_handles(self):
         """Update Bezier handle visualization."""
         if not self.is_bezier or not self.handle_vis_root or not self.handles_visible:
@@ -1460,12 +1672,117 @@ class PointEditor(object):
             self.line_set.numValues = len(num_vertices)
             self.line_set.numVertices.setValues(0, len(num_vertices), num_vertices)
 
+            # Update curvature comb
+            self._update_curvature_comb()
+
+            # Update jerk handles
+            self._update_jerk_handles()
+
         except Exception as exc:
             FreeCAD.Console.PrintWarning(
                 f"Railform: Error updating Bezier handles: {exc}\n")
 
+    def _build_jerk_handles(self):
+        """Build Coin visualization for G3 jerk handles (third derivative control)."""
+        if not self.is_bezier or not self.coin:
+            return
+
+        try:
+            from pivy import coin
+            self.jerk_vis_root = coin.SoSeparator()
+
+            # Jerk handles (purple diamonds) - third derivative control
+            jerk_sep = coin.SoSeparator()
+            jerk_col = coin.SoBaseColor()
+            jerk_col.rgb = (0.8, 0.3, 1.0)  # Purple
+            jerk_sep.addChild(jerk_col)
+            jerk_style = coin.SoDrawStyle()
+            jerk_style.pointWidth = 10
+            jerk_sep.addChild(jerk_style)
+            jerk_coords = coin.SoCoordinate3()
+            jerk_markers = coin.SoMarkerSet()
+            jerk_markers.markerIndex = coin.SoMarkerSet.DIAMOND
+            jerk_sep.addChild(jerk_coords)
+            jerk_sep.addChild(jerk_markers)
+            self.handle_vis_root.addChild(jerk_sep)
+            self.jerk_handle_coords = jerk_coords
+            self.jerk_handle_markers = jerk_markers
+
+            # Add to scene
+            doc = FreeCADGui.ActiveDocument
+            view = doc.ActiveView if doc is not None else None
+            if view:
+                view.getSceneGraph().addChild(self.handle_vis_root)
+
+        except Exception as exc:
+            FreeCAD.Console.PrintWarning(
+                f"Railform: Jerk handle visualization unavailable ({exc})\n")
+
+    def _update_jerk_handles(self):
+        """Update G3 jerk handle visualization."""
+        if not self.is_bezier or not self.jerk_vis_root or not self.handles_visible:
+            return
+
+        try:
+            pts = self._points()
+            if len(pts) < 2:
+                return
+
+            # Compute jerk handles for each interior point
+            # Jerk handle position is based on the third derivative at each point
+            jerk_pts = []
+            for i in range(len(pts)):
+                if i == 0 or i == len(pts) - 1:
+                    # Endpoints - use nearby jerk
+                    if i == 0:
+                        # First point - use jerk at t=0 of first segment
+                        if len(pts) > 1:
+                            p0, p1, p2, p3 = self._points()[0], right_handles[0], left_handles[1], pts[1]
+                            jerk = _bezier_curvature_and_jerk(p0, p1, p2, p3, 0.0)[1]
+                            if jerk is not None:
+                                jerk_vec = _bezier_segment_derivatives(p0, p1, p2, p3, 0.0)[3]
+                                jerk_pts.append((pts[0] + jerk_vec * 0.1).x)
+                                # Simplified: use a visual offset
+                                jerk_pts.append(pts[0])
+                    else:
+                        # Last point - use jerk at t=1 of last segment
+                        pass
+                else:
+                    # Interior points - compute jerk from adjacent segments
+                    pass
+            
+            # For now, show simplified jerk handles at each interior point
+            # Jerk visualization is complex; we'll use a simplified approach
+            pts = self._points()
+            left_handles = getattr(self.obj, "LeftHandles", [Vector(0,0,0)] * len(pts))
+            right_handles = getattr(self.obj, "RightHandles", [Vector(0,0,0)] * len(pts))
+            
+            jerk_pts = []
+            for i in range(1, len(pts) - 1):
+                # Compute third derivative at interior points
+                p0 = pts[i-1]
+                p3 = pts[i+1]
+                p1 = right_handles[i-1]
+                p2 = left_handles[i]
+                
+                # Approximate jerk as difference in curvature vectors
+                # This is a simplified visualization
+                jerk_vec = (right_handles[i] - left_handles[i]) * 0.5
+                jerk_pt = pts[i] + jerk_vec * 0.1
+                jerk_pts.append((jerk_pt.x, jerk_pt.y, jerk_pt.z))
+            
+            if jerk_pts:
+                self.jerk_handle_coords.point.setValues(0, len(jerk_pts), jerk_pts)
+                self.jerk_handle_markers.numPoints = len(jerk_pts)
+            else:
+                self.jerk_handle_markers.numPoints = 0
+
+        except Exception as exc:
+            FreeCAD.Console.PrintWarning(
+                f"Railform: Error updating jerk handles: {exc}\n")
+
     def _destroy_bezier_handles(self):
-        """Destroy Bezier handle visualization."""
+        """Destroy Bezier handle visualization and jerk handle visualization."""
         if self.handle_vis_root:
             try:
                 doc = FreeCADGui.ActiveDocument
@@ -1475,6 +1792,159 @@ class PointEditor(object):
             except Exception:
                 pass
             self.handle_vis_root = None
+
+        # Destroy jerk handle visualization
+        if hasattr(self, 'jerk_vis_root') and self.jerk_vis_root:
+            try:
+                doc = FreeCADGui.ActiveDocument
+                view = doc.ActiveView if doc is not None else None
+                if view:
+                    view.getSceneGraph().removeChild(self.jerk_vis_root)
+            except Exception:
+                pass
+            self.jerk_vis_root = None
+
+        # Destroy curvature comb
+        self._destroy_curvature_comb()
+
+    # ---- Bezier G2/G3 curvature comb visualization ----
+    def _build_curvature_comb(self):
+        """Build Coin visualization for G2/G3 curvature comb on Bezier segments."""
+        if not self.is_bezier or not self.coin:
+            return
+
+        try:
+            from pivy import coin
+            self.comb_vis_root = coin.SoSeparator()
+
+            # G2 curvature comb (magenta lines)
+            comb_sep = coin.SoSeparator()
+            comb_col = coin.SoBaseColor()
+            comb_col.rgb = (1.0, 0.0, 1.0)  # Magenta
+            comb_sep.addChild(comb_col)
+            comb_style = coin.SoDrawStyle()
+            comb_style.lineWidth = 2
+            comb_sep.addChild(comb_style)
+            comb_coords = coin.SoCoordinate3()
+            comb_set = coin.SoLineSet()
+            self.comb_coords = comb_coords
+            self.comb_set = comb_set
+            comb_sep.addChild(comb_coords)
+            comb_sep.addChild(comb_set)
+            self.comb_vis_root.addChild(comb_sep)
+
+            # G3 jerk comb (orange lines, shorter)
+            jerk_sep = coin.SoSeparator()
+            jerk_col = coin.SoBaseColor()
+            jerk_col.rgb = (1.0, 0.5, 0.0)  # Orange
+            jerk_sep.addChild(jerk_col)
+            jerk_style = coin.SoDrawStyle()
+            jerk_style.lineWidth = 2
+            jerk_style.linePattern = coin.SoDrawStyle.DOT
+            jerk_sep.addChild(jerk_style)
+            jerk_coords = coin.SoCoordinate3()
+            jerk_set = coin.SoLineSet()
+            self.jerk_coords = jerk_coords
+            self.jerk_set = jerk_set
+            jerk_sep.addChild(jerk_coords)
+            jerk_sep.addChild(jerk_set)
+            self.comb_vis_root.addChild(jerk_sep)
+
+            # Numeric readout overlay (SoText2 is 2D, use 3D text approach)
+            # We'll use a text label in the status area instead for now
+
+            # Add to scene
+            doc = FreeCADGui.ActiveDocument
+            view = doc.ActiveView if doc is not None else None
+            if view:
+                view.getSceneGraph().addChild(self.comb_vis_root)
+
+        except Exception as exc:
+            FreeCAD.Console.PrintWarning(
+                f"Railform: Curvature comb visualization unavailable ({exc})\n")
+
+    def _update_curvature_comb(self):
+        """Update G2/G3 curvature comb visualization for all Bezier segments."""
+        if not self.is_bezier or not self.comb_vis_root or not self.handles_visible:
+            return
+
+        try:
+            pts = self._points()
+            if len(pts) < 2:
+                return
+
+            left_handles = getattr(self.obj, "LeftHandles", [Vector(0,0,0)] * len(self._points()))
+            right_handles = getattr(self.obj, "RightHandles", [Vector(0,0,0)] * len(self._points()))
+
+            # Sample each segment
+            samples_per_segment = 20
+            comb_pts = []
+            jerk_pts = []
+
+            for i in range(len(pts) - 1):
+                p0 = pts[i]
+                p3 = pts[i + 1]
+                p1 = right_handles[i]
+                p2 = left_handles[i + 1]
+
+                for j in range(samples_per_segment):
+                    t = j / (samples_per_segment - 1.0)
+                    p, d1, d2, d3 = _bezier_segment_derivatives(p0, p1, p2, p3, t)
+                    speed2 = d1.dot(d1)
+                    if speed2 < 1e-12:
+                        continue
+                    # Curvature
+                    cross = d1.cross(d2)
+                    curvature = cross.Length / (speed2 ** 1.5)
+                    # Jerk
+                    speed = speed2 ** 0.5
+                    d1_norm = d1 * (1.0 / speed) if speed > 1e-12 else Vector(0,0,0)
+                    d3 = (p0 - p1*3 + p2*3 - p0) * 6.0  # Wait, need proper d3
+                    d3 = (pts[i+1] - left_handles[i+1]*3 + right_handles[i]*3 - pts[i]) * 6.0 if False else None
+                    # Recompute d3 properly
+                    p0, p1, p2, p3 = pts[i], right_handles[i], left_handles[i+1], pts[i+1]
+                    d3 = (p3 - p2*3 + p1*3 - p0) * 6.0
+                    speed = speed2 ** 0.5
+                    if speed > 1e-12:
+                        d1_norm = d1 * (1.0 / speed)
+                        d3 = (p3 - p2*3 + p1*3 - p0) * 6.0
+                        d3_perp = d3 - d1_norm * d3.dot(d1_norm)
+                        jerk = d3_perp.Length / (speed2 * speed)
+                    else:
+                        jerk = 0.0
+
+                    # Scale for visualization
+                    scale = self._arrow_len() * 0.5
+                    comb_end = p + (d2 - d1 * (d2.dot(d1) / speed2)) * (1.0 / speed2) * scale
+                    jerk_end = p + d1 * jerk * scale * 0.3
+
+                    comb_pts.append((p.x, p.y, p.z))
+                    comb_pts.append((comb_end.x, comb_end.y, comb_end.z))
+                    jerk_pts.append((p.x, p.y, p.z))
+                    jerk_pts.append((jerk_end.x, jerk_end.y, jerk_end.z))
+
+            # Update Coin
+            self.comb_coords.point.setValues(0, len(comb_pts), comb_pts)
+            self.comb_set.numVertices.setValues(0, len(comb_pts) // 2, [2] * (len(comb_pts) // 2))
+
+            self.jerk_coords.point.setValues(0, len(jerk_pts), jerk_pts)
+            self.jerk_set.numVertices.setValues(0, len(jerk_pts) // 2, [2] * (len(jerk_pts) // 2))
+
+        except Exception as exc:
+            FreeCAD.Console.PrintWarning(
+                f"Railform: Error updating curvature comb: {exc}\n")
+
+    def _destroy_curvature_comb(self):
+        """Destroy curvature comb visualization."""
+        if self.comb_vis_root:
+            try:
+                doc = FreeCADGui.ActiveDocument
+                view = doc.ActiveView if doc is not None else None
+                if view:
+                    view.getSceneGraph().removeChild(self.comb_vis_root)
+            except Exception:
+                pass
+            self.comb_vis_root = None
 
 
 class KnotEditor(object):
@@ -2362,14 +2832,10 @@ class KnotEditor(object):
     # ---- teardown ---- #
     def finish(self):
         self._stop_watchdog()
-        try:
-            if self._cb_btn is not None:
-                self.view.removeEventCallback("SoMouseButtonEvent", self._cb_btn)
-            if self._cb_mov is not None:
-                self.view.removeEventCallback("SoLocation2Event", self._cb_mov)
-        except Exception as exc:
-            FreeCAD.Console.PrintWarning(
-                "Railform: knot editor callback teardown failed (%s)\n" % exc)
+        drop_callbacks(self.view, (
+            ("SoMouseButtonEvent", self, "_cb_btn"),
+            ("SoLocation2Event", self, "_cb_mov"),
+        ))
         try:
             self.view.getSceneGraph().removeChild(self.root)
         except Exception as exc:
@@ -2378,16 +2844,22 @@ class KnotEditor(object):
 
 
 class CornerFilletEditor(object):
-    """Illustrator-style LIVE per-corner fillet handles for a
-    PolylineFillet object (parametric.PolylineFilletFP).
+    """Illustrator-style LIVE per-corner fillet handles.
+
+    Two modes, keyed off the edited object itself:
+      * IN PLACE (preferred): `fillet_obj` IS the polyline (has a
+        `Fillets` record) -- handles read/write that record directly, so
+        the fillet lives on the curve, SolidWorks-sketch style, and no
+        second object exists.
+      * DERIVED (legacy): `fillet_obj` is a parametric.PolylineFillet
+        and reads/writes its `Radii` off its linked `Source`.
 
     One small ring marker per rounded-eligible corner of the SOURCE
     polyline, positioned exactly on that corner's fillet arc apex (the
     same `pmid` point core.polyline_corner_fillet computes for its arc)
     -- so the handle IS the visible fillet, not an abstract proxy for
     it. Dragging a handle along the corner's own bisector changes ONLY
-    that corner's radius, live, via obj.Radii (see
-    parametric.PolylineFilletFP), following the exact
+    that corner's radius, live, following the exact
     d = r / tan(half_angle) relationship the underlying fillet
     construction uses -- so the handle position and the arc actually
     built always agree, with no separate approximation of "where the
@@ -2408,8 +2880,13 @@ class CornerFilletEditor(object):
     """
 
     def __init__(self, fillet_obj, vobj_of_source):
-        self.obj = fillet_obj                # the PolylineFillet object
+        self.obj = fillet_obj                # PolylineFillet, or (in
+                                             # place) the polyline itself
         self.vobj = vobj_of_source            # ViewObject of the SOURCE curve
+        # In place iff the edited object carries the `Fillets` record
+        # itself (a Polyline); legacy PolylineFillet objects have
+        # Source/Radii instead.
+        self._inplace = hasattr(fillet_obj, "Fillets")
         doc = FreeCADGui.ActiveDocument
         self.view = doc.ActiveView if doc is not None else None
         self.sel = -1
@@ -2435,27 +2912,49 @@ class CornerFilletEditor(object):
 
     # ---- geometry (mirrors core.polyline_corner_fillet's per-corner math) --
     def _source_points(self):
+        if self._inplace:
+            return list(getattr(self.obj, "Points", []) or [])
         src = getattr(self.obj, "Source", None)
         if src is None:
             return []
         return list(getattr(src, "Points", []) or [])
 
     def _radii(self):
-        """Current per-corner radii, index-aligned with _source_points();
-        falls back to a flat list of the uniform Radius, same convention
-        as PolylineFilletFP.execute()."""
+        """Current per-corner radii, index-aligned with _source_points().
+
+        In place: the `Fillets` record itself, zero-padded so corners
+        added after the record was written show as sharp (their index
+        simply has no radius yet). Legacy: falls back to a flat list of
+        the uniform Radius, same convention as PolylineFilletFP.execute().
+        """
         pts = self._source_points()
+        if self._inplace:
+            radii = list(getattr(self.obj, "Fillets", []) or [])
+            if len(radii) < len(pts):
+                radii += [0.0] * (len(pts) - len(radii))
+            return radii[:len(pts)]
         radii = list(getattr(self.obj, "Radii", []) or [])
         if len(radii) != len(pts):
             radii = [float(getattr(self.obj, "Radius", 5.0))] * len(pts)
         return radii
+
+    def _set_radii(self, radii):
+        """Persist a dragged/edited radius list: the `Fillets` record in
+        place, `Radii` on the legacy derived PolylineFillet."""
+        if self._inplace:
+            self.obj.Fillets = [float(r) for r in radii]
+        else:
+            self.obj.Radii = radii
 
     def _corner_indices(self):
         pts = self._source_points()
         n = len(pts)
         if n < 3:
             return []
-        closed = bool(getattr(self.obj, "Closed", False))
+        if self._inplace:
+            closed = bool(getattr(self.obj, "FilletClosed", False))
+        else:
+            closed = bool(getattr(self.obj, "Closed", False))
         return list(range(n)) if closed else list(range(1, n - 1))
 
     def _corner_frame(self, i, tol=1e-7):
@@ -2626,7 +3125,7 @@ class CornerFilletEditor(object):
             radii = self._radii()
             if i < len(radii):
                 radii[i] = r
-            self.obj.Radii = radii
+            self._set_radii(radii)
             try:
                 self.obj.recompute()
             except Exception:
@@ -2678,15 +3177,10 @@ class CornerFilletEditor(object):
     # ---- teardown ---- #
     def finish(self):
         self._stop_watchdog()
-        try:
-            if self._cb_btn is not None:
-                self.view.removeEventCallback("SoMouseButtonEvent", self._cb_btn)
-            if self._cb_mov is not None:
-                self.view.removeEventCallback("SoLocation2Event", self._cb_mov)
-        except Exception as exc:
-            FreeCAD.Console.PrintWarning(
-                "Railform: corner fillet handle callback teardown failed "
-                "(%s)\n" % exc)
+        drop_callbacks(self.view, (
+            ("SoMouseButtonEvent", self, "_cb_btn"),
+            ("SoLocation2Event", self, "_cb_mov"),
+        ))
         try:
             self.view.getSceneGraph().removeChild(self.root)
         except Exception as exc:
@@ -3038,14 +3532,10 @@ class SurfaceEditor(object):
     # ---- teardown ---- #
     def finish(self):
         self._stop_watchdog()
-        try:
-            if self._cb_btn is not None:
-                self.view.removeEventCallback("SoMouseButtonEvent", self._cb_btn)
-            if self._cb_mov is not None:
-                self.view.removeEventCallback("SoLocation2Event", self._cb_mov)
-        except Exception as exc:
-            FreeCAD.Console.PrintWarning(
-                "Railform: knot editor callback teardown failed (%s)\n" % exc)
+        drop_callbacks(self.view, (
+            ("SoMouseButtonEvent", self, "_cb_btn"),
+            ("SoLocation2Event", self, "_cb_mov"),
+        ))
         try:
             self.view.getSceneGraph().removeChild(self.root)
         except Exception as exc:

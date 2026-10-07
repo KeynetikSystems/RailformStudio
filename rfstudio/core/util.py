@@ -330,18 +330,52 @@ def _nearest_facing_sides(face_a, face_b):
     faces the other -- the boundary-pair finder shared by match_surface,
     blend_surface, and surface_deviation (previously duplicated inline in
     match_surface; factored out here so the new QA/blend code doesn't grow
-    a fourth copy)."""
+    a fourth copy). Pairs rank by boundary-midpoint distance, but a
+    transverse (near-perpendicular) nearest pair is skipped for the
+    nearest parallel one -- stitching across a corner folds the seam."""
     def _iso_mid(face, side):
         u0, u1, v0, v1 = face.ParameterRange
         return face.valueAt(*{0: (u0, (v0 + v1) / 2), 1: (u1, (v0 + v1) / 2),
                               2: ((u0 + u1) / 2, v0), 3: ((u0 + u1) / 2, v1)}[side])
-    best, sa, sb = 1e18, 0, 0
+    def _edge_dir(face, side):
+        """Unit tangent along the side's real (trim-aware) boundary,
+        or None when it can't be established."""
+        try:
+            pr = face.ParameterRange
+            p0 = face.valueAt(*_side_uv_trimmed(face, pr, side, 0.4, {}))
+            p1 = face.valueAt(*_side_uv_trimmed(face, pr, side, 0.6, {}))
+            d = p1 - p0
+            if d.Length < 1e-12:
+                return None
+            d.normalize()
+            return d
+        except Exception:
+            return None
+
+    ranked = []
     for a in range(4):
         for b in range(4):
             d = _iso_mid(face_a, a).distanceToPoint(_iso_mid(face_b, b))
-            if d < best:
-                best, sa, sb = d, a, b
-    return sa, sb, face_a.ParameterRange, face_b.ParameterRange
+            ranked.append((d, a, b))
+    ranked.sort(key=lambda c: c[0])
+    da = [_edge_dir(face_a, a) for a in range(4)]
+    db = [_edge_dir(face_b, b) for b in range(4)]
+    for d, a, b in ranked:
+        va, vb = da[a], db[b]
+        if va is None or vb is None:
+            return a, b, face_a.ParameterRange, face_b.ParameterRange
+        try:
+            align = abs(va.dot(vb))
+        except Exception:
+            return a, b, face_a.ParameterRange, face_b.ParameterRange
+        # Orientation-agnostic: antiparallel edges are fine, transverse
+        # ones fold the seam (exact G0, garbage G1/G2).
+        if align >= 0.5:
+            return a, b, face_a.ParameterRange, face_b.ParameterRange
+    # Every pair transverse (degenerate geometry) -- historical
+    # pure-distance winner, so this never fails where it succeeded.
+    _d0, a0, b0 = ranked[0]
+    return a0, b0, face_a.ParameterRange, face_b.ParameterRange
 
 
 
@@ -535,52 +569,222 @@ def _side_is_trimmed(face, pr, side, corner_tol_rel=1e-3):
     Method: locate the real boundary edge (_trimmed_boundary_edge); if
     none is found (or the search is ambiguous), there's nothing to prove
     is trimmed, so return False (matches the existing untrimmed-fallback
-    behaviour elsewhere in this module). If one is found, compare its two
-    endpoints to the expected untrimmed corner points for that side --
-    if both endpoints sit within `corner_tol_rel` * the face's bounding
-    diagonal of the full iso-line's own corners, the edge spans the whole
-    side and there is nothing to distinguish from "untrimmed" for this
-    purpose; otherwise the edge is a genuine fragment of the full side and
-    the face is trimmed there.
+    behaviour elsewhere in this module). If one is found, compare its
+    extent in 3D space to the face's bounding box. If the edge's extent
+    in the direction parallel to the side is significantly less than the
+    face's extent in that direction, the face is trimmed on that side.
     """
     edge = _trimmed_boundary_edge(face, pr, side)
     if edge is None:
         return False
-    u0, u1, v0, v1 = pr
+
+    # NOTE: an earlier revision also compared the wire edge's world-axis
+    # bbox extent against the face bbox. That is wrong twice over: the
+    # face bbox is already post-trim (ratio ~1.0 by construction), and
+    # world X/Y mean nothing for non-XY-planar faces (it false-positived
+    # on cylinder rulings running along Z). Extent comparison belongs at
+    # the matched-edge level (see _matched_edges_compatible), not here.
+
+    # Get the UNDERLYING SURFACE's natural parameter bounds from its
+    # knot vectors. This is the key fix: trim_face reparameterizes the
+    # face, but the underlying BSpline surface's knot vectors still
+    # reflect the original untrimmed domain (for analytic surfaces,
+    # the natural bounds are used as fallback).
+    surf = face.Surface
+    u0_surf = u1_surf = v0_surf = v1_surf = None
+
+    # Try to get natural bounds from BSpline knot vectors
+    if hasattr(surf, 'UKnots') and hasattr(surf, 'VKnots'):
+        try:
+            uknots = list(surf.UKnots())
+            vknots = list(surf.VKnots())
+            if uknots and vknots:
+                u0_surf, u1_surf = uknots[0], uknots[-1]
+                v0_surf, v1_surf = vknots[0], vknots[-1]
+        except Exception:
+            pass
+
+    # Fallback to surface's Bounds method
+    if u0_surf is None:
+        if hasattr(surf, 'Bounds'):
+            try:
+                u0_surf, u1_surf, v0_surf, v1_surf = surf.Bounds()
+            except Exception:
+                pass
+        elif hasattr(surf, 'getBounds'):
+            try:
+                u0_surf, u1_surf, v0_surf, v1_surf = surf.getBounds()
+            except Exception:
+                pass
+
+    # For analytic surfaces (cylinder, cone, sphere, torus), compute geometric extent
+    if u0_surf is None:
+        surf_type = type(surf).__name__.lower()
+        if 'cylinder' in surf_type:
+            radius = 0.0
+            if hasattr(surf, 'Radius'):
+                radius = surf.Radius
+            elif hasattr(surf, 'radius'):
+                radius = surf.radius
+            else:
+                bb = face.BoundBox
+                radius = max(bb.XLength, bb.YLength) / 2.0
+            u0_surf, u1_surf = 0.0, 2.0 * math.pi
+            v0_surf, v1_surf = 0.0, face.BoundBox.ZLength
+        elif 'cone' in surf_type:
+            u0_surf, u1_surf, v0_surf, v1_surf = face.ParameterRange
+        elif 'sphere' in surf_type:
+            u0_surf, u1_surf = 0.0, 2.0 * math.pi
+            v0_surf, v1_surf = -math.pi/2, math.pi/2
+        elif 'torus' in surf_type:
+            u0_surf, u1_surf = 0.0, 2.0 * math.pi
+            v0_surf, v1_surf = 0.0, 2.0 * math.pi
+
+    # Fallback to surface's Bounds method
+    if u0_surf is None:
+        if hasattr(surf, 'Bounds'):
+            try:
+                u0_surf, u1_surf, v0_surf, v1_surf = surf.Bounds()
+            except Exception:
+                pass
+        elif hasattr(surf, 'getBounds'):
+            try:
+                u0_surf, u1_surf, v0_surf, v1_surf = surf.getBounds()
+            except Exception:
+                pass
+
+    # Fallback to surface's toBSpline then knot vectors
+    if u0_surf is None:
+        try:
+            bs = surf.toBSpline()
+            if hasattr(bs, 'UKnots') and hasattr(bs, 'VKnots'):
+                uknots = list(bs.UKnots())
+                vknots = list(bs.VKnots())
+                if uknots and vknots:
+                    u0_surf, u1_surf = uknots[0], uknots[-1]
+                    v0_surf, v1_surf = vknots[0], vknots[-1]
+        except Exception:
+            pass
+
+    # Fallback to face's parameter range if surface bounds unavailable
+    if u0_surf is None:
+        u0_surf, u1_surf, v0_surf, v1_surf = face.ParameterRange
+
+    # Compute the expected 3D corner points for this side using the
+    # surface's NATURAL parameter bounds (NOT the face's parameter range).
     corner0_uv, corner1_uv = {
-        0: ((u0, v0), (u0, v1)), 1: ((u1, v0), (u1, v1)),
-        2: ((u0, v0), (u1, v0)), 3: ((u0, v1), (u1, v1)),
+        0: ((u0_surf, v0_surf), (u0_surf, v1_surf)),  # umin
+        1: ((u1_surf, v0_surf), (u1_surf, v1_surf)),  # umax
+        2: ((u0_surf, v0_surf), (u1_surf, v0_surf)),  # vmin
+        3: ((u0_surf, v1_surf), (u1_surf, v1_surf)),  # vmax
     }[side]
+
     c0 = face.valueAt(*corner0_uv)
     c1 = face.valueAt(*corner1_uv)
+
+    # Get the actual edge endpoints in 3D space
     try:
         e0 = edge.valueAt(edge.FirstParameter)
         e1 = edge.valueAt(edge.LastParameter)
     except Exception:
-        return True    # can't verify extent -- treat conservatively as trimmed
+        return True
+
+    # Compare in 3D space: check if edge endpoints match expected corners
+    # within tolerance. Use face bounding box diagonal for tolerance scaling.
     try:
         diag = max(face.BoundBox.DiagonalLength, 1e-9)
     except Exception:
         diag = 1.0
     tol = corner_tol_rel * diag
+
+    # Check if edge endpoints match expected corners (in either order)
     matches_untrimmed = (
         (e0.distanceToPoint(c0) < tol and e1.distanceToPoint(c1) < tol) or
         (e0.distanceToPoint(c1) < tol and e1.distanceToPoint(c0) < tol))
     return not matches_untrimmed
 
 
+def _matched_edges_compatible(face_a, pr_a, sa, face_b, pr_b, sb,
+                              len_tol_rel=0.01, end_tol_rel=1e-3):
+    """True when the two matched boundary edges coincide geometrically
+    (same length within `len_tol_rel`, endpoints coincident within
+    `end_tol_rel` of the larger face diagonal) -- the precondition for
+    any control-net row copy between the faces.
 
-# --- Blender Railform rail interchange ------------------------------------ #
-# Interchange format (JSON), one object with a "rails" list. Each rail:
-#   { "degree": int,
-#     "poles":  [[x,y,z], ...],          # control points
-#     "knots":  [float, ...],            # optional; clamped-uniform if omitted
-#     "mults":  [int, ...],              # optional; matches knots
-#     "weights":[float, ...],            # optional; non-rational if omitted
-#     "continuity": "G0|G1|G2|G3" }      # advisory tag for downstream policy
-#
-# Keeping this Gui-free means we can build + round-trip-test it under freecadcmd,
-# unlike anything that touches Silk/Curves.
+    This is what actually guards exact matching, and it subsumes trim
+    detection: copying rows is valid if and only if the two boundary
+    edges are the same curve, regardless of either face's trim history.
+    A trimmed face whose matched edge coincides with the reference edge
+    matches fine; a trimmed (or merely different) edge that doesn't is
+    refused with (False, reason) so the caller falls back to sampled,
+    trim-aware matching instead of silently miscopying rows.
+
+    Unverifiable inputs (no wire edge found, unreadable lengths) return
+    (True, "") -- permissive, preserving historical behavior where the
+    downstream harmonization still fails loudly on its own when the
+    parametrizations truly disagree.
+
+    Returns (compatible: bool, reason: str)."""
+    try:
+        ea = _trimmed_boundary_edge(face_a, pr_a, sa)
+        eb = _trimmed_boundary_edge(face_b, pr_b, sb)
+    except Exception:
+        return True, ""
+    if ea is None or eb is None:
+        return True, ""
+    try:
+        la, lb = ea.Length, eb.Length
+    except Exception:
+        return True, ""
+    span = max(la, lb)
+    if span < 1e-9:
+        return True, ""
+    if abs(la - lb) / span > len_tol_rel:
+        return False, ("matched edges differ in length (%.4g vs %.4g) -- "
+                       "control-net rows do not correspond 1:1" % (la, lb))
+    try:
+        a0 = ea.valueAt(ea.FirstParameter)
+        a1 = ea.valueAt(ea.LastParameter)
+        b0 = eb.valueAt(eb.FirstParameter)
+        b1 = eb.valueAt(eb.LastParameter)
+    except Exception:
+        return True, ""
+    try:
+        diag = max(face_a.BoundBox.DiagonalLength,
+                   face_b.BoundBox.DiagonalLength, 1e-9)
+    except Exception:
+        diag = 1.0
+    tol = end_tol_rel * diag
+    straight = (a0.distanceToPoint(b0) < tol and
+                a1.distanceToPoint(b1) < tol)
+    flipped = (a0.distanceToPoint(b1) < tol and
+               a1.distanceToPoint(b0) < tol)
+    if not (straight or flipped):
+        return False, ("matched edge endpoints do not coincide "
+                       "(gap %.4g > tol %.4g) -- not the same seam"
+                       % (min(a0.distanceToPoint(b0) + a1.distanceToPoint(b1),
+                              a0.distanceToPoint(b1) + a1.distanceToPoint(b0)),
+                          tol))
+    return True, ""
+
+
+def rails_to_edges(doc_dict):
+    """interchange dict -> list of BSpline edges (+ their continuity tags)."""
+    out = []
+    for rail in doc_dict.get("rails", []):
+        out.append((rail_to_bspline(rail), rail.get("continuity", "G0")))
+    return out
+
+def _clamped_knots(n_poles, degree):
+    n_interior = n_poles - degree - 1
+    if n_interior < 0:
+        raise ValueError("need n_poles >= degree+1")
+    interior = [float(i + 1) / (n_interior + 1) for i in range(n_interior)]
+    return [0.0] + interior + [1.0]
+
+def _clamped_mults(n_poles, degree):
+    n_interior = n_poles - degree - 1
+    return [degree + 1] + [1] * n_interior + [degree + 1]
 def rail_to_bspline(rail):
     """Rebuild one interchange rail as an exact Part.BSplineCurve edge."""
     poles = [Vector(*p) for p in rail["poles"]]
@@ -609,28 +813,6 @@ def rail_to_bspline(rail):
 
 
 
-def rails_to_edges(doc_dict):
-    """interchange dict -> list of BSpline edges (+ their continuity tags)."""
-    out = []
-    for rail in doc_dict.get("rails", []):
-        out.append((rail_to_bspline(rail), rail.get("continuity", "G0")))
-    return out
-
-
-
-def _clamped_knots(n_poles, degree):
-    n_interior = n_poles - degree - 1
-    if n_interior < 0:
-        raise ValueError("need n_poles >= degree+1")
-    interior = [float(i + 1) / (n_interior + 1) for i in range(n_interior)]
-    return [0.0] + interior + [1.0]
-
-
-
-def _clamped_mults(n_poles, degree):
-    n_interior = n_poles - degree - 1
-    return [degree + 1] + [1] * n_interior + [degree + 1]
-
 __all__ = [
     'G0',
     'G1',
@@ -655,6 +837,7 @@ __all__ = [
     '_hermite5',
     '_hermite7',
     '_nearest_facing_sides',
+    '_matched_edges_compatible',
     '_side_uv',
     '_trimmed_boundary_candidates',
     '_trimmed_boundary_edge',

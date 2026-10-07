@@ -263,7 +263,298 @@ def polyline_corner_fillet(points, radius, closed=False, tol=1e-7):
 
 
 
-# --- radius-driven fillet / chamfer (RFS_Fillet) -------------------------- #
+
+
+
+def wire_corner_fillet(wire, radius, tol=1e-7):
+    """Round each interior corner of a general Wire with tangent arcs.
+
+    Works on any Wire (Line, Arc, BSpline, Ellipse, etc.) by computing
+    tangents at junctions and inserting tangent circular arcs.
+
+    `radius` is either:
+      * a single float, broadcast to every corner, or
+      * a dict {corner_index: radius} for PER-CORNER control.
+        A corner index missing from the dict, or given as 0/None, is left sharp.
+
+    Returns a new Part.Wire with straight/runs preserved and corners
+    replaced by tangent circular arcs. The radius is auto-reduced per
+    corner so an arc never consumes more than half of either neighbouring
+    edge. Collinear corners are left sharp. Gui-free -- headless testable.
+    """
+    radius_map = radius if isinstance(radius, dict) else None
+    if radius_map is None and (radius is None or radius <= 0):
+        raise ValueError("wire_corner_fillet: radius must be > 0")
+
+    edges = list(wire.Edges)
+    n = len(edges)
+    if n < 2:
+        return wire.copy()
+
+    closed = wire.isClosed()
+    idxs = range(n) if closed else range(1, n)
+
+    corner = {}   # corner_idx -> (p1, pmid, p2) arc definition
+
+    for i in idxs:
+        r = radius_map.get(i, 0.0) if radius_map is not None else radius
+        if not r or r <= 0:
+            continue
+
+        edge_prev = edges[(i - 1) % len(edges)]
+        edge_next = edges[i]
+        vertex = edge_prev.Vertexes[-1]
+        v_pt = vertex.Point
+
+        try:
+            t1 = edge_prev.tangentAt(edge_prev.LastParameter)
+            t2 = edge_next.tangentAt(edge_next.FirstParameter)
+        except Exception:
+            continue
+
+        l1, l2 = t1.Length, t2.Length
+        if l1 < tol or l2 < tol:
+            continue
+        t1 = t1 * (1.0 / l1)
+        t2 = t2 * (1.0 / l2)
+
+        cos_phi = max(-1.0, min(1.0, t1.dot(t2)))
+        phi = math.acos(max(-1.0, min(1.0, cos_phi)))
+        if phi < 1e-4 or abs(math.pi - phi) < 1e-4:
+            continue
+
+        half = phi / 2.0
+        d = r / math.tan(half)
+
+        # Limit d to half of each edge's length
+        max_d = min(edge_prev.Length, edge_next.Length) * 0.5
+        d = min(d, max_d)
+        if d < tol:
+            continue
+
+        r_eff = d * math.tan(phi / 2.0)
+
+        # Get actual tangents at the junction
+        u = edge_prev.tangentAt(edge_prev.LastParameter)
+        v = edge_next.tangentAt(edge_next.FirstParameter)
+        u = u * (1.0 / u.Length)
+        v = v * (1.0 / v.Length)
+        bis = u + v
+        lb = bis.Length
+        if lb < tol:
+            continue
+        bis = bis * (1.0 / lb)
+
+        center = Vector(edge_prev.valueAt(edge_prev.LastParameter)) + bis * (r_eff / math.sin(phi / 2.0))
+
+        # Point at distance d back from junction on edge_prev
+        # Approximate by linear parameter interpolation
+        def _point_at_dist_back(edge, dist):
+            length = edge.Length
+            if dist >= length - tol:
+                return edge.valueAt(edge.FirstParameter)
+            param = edge.LastParameter - (dist / length) * (edge.LastParameter - edge.FirstParameter)
+            return edge.valueAt(param)
+
+        def _point_at_dist_forward(edge, dist):
+            length = edge.Length
+            if dist >= length - tol:
+                return edge.valueAt(edge.LastParameter)
+            param = edge.FirstParameter + (dist / length) * (edge.LastParameter - edge.FirstParameter)
+            return edge.valueAt(param)
+
+        p1 = _point_at_dist_back(edge_prev, d)
+        p2 = _point_at_dist_forward(edge_next, d)
+
+        # Arc mid-point (approximate: perpendicular to bisector at radius)
+        cb = Vector(edge_prev.valueAt(edge_prev.LastParameter)) - center
+        lcb = cb.Length
+        if lcb > tol:
+            pmid = center + cb * (r_eff / lcb)
+        else:
+            pmid = (p1 + p2) * 0.5
+
+        corner[i] = (p1, pmid, p2)
+
+    if not corner:
+        return wire.copy()
+
+    # Build new wire with trimmed edges and arcs
+    edges_new = []
+
+    if closed:
+        # Closed wire: n edges, n corners at vertices 0..n-1
+        # Each edge k goes from vertex k to vertex (k+1)%n
+        for k in range(len(edges)):
+            # Start at vertex k
+            if k in corner:
+                s = corner[k][2]
+            else:
+                s = edges[k].valueAt(edges[k].FirstParameter)
+
+            # End at vertex (k+1)%n
+            next_v = (k + 1) % len(edges)
+            if next_v in corner:
+                e = corner[next_v][0]
+            else:
+                e = edges[k].valueAt(edges[k].LastParameter)
+
+            if (Vector(e) - Vector(s)).Length > tol:
+                edges_new.append(Part.LineSegment(Vector(s), Vector(e)).toShape())
+
+            # Arc at next vertex
+            if next_v in corner:
+                p1, pmid, p2 = corner[next_v]
+                try:
+                    edges_new.append(Part.Arc(Vector(p1), Vector(pmid), Vector(p2)).toShape())
+                except Exception:
+                    if (Vector(p2) - Vector(p1)).Length > tol:
+                        edges_new.append(Part.LineSegment(Vector(p1), Vector(p2)).toShape())
+    else:
+        # Open wire: n edges, n-1 corners at vertices 1..n-1
+        for k in range(len(edges)):
+            # Edge k goes from vertex k to vertex k+1
+            # Start at vertex k
+            if k in corner:
+                s = corner[k][2]
+            else:
+                s = edges[k].valueAt(edges[k].FirstParameter)
+
+            # End at vertex k+1
+            if k + 1 < len(edges) and (k + 1) in corner:
+                e = corner[k + 1][0]
+            else:
+                e = edges[k].valueAt(edges[k].LastParameter)
+
+            if (Vector(e) - Vector(s)).Length > tol:
+                edges_new.append(Part.LineSegment(Vector(s), Vector(e)).toShape())
+
+            # Arc at vertex k+1
+            if k + 1 < len(edges) and (k + 1) in corner:
+                p1, pmid, p2 = corner[k + 1]
+                try:
+                    edges_new.append(Part.Arc(Vector(p1), Vector(pmid), Vector(p2)).toShape())
+                except Exception:
+                    if (Vector(p2) - Vector(p1)).Length > tol:
+                        edges_new.append(Part.LineSegment(Vector(p1), Vector(p2)).toShape())
+
+    return Part.Wire(edges_new)
+
+
+def _corner_cut_points(wire, dist_map, tol=1e-7):
+    """Shared corner-trim computation for wire_corner_fillet/chamfer.
+
+    Returns ({idx: (p1, p2)}, closed, edges) where p1/p2 sit `dist`
+    back from corner vertex idx along the previous/next edge
+    (linear-parameter approximation, clamped to half the shorter
+    neighbour edge). Collinear corners are skipped. `dist_map` is
+    {corner_idx: setback} with missing/zero entries left sharp."""
+    edges = list(wire.Edges)
+    if len(edges) < 2:
+        return {}, False, edges
+    closed = wire.isClosed()
+    idxs = range(len(edges)) if closed else range(1, len(edges))
+    cuts = {}
+    for i in idxs:
+        d = dist_map.get(i, 0.0)
+        if not d or d <= 0:
+            continue
+        edge_prev = edges[(i - 1) % len(edges)]
+        edge_next = edges[i]
+        try:
+            t1 = edge_prev.tangentAt(edge_prev.LastParameter)
+            t2 = edge_next.tangentAt(edge_next.FirstParameter)
+        except Exception:
+            continue
+        if t1.Length < tol or t2.Length < tol:
+            continue
+        t1 = t1 * (1.0 / t1.Length)
+        t2 = t2 * (1.0 / t2.Length)
+        cos_phi = max(-1.0, min(1.0, t1.dot(t2)))
+        phi = math.acos(cos_phi)
+        if phi < 1e-4 or abs(math.pi - phi) < 1e-4:
+            continue                     # collinear -> leave sharp
+        d = min(d, 0.5 * min(edge_prev.Length, edge_next.Length))
+        if d < tol:
+            continue
+
+        def _back(edge, dist):
+            if dist >= edge.Length - tol:
+                return edge.valueAt(edge.FirstParameter)
+            u = (edge.LastParameter -
+                 (dist / edge.Length) *
+                 (edge.LastParameter - edge.FirstParameter))
+            return edge.valueAt(u)
+
+        def _fwd(edge, dist):
+            if dist >= edge.Length - tol:
+                return edge.valueAt(edge.LastParameter)
+            u = (edge.FirstParameter +
+                 (dist / edge.Length) *
+                 (edge.LastParameter - edge.FirstParameter))
+            return edge.valueAt(u)
+
+        cuts[i] = (_back(edge_prev, d), _fwd(edge_next, d))
+    return cuts, closed, edges
+
+
+def _splice_cuts(edges, cuts, closed, tol, join):
+    """Rebuild a wire from trimmed edges, calling join(p1, p2) (which
+    returns a list of edges) at each cut corner."""
+    out = []
+    n = len(edges)
+    if closed:
+        for k in range(n):
+            s = cuts[k][1] if k in cuts else edges[k].valueAt(
+                edges[k].FirstParameter)
+            nxt = (k + 1) % n
+            e = cuts[nxt][0] if nxt in cuts else edges[k].valueAt(
+                edges[k].LastParameter)
+            if (Vector(e) - Vector(s)).Length > tol:
+                out.append(Part.LineSegment(Vector(s), Vector(e)).toShape())
+            if nxt in cuts:
+                out.extend(join(*cuts[nxt]))
+    else:
+        for k in range(n):
+            s = cuts[k][1] if k in cuts else edges[k].valueAt(
+                edges[k].FirstParameter)
+            if k + 1 < n and (k + 1) in cuts:
+                e = cuts[k + 1][0]
+            else:
+                e = edges[k].valueAt(edges[k].LastParameter)
+            if (Vector(e) - Vector(s)).Length > tol:
+                out.append(Part.LineSegment(Vector(s), Vector(e)).toShape())
+            if k + 1 < n and (k + 1) in cuts:
+                out.extend(join(*cuts[k + 1]))
+    return Part.Wire(out)
+
+
+def wire_corner_chamfer(wire, dist, tol=1e-7):
+    """Cut each interior corner of a general Wire with a straight chamfer.
+
+    Works on any Wire (Line, Arc, BSpline, Ellipse, ...) by cutting
+    back `dist` from each corner vertex along both neighbour edges and
+    joining the cut points with a straight edge.
+
+    `dist` is either a single setback float (broadcast) or a dict
+    {corner_index: setback}; missing/zero entries stay sharp. The
+    setback is clamped to half the shorter neighbour edge, collinear
+    corners are skipped. Gui-free -- headless testable."""
+    dist_map = dist if isinstance(dist, dict) else None
+    if dist_map is None and (dist is None or dist <= 0):
+        raise ValueError("wire_corner_chamfer: setback must be > 0")
+    cuts, closed, edges = _corner_cut_points(
+        wire, dist_map if dist_map is not None
+        else {i: dist for i in range(len(list(wire.Edges)))}, tol)
+
+    def _chamfer(p1, p2):
+        if (Vector(p2) - Vector(p1)).Length > tol:
+            return [Part.LineSegment(Vector(p1), Vector(p2)).toShape()]
+        return []
+
+    if not cuts:
+        return wire.copy()
+    return _splice_cuts(edges, cuts, closed, tol, _chamfer)
 # blend_surface (above) handles the OPEN-SURFACE case -- "I have two
 # adjacent unclosed patches, build a blend strip between them" -- but has
 # no concept of an actual world-units RADIUS, only a dimensionless scale
@@ -763,6 +1054,10 @@ __all__ = [
     'shell_solid',
     '_polyline_wire',
     'polyline_corner_fillet',
+    'wire_corner_fillet',
+    '_corner_cut_points',
+    '_splice_cuts',
+    'wire_corner_chamfer',
     '_solid_fillet_chamfer_common',
     'fillet_solid',
     'chamfer_solid',

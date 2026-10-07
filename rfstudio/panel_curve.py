@@ -21,6 +21,7 @@ from rfstudio import parametric
 from rfstudio import snaputil
 from rfstudio.panel_base import (
     _EditPanelBase, _selected_points, _notify_overlay_unavailable,
+    _ShortcutHintBar, drop_callbacks,
 )
 
 
@@ -130,18 +131,25 @@ class CurvePanel(_EditPanelBase):
         self.constraints = []
 
         self.form = QtWidgets.QWidget()
-        self.form.setWindowTitle("Railform – %s" % self.kind)
+        self.form.setWindowTitle("Railform -- %s" % self.kind)
         self._lay = QtWidgets.QVBoxLayout(self.form)
+
+        # --- viewport shortcut hint bar ----------------------------------- #
+        self.shortcut_bar = _ShortcutHintBar("X/Y/Z: lock  |  Tab: plane  |  Esc: drop")
+        self._lay.addWidget(self.shortcut_bar)
 
         # Add curve type converter controls
         self._add_converter_controls()
 
         self._build()
         self._setup_highlight()
-        if self.creating:
-            pre = _selected_points()
-            if pre:
-                self._set_points(pre)
+        # Deliberately NOT auto-seeding a new curve's points from whatever
+        # happens to be selected right now -- every draw-tool entry point
+        # (RFS_Draw*) is click-to-place, and FreeCAD conventionally leaves
+        # the previous curve selected after accept(), so this used to
+        # silently start the next curve with the last curve's points. Use
+        # the "Add selected" button (_add_sel) to seed from selection
+        # on purpose.
         self._fill_table()
         self.recompute()
 
@@ -1193,12 +1201,10 @@ class CurvePanel(_EditPanelBase):
                 self._snap_shapes = self._collect_snap_shapes()
                 self._build_snap_overlay(view)
             else:
-                if self._cbid is not None:
-                    view.removeEventCallback("SoMouseButtonEvent", self._cbid)
-                    self._cbid = None
-                if self._cbid_mov is not None:
-                    view.removeEventCallback("SoLocation2Event", self._cbid_mov)
-                    self._cbid_mov = None
+                drop_callbacks(view, (
+                    ("SoMouseButtonEvent", self, "_cbid"),
+                    ("SoLocation2Event", self, "_cbid_mov"),
+                ))
                 self._remove_snap_overlay(view)
                 self._snap_pt = None
                 self._snap_cands = []
@@ -1218,6 +1224,13 @@ class CurvePanel(_EditPanelBase):
             if view is None:
                 raise Exception("No active view")
             if on:
+                # Already on -- re-registering here would leak a second,
+                # overlapping pair of Coin event callbacks (the previous
+                # pair's IDs would be overwritten and never removed), so
+                # every click/move would fire twice. See commands.py's
+                # _draw_tool_panel for the bug this guards against.
+                if getattr(self, '_drawing', False):
+                    return
                 # If pick mode is on, turn it off since these modes are exclusive
                 if getattr(self, '_cbid', None) is not None:
                     self._toggle_pick(False)
@@ -1236,12 +1249,10 @@ class CurvePanel(_EditPanelBase):
                 self._draw_points = []  # Temporary points for drawing
             else:
                 # Clean up draw mode callbacks
-                if getattr(self, '_draw_cb_id', None) is not None:
-                    view.removeEventCallback("SoMouseButtonEvent", self._draw_cb_id)
-                    self._draw_cb_id = None
-                if getattr(self, '_draw_cb_id_mov', None) is not None:
-                    view.removeEventCallback("SoLocation2Event", self._draw_cb_id_mov)
-                    self._draw_cb_id_mov = None
+                drop_callbacks(view, (
+                    ("SoMouseButtonEvent", self, "_draw_cb_id"),
+                    ("SoLocation2Event", self, "_draw_cb_id_mov"),
+                ))
                 self._remove_snap_overlay(view)
                 self._snap_cands = []
                 self._snap_shapes = []
@@ -1453,17 +1464,25 @@ class CurvePanel(_EditPanelBase):
                 # For draw mode, we use default weights (all 1.0) since weights
                 # can't be specified during drawing - they can be edited afterward
                 pts = self._draw_points
-                self._set_points(pts)
 
                 # For ControlCurve, reset weights to defaults (1.0) since we
-                # don't capture weights during drawing
+                # don't capture weights during drawing. Must happen BEFORE
+                # _set_points, which writes self._weights to obj.Weights.
                 if self.kind == "ControlCurve":
                     self._weights = [1.0] * len(pts)
-                    self._set_weights(self._weights)
 
-                # Update the editor and table to reflect the new points
+                self._set_points(pts)
+
+                # Update the editor and table to reflect the new points.
+                # PointEditor has no setup() method -- refresh its existing
+                # markers/arrows instead (same pattern used elsewhere in
+                # this file, e.g. _on_spin_changed).
                 if self._editor is not None:
-                    self._editor.setup()
+                    try:
+                        self._editor._refresh_markers()
+                        self._editor._refresh_arrows()
+                    except Exception:
+                        pass
                 self._fill_table()
 
                 # Clean up drawing state
@@ -1474,6 +1493,7 @@ class CurvePanel(_EditPanelBase):
         else:
             # Normal pick mode behavior
             self._toggle_pick(False)
+        self._flush_pending_transaction(commit=True)
 
     def _pre_reject(self):
         # If we're in draw mode, handle drawing cancellation instead of pick mode
@@ -1487,6 +1507,25 @@ class CurvePanel(_EditPanelBase):
         else:
             # Normal pick mode behavior
             self._toggle_pick(False)
+        self._flush_pending_transaction(commit=False)
+
+    def _flush_pending_transaction(self, commit):
+        """_on_click/_on_draw_click always leave exactly one transaction open
+        after the last pick — commit() closes previous + opens new each time,
+        so nothing ever closes the FINAL one. Left open, it isn't in the undo
+        stack and isn't durably committed until some *later* command's own
+        commitTransaction() call happens to flush it (the 'works the second
+        time' symptom). Close it here, one way or the other, before the panel
+        exits."""
+        if self._pick_count > 0:
+            try:
+                if commit:
+                    self.doc.commitTransaction()
+                else:
+                    self.doc.abortTransaction()
+            except Exception as exc:
+                FreeCAD.Console.PrintWarning(
+                    "Railform: could not close pick transaction (%s)\n" % exc)
 
     def _post_abort(self):
         if self.creating:

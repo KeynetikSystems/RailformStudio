@@ -23,6 +23,7 @@ from rfstudio import parametric
 from rfstudio import panel_logic
 from rfstudio.panel_base import (
     _EditPanelBase, _CurveGroup, _selected_objects, _notify_overlay_unavailable,
+    _CollapsibleGroup, _ShortcutHintBar, drop_callbacks, _status_label,
 )
 from rfstudio.panel_lawcurve import LawCurveWidget
 
@@ -124,6 +125,18 @@ class SurfacePanel(_EditPanelBase):
             self._lay.addWidget(self._match_diag)
             self._update_match_diagnostics()
 
+        # MirrorGroup only: per-source weld outcome. _LastWeldOK is a
+        # plain runtime list attribute set by MirrorGroupFP.execute()
+        # (not an addProperty -- session-only), index-aligned with
+        # Sources as of the last recompute.
+        if self.kind == "MirrorGroup":
+            self._mirror_weld_diag = QtWidgets.QLabel("")
+            self._mirror_weld_diag.setWordWrap(True)
+            self._mirror_weld_diag.setStyleSheet(
+                "font-size:11px;padding:2px 0;")
+            self._lay.addWidget(self._mirror_weld_diag)
+            self._update_mirror_weld_diagnostics()
+
         # Gordon only: click a row in either list to flash the matching
         # curve in the viewport. Selection-driven, no preview grid, no
         # auto-orient -- just a highlight overlay on the document object
@@ -143,7 +156,45 @@ class SurfacePanel(_EditPanelBase):
     def _scalar_controls(self):
         obj = self.obj
         link_props = {p for p, _, _ in parametric.GROUPS[self.kind]}
+        
+        # Match: wrap Samples/Scale in collapsible Advanced group
+        if self.kind == "Match":
+            self.adv_match = _CollapsibleGroup("Advanced: samples / scale", collapsed=True)
+            for name in ("Samples", "Scale"):
+                if name in obj.PropertiesList and obj.getGroupOfProperty(name) == self.kind:
+                    tid = obj.getTypeIdOfProperty(name)
+                    if tid == "App::PropertyInteger":
+                        self._add_int(name)
+                    elif tid == "App::PropertyFloat":
+                        self._add_float(name)
+                    # Move the created widgets into the collapsible group
+                    # (they were added via _row -> _lay, so we need to move them)
+            # This is complex - let's use a simpler approach
+            # Instead, add the controls directly in the group
+            self.adv_match.content_layout.addWidget(QtWidgets.QLabel("Samples"))
+            self.samples = QtWidgets.QSpinBox()
+            self.samples.setRange(4, 200)
+            self.samples.setValue(int(getattr(obj, "Samples", 24)))
+            self.samples.valueChanged.connect(lambda v: self._set("Samples", v))
+            self.adv_match.content_layout.addWidget(self.samples)
+
+            self.adv_match.content_layout.addWidget(QtWidgets.QLabel("Scale"))
+            self.scale = QtWidgets.QDoubleSpinBox()
+            self.scale.setRange(0.1, 5.0)
+            self.scale.setSingleStep(0.1)
+            self.scale.setValue(float(getattr(obj, "Scale", 1.0)))
+            self.adv_match.content_layout.addWidget(self.scale)
+            self.scale.valueChanged.connect(lambda v: self._set("Scale", v))
+            self._lay.addWidget(self.adv_match)
+            
+            # Skip Samples/Scale in the generic loop
+            skip_match = {"Samples", "Scale"}
+        else:
+            skip_match = set()
+
         for name in obj.PropertiesList:
+            if name in skip_match:
+                continue
             if obj.getGroupOfProperty(name) != self.kind or name in link_props:
                 continue
             tid = obj.getTypeIdOfProperty(name)
@@ -155,6 +206,8 @@ class SurfacePanel(_EditPanelBase):
                 self._add_int(name)
             elif tid == "App::PropertyFloat":
                 self._add_float(name)
+            elif tid == "App::PropertyVector":
+                self._add_vector(name)
 
     def _row(self, label, widget):
         r = QtWidgets.QHBoxLayout()
@@ -192,6 +245,28 @@ class SurfacePanel(_EditPanelBase):
         sb.setValue(float(getattr(self.obj, name)))
         sb.valueChanged.connect(lambda v, n=name: self._set(n, v))
         self._row(name, sb)
+
+    def _add_vector(self, name):
+        vec = getattr(self.obj, name)
+        spins = []
+        for val in (vec.x, vec.y, vec.z):
+            sb = QtWidgets.QDoubleSpinBox()
+            sb.setDecimals(3)
+            sb.setRange(-1e6, 1e6)
+            sb.setSingleStep(0.1)
+            sb.setValue(val)
+            spins.append(sb)
+
+        def _commit(*_a, n=name, sp=spins):
+            self._set(n, FreeCAD.Vector(sp[0].value(), sp[1].value(), sp[2].value()))
+        for sb in spins:
+            sb.valueChanged.connect(_commit)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel(name))
+        row.addStretch(1)
+        for sb in spins:
+            row.addWidget(sb)
+        self._lay.addLayout(row)
 
     def _xfer(self, src_i, dst_i):
         """Move selected items from one group list to the other."""
@@ -236,13 +311,35 @@ class SurfacePanel(_EditPanelBase):
         self._update_status()
         if self.kind == "Match" and getattr(self, "_match_diag", None) is not None:
             self._update_match_diagnostics()
+        if self.kind == "MirrorGroup" and getattr(self, "_mirror_weld_diag", None) is not None:
+            self._update_mirror_weld_diagnostics()
+
+    def _update_mirror_weld_diagnostics(self):
+        """MirrorGroup kind only: report how many of the current Sources
+        actually got welded to their own mirror this recompute (only
+        meaningful while WeldSeam is on)."""
+        lbl = getattr(self, "_mirror_weld_diag", None)
+        if lbl is None:
+            return
+        if not bool(getattr(self.obj, "WeldSeam", False)):
+            lbl.setText("")
+            return
+        welds = getattr(self.obj, "_LastWeldOK", None)
+        if not welds:
+            lbl.setText("")
+            return
+        ok = sum(1 for w in welds if w)
+        lbl.setText("%d/%d source(s) welded." % (ok, len(welds)))
+        lbl.setStyleSheet(
+            ("color:#7fae5a;" if ok == len(welds) else "color:#c08552;")
+            + "font-size:11px;padding:2px 0;")
 
     def _update_match_diagnostics(self):
         """Match kind only: show which algorithm match_surface_to_references
-        actually used (exact_g1 vs sampled) and the achieved grade, and --
-        when exact_g1 fired -- an explicit note that the target's control
+        actually used (exact_g2 / exact_g1 vs sampled) and the achieved grade, and --
+        when an exact path fired -- an explicit note that the target's control
         net was directly overwritten near the shared edge (see
-        core.match_surface_exact_g1's docstring), not just resampled."""
+        core.match_surface_exact_g1/_g2 docstrings), not just resampled."""
         lbl = getattr(self, "_match_diag", None)
         if lbl is None:
             return
@@ -266,10 +363,16 @@ class SurfacePanel(_EditPanelBase):
             colors = {"G2": "#7fae5a", "G1": "#c08552", "G0": "#c08552",
                      "FAIL": "#c0392b"}
             method = report.get("method", "sampled")
-            note = (" -- target's control net near the shared edge was "
-                   "directly overwritten from the reference (exact "
-                   "copy, not a resampled fit)." if method == "exact_g1"
-                   else " -- rebuilt by sampled Hermite fit (no control-"
+            if method == "exact_g1":
+                note = (" -- target's control net near the shared edge was "
+                       "directly overwritten from the reference (2 rows: "
+                       "exact G0/G1 copy, not a resampled fit).")
+            elif method == "exact_g2":
+                note = (" -- target's control net near the shared edge was "
+                       "directly overwritten from the reference (3 rows: "
+                       "exact G0/G1/G2 copy, not a resampled fit).")
+            else:
+                note = (" -- rebuilt by sampled Hermite fit (no control-"
                         "net rows copied).")
             lbl.setText(
                 "Match method: <b>%s</b>, achieved: <b>%s</b> "
@@ -478,9 +581,11 @@ class SurfacePanel(_EditPanelBase):
                 try:
                     doc = FreeCADGui.ActiveDocument
                     view = doc.ActiveView if doc is not None else None
-                    if view:
-                        view.removeEventCallback(
-                            "SoMouseButtonEvent", self._gordon_pick_cbid)
+                    if view is not None:
+                        drop_callbacks(view, (
+                            ("SoMouseButtonEvent", self,
+                             "_gordon_pick_cbid"),
+                        ))
                 except Exception:
                     pass
             self._gordon_pick_cbid = None
@@ -553,13 +658,14 @@ class SurfacePanel(_EditPanelBase):
         except Exception:
             pass
         self._gordon_hl_root = None
-        if getattr(self, "_gordon_pick_cbid", None):
+        if getattr(self, "_gordon_pick_cbid", None) is not None:
             try:
                 doc = FreeCADGui.ActiveDocument
                 view = doc.ActiveView if doc is not None else None
-                if view:
-                    view.removeEventCallback(
-                        "SoMouseButtonEvent", self._gordon_pick_cbid)
+                if view is not None:
+                    drop_callbacks(view, (
+                        ("SoMouseButtonEvent", self, "_gordon_pick_cbid"),
+                    ))
             except Exception:
                 pass
             self._gordon_pick_cbid = None
@@ -1477,12 +1583,23 @@ class BlendSurfPanel(_EditPanelBase):
         self.cont.currentTextChanged.connect(
             lambda v: self._set("Continuity", v))
 
+        # Advanced controls for BlendSurf (collapsible)
+        self.adv_blend = _CollapsibleGroup("Advanced: samples / scale", collapsed=True)
+        self.adv_blend.content_layout.addWidget(QtWidgets.QLabel("Samples"))
+        self.samples = QtWidgets.QSpinBox()
+        self.samples.setRange(4, 200)
+        self.samples.setValue(int(self.obj.Samples))
+        self.samples.valueChanged.connect(lambda v: self._set("Samples", v))
+        self.adv_blend.content_layout.addWidget(self.samples)
+
+        self.adv_blend.content_layout.addWidget(QtWidgets.QLabel("Scale"))
         self.scale = QtWidgets.QDoubleSpinBox()
         self.scale.setRange(0.1, 5.0)
         self.scale.setSingleStep(0.1)
         self.scale.setValue(float(self.obj.Scale))
-        lay.addWidget(self.scale)
+        self.adv_blend.content_layout.addWidget(self.scale)
         self.scale.valueChanged.connect(lambda v: self._set("Scale", v))
+        lay.addWidget(self.adv_blend)
 
         g3_note = QtWidgets.QLabel(
             "G3 uses a finite-difference estimate of the 3rd derivative "
@@ -1735,18 +1852,46 @@ class FilletPanel(_EditPanelBase):
 
 
 class PolylineFilletPanel(_EditPanelBase):
-    """Round the control-point corners of a polyline (RFS_FilletPolyline) with
-    tangent arcs of a single radius, producing a NEW parametric curve. Unlike
-    FilletPanel (which needs a solid + edges), this works on a 2D point-defined
-    curve. Wraps parametric.PolylineFilletFP -> core.polyline_corner_fillet."""
+    """Round the corners of a polyline (RFS_FilletPolyline) with tangent
+    arcs of a single radius.
+
+    IN PLACE (preferred): when the selection contains a Railform
+    Polyline, the fillet is recorded ON that polyline (its `Fillets`
+    record, SolidWorks-sketch style) -- no second, linked curve object
+    is created; `Points` keep the sharp corners and execute() rebuilds
+    the arcs from the record on every recompute.
+
+    DERIVED (legacy): with no polyline selected -- or when editing an
+    existing PolylineFillet object -- it creates/edits a
+    parametric.PolylineFilletFP that links the source (kept so old
+    documents and workflows still work).
+
+    Both modes wrap core.polyline_corner_fillet."""
 
     def __init__(self, edit_obj=None):
-        self._start_edit(edit_obj,
-                         "Create Polyline Fillet" if edit_obj is None
-                         else "Edit Polyline Fillet",
+        target = edit_obj if edit_obj is not None \
+            else self._selection_target()
+        self._inplace = target is not None and hasattr(target, "Fillets")
+        if target is None:
+            title = "Create Polyline Fillet"
+        elif self._inplace:
+            title = "Fillet polyline"
+        else:
+            title = "Edit Polyline Fillet"
+        self._start_edit(target, title,
                          lambda: parametric.make_polyline_fillet(None, self.doc))
 
-        # On creation, auto-adopt a selected polyline/curve as the source.
+        # In place: seed an EMPTY record with the default radius so
+        # opening the panel on a sharp polyline previews a uniform
+        # fillet immediately (same default the legacy feature used);
+        # Cancel/undo restores the sharp polyline since this all runs
+        # inside the panel's undo transaction.
+        if self._inplace and not list(self.obj.Fillets or []):
+            n = len(self.obj.Points or [])
+            if n >= 3:
+                self.obj.Fillets = [5.0] * n
+
+        # On legacy creation, auto-adopt a selected polyline/curve as the source.
         if self.creating and getattr(self.obj, "Source", None) is None:
             src = self._first_source_in_selection()
             if src is not None:
@@ -1757,30 +1902,44 @@ class PolylineFilletPanel(_EditPanelBase):
         # editmode.CornerFilletEditor. Best-effort: absence of pivy/Coin
         # (editor.ok == False) just means no in-viewport handles, same
         # fallback convention as PointEditor/KnotEditor elsewhere.
+        # In place the handle editor writes the polyline's own `Fillets`
+        # record; in legacy mode it writes the derived object's `Radii`.
         self._corner_editor = None
-        src_obj = getattr(self.obj, "Source", None)
-        if src_obj is not None and getattr(src_obj, "ViewObject", None) is not None:
-            from rfstudio import editmode
-            editor = editmode.CornerFilletEditor(self.obj, src_obj.ViewObject)
-            if editor.ok:
-                editor.on_commit = self._update_status
-                self._corner_editor = editor
+        self._rebuild_corner_editor()
 
         self.form = QtWidgets.QWidget()
         self.form.setWindowTitle("Railform – Polyline Fillet")
         lay = QtWidgets.QVBoxLayout(self.form)
-        lay.addWidget(QtWidgets.QLabel(
-            "Rounds every corner of a polyline with a tangent arc.\n"
-            "Pick the polyline, then set the radius:"))
+        if self._inplace:
+            lay.addWidget(QtWidgets.QLabel(
+                "Rounds every corner of the selected polyline with a\n"
+                "tangent arc. The fillet is RECORDED ON the polyline\n"
+                "(its points stay sharp; the arcs are rebuilt from the\n"
+                "record on every recompute):"))
+        else:
+            # W4: the dual object model is now explicit in the UI --
+            # legacy mode says what it will create and how to get the
+            # in-place behaviour instead of silently linking an object.
+            lay.addWidget(QtWidgets.QLabel(
+                "Rounds every corner of a polyline with a tangent arc.\n"
+                "Pick the polyline, then set the radius. (Legacy mode:\n"
+                "this creates a LINKED PolylineFillet object -- select\n"
+                "a polyline BEFORE running this tool to fillet it in\n"
+                "place instead, with no extra object.)"))
 
-        src_row = QtWidgets.QHBoxLayout()
-        self._src_lbl = QtWidgets.QLabel("Polyline: " + self._src_name())
-        b1 = QtWidgets.QPushButton("Set source from selection")
-        b1.clicked.connect(self._assign_source)
-        src_row.addWidget(self._src_lbl)
-        src_row.addStretch(1)
-        src_row.addWidget(b1)
-        lay.addLayout(src_row)
+        if self._inplace:
+            lay.addWidget(QtWidgets.QLabel(
+                "Polyline: %s  (edited in place — no new object)"
+                % self.obj.Label))
+        else:
+            src_row = QtWidgets.QHBoxLayout()
+            self._src_lbl = QtWidgets.QLabel("Polyline: " + self._src_name())
+            b1 = QtWidgets.QPushButton("Set source from selection")
+            b1.clicked.connect(self._assign_source)
+            src_row.addWidget(self._src_lbl)
+            src_row.addStretch(1)
+            src_row.addWidget(b1)
+            lay.addLayout(src_row)
 
         r_row = QtWidgets.QHBoxLayout()
         r_row.addWidget(QtWidgets.QLabel("Radius"))
@@ -1788,21 +1947,36 @@ class PolylineFilletPanel(_EditPanelBase):
         self.rad.setDecimals(3)
         self.rad.setRange(0.001, 1e5)
         self.rad.setSingleStep(0.5)
-        self.rad.setValue(float(self.obj.Radius))
-        self.rad.valueChanged.connect(lambda v: self._set("Radius", v))
+        if self._inplace:
+            self.rad.setValue(next(
+                (r for r in (self.obj.Fillets or []) if r > 0), 5.0))
+            self.rad.valueChanged.connect(self._radius_changed)
+        else:
+            self.rad.setValue(float(self.obj.Radius))
+            self.rad.valueChanged.connect(lambda v: self._set("Radius", v))
         r_row.addWidget(self.rad)
+        if self._inplace:
+            bclr = QtWidgets.QPushButton("Clear all")
+            bclr.setToolTip(
+                "Remove every fillet: all corners go sharp (the record "
+                "stays, as zeros, so the polyline does not re-seed).")
+            bclr.clicked.connect(self._clear_fillets)
+            r_row.addWidget(bclr)
         lay.addLayout(r_row)
 
         self.closed = QtWidgets.QCheckBox(
             "Closed (also round the last→first corner)")
-        self.closed.setChecked(bool(self.obj.Closed))
-        self.closed.stateChanged.connect(lambda s: self._set("Closed", bool(s)))
+        if self._inplace:
+            self.closed.setChecked(bool(self.obj.FilletClosed))
+            self.closed.stateChanged.connect(
+                lambda s: self._set("FilletClosed", bool(s)))
+        else:
+            self.closed.setChecked(bool(self.obj.Closed))
+            self.closed.stateChanged.connect(
+                lambda s: self._set("Closed", bool(s)))
         lay.addWidget(self.closed)
 
-        self._status = QtWidgets.QLabel("")
-        self._status.setWordWrap(True)
-        self._status.setStyleSheet(
-            "color:#9aa6b2;font-size:11px;padding:4px 0;")
+        self._status = _status_label()
         lay.addWidget(self._status)
 
         self.live = QtWidgets.QCheckBox("Live preview")
@@ -1833,10 +2007,50 @@ class PolylineFilletPanel(_EditPanelBase):
             self._rebuild_corner_editor()
             self.recompute()
 
+    @staticmethod
+    def _selection_target():
+        """In-place fillet target from the current selection: a Railform
+        Polyline (fillet recorded ON it) preferred, else an existing
+        PolylineFillet (edit it instead of stacking a new one), else
+        None -> legacy create-and-link flow."""
+        def kind_of(o):
+            return getattr(getattr(o, "Proxy", None), "Kind", None)
+        sel = list(_selected_objects())
+        for o in sel:
+            if kind_of(o) == "Polyline":
+                return o
+        for o in sel:
+            if kind_of(o) == "PolylineFillet":
+                return o
+        return None
+
+    def _radius_changed(self, v):
+        """In place, the uniform Radius box IS a record write: it
+        re-rounds EVERY corner at v (overriding per-corner handle
+        refinements -- the box means "all corners", the handles mean
+        "just this one"). Legacy mode just sets the Radius property."""
+        if not self._inplace:
+            self._set("Radius", v)
+            return
+        n = len(self.obj.Points or [])
+        if n:
+            self.obj.Fillets = [float(v)] * n
+        self.recompute()
+
+    def _clear_fillets(self):
+        """In place: all corners sharp -- every radius in the record
+        goes to 0 (not empty, so the panel does not re-seed 5.0 on the
+        next open)."""
+        n = len(self.obj.Points or [])
+        self.obj.Fillets = [0.0] * n
+        self.recompute()
+
     def _rebuild_corner_editor(self):
-        """(Re)build CornerFilletEditor against the current Source --
+        """(Re)build CornerFilletEditor against the current target --
         called on init and whenever Source is reassigned, since the
-        editor's markers are keyed off a specific ViewObject."""
+        editor's markers are keyed off a specific ViewObject. In place,
+        the target is the polyline itself (its `Fillets` record gets
+        written); in legacy mode it is the derived PolylineFillet."""
         old = getattr(self, "_corner_editor", None)
         if old is not None:
             try:
@@ -1844,7 +2058,8 @@ class PolylineFilletPanel(_EditPanelBase):
             except Exception:
                 pass
             self._corner_editor = None
-        src_obj = getattr(self.obj, "Source", None)
+        src_obj = self.obj if self._inplace \
+            else getattr(self.obj, "Source", None)
         if src_obj is None or getattr(src_obj, "ViewObject", None) is None:
             return
         from rfstudio import editmode
@@ -1874,8 +2089,29 @@ class PolylineFilletPanel(_EditPanelBase):
         self._update_status()
 
     def _update_status(self):
+        if self._inplace:
+            sh = getattr(self.obj, "Shape", None)
+            if sh is None or sh.isNull():
+                self._status.setText(
+                    "No result — a polyline needs >= 2 points and real "
+                    "corners to fillet.")
+                return
+            radii = list(self.obj.Fillets or [])
+            active = sum(1 for r in radii if r > 0)
+            self._status.setText(
+                "Ready. %d edges, %d rounded corners (of %d points). "
+                "Drag an orange ring in the 3D view for ONE corner; the "
+                "Radius box re-rounds all of them."
+                % (len(sh.Edges), active, len(radii)))
+            return
         if not getattr(self.obj, "Source", None):
-            self._status.setText("Pick a polyline to round.")
+            # W6: say exactly what to do next (and how to avoid this
+            # legacy flow altogether by pre-selecting the polyline).
+            self._status.setText(
+                "No polyline yet -- select one in the 3D view, then "
+                "press 'Set source from selection'. Tip: select the "
+                "polyline BEFORE running this tool to fillet it in "
+                "place (no linked object is created that way).")
             return
         sh = getattr(self.obj, "Shape", None)
         if sh is None or sh.isNull():

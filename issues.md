@@ -1,0 +1,324 @@
+# Railform Studio — known issues / limitations
+
+Tracked gaps, ordered by severity. Each entry links to where the
+limitation lives in code so it doesn't have to be rediscovered.
+
+## 1. `match_surface_exact_g1` trim guard is currently inert
+
+`core.match_surface_exact_g1` refuses (ValueError) when the matched
+boundary is a genuine trim fragment of a larger surface
+(`_side_is_trimmed` guard in `rfstudio/core/surfacing.py`). However,
+`core.trim_face` **reparameterizes** the trimmed surface to the wire's
+bounding extent, so a trim-face-produced face looks exactly like a fresh
+untrimmed rectangular face and the guard never fires.
+
+Consequence: no silent corruption (the cropped surface is self-consistent),
+but the documented "exact copy is wrong on trimmed input" protection is
+effectively dead for faces produced by our own trim path. `test_core.py`'s
+`test_match_surface_exact_g1_rejects_trimmed_boundary` pins the current
+behavior so the invariant change is loud if it ever returns.
+
+Fix options: have `trim_face` preserve the original parameterization
+(more honest geometry, larger blast radius), or build the guard on
+edge/wire shape analysis rather than parameter ranges. Parked for now.
+
+Update: `_exact_match_prep` (shared by exact_g1/_g2) now ALSO checks
+matched-edge compatibility (`_matched_edges_compatible` in
+`rfstudio/core/util.py`): the two boundary edges must coincide
+geometrically (length within 1%, endpoints coincident), else it refuses
+with ValueError and falls back to sampled, trim-aware matching. This
+catches the trim case the trim guard misses (trimmed plane vs full
+plane: lengths 6 vs 10), because row-copying is only valid when the two
+edges are the same curve -- regardless of trim history. The trim guard
+itself was also fixed to compare against the surface's natural bounds
+(BSpline knots, analytic extents) instead of the possibly
+reparameterized face range, and a broken world-axis extent check that
+false-positived on non-XY-planar faces was removed.
+
+## 2. GUI panels have no automated coverage
+
+Silk/Curves import `FreeCAD.Gui` at load, so anything importing them
+(every `rfstudio.panel_*`) cannot run under `freecadcmd`. The curated
+panels are therefore validated only by the manual smoke test in
+`README.md`. Decision logic that CAN be checked headlessly lives in
+`rfstudio/panel_logic.py` + `test_panel_logic.py`; keep pushing
+triage-style decisions there when adding panels.
+
+**Status (W1 fix):** the static half is now automated —
+`rfstudio/test_gui_imports.py` fakes FreeCAD/Qt/Coin and runs six
+checks over all 25 modules (mocked imports, undefined self-calls,
+scope-aware bare names, cross-module reference resolution, no
+import-time Qt class bases, callback add/remove/null symmetry), with
+a planted-bug self-test. It caught the stranded `dim_preview_btn`
+block in `panel_sketch3d` the same day. FUNCTIONAL GUI behavior
+(widgets rendering, viewport interactions) still needs the manual
+smoke test — that half remains open.
+
+## 3. RFS_StarPatch is true-G2-only-via-Silk
+
+It now has a native last resort (`engines.native_star_patch` over
+`core.n_sided_patch`), but that path is exact G0 + tangent-plane G1 only
+by construction. If you need Silk's G2 star point, Silk must be
+installed or its `ControlGridNStar66` command vendored frozen.
+
+## 4. Native providers are geometry-tested, not field-tested
+
+`native_trim`, `native_sketch_on_surf`, `native_clean_patch_*`, and the
+newer `native_analysis`/`native_control_poly4`/`native_star_patch` are
+covered by `test_core.py` at the geometry level and raised-value-error
+convention, but have not been exercised against every selection shape a
+real user will throw at them. Bug reports welcome; each raises ValueError
+on bad selections so ProviderCommand falls through to the engine command
+instead of silently no-op'ing.
+
+## 5. Mirroring welding is best-effort
+
+`rfstudio.mirror.mirror_shape(..., weld=True)` stitches original+mirror
+via the injected `stitch_fn` and returns `(shape, False)` on any failure
+— welding visually reports success-shape only when `welded=True` comes
+back. There is no automated box-level weld verification yet
+(`stitch_shell` itself is tested).
+
+## 6. `verify_delegations` may be skipped early in GUI startup
+
+`workbench.Initialize` wraps `deps.verify_delegations` in try/except
+because a fresh GUI session sometimes hasn't finished registering engine
+commands yet; in that case the startup health check prints "skipping"
+and the check effectively does not run. Acceptable for now, but it means
+the "whole curated surface validated at activation" promise is
+best-effort.
+
+## 7. Pierce / On Surface / Tangent to Face relations — unlocks in-context design
+
+The 3D sketch constraint system (`rfstudio/panel_sketch3d.py` +
+`rfstudio/core/constraints.py`) currently supports distance/angle/coincident/
+horizontal/vertical/tangent/equal/fix/symmetric/mirror. Missing the
+in-context workhorse relations:
+
+- **Pierce** — sketch point constrained to intersection of sketch plane
+  with a non-planar face/edge from another body
+- **On Surface** — point constrained to lie on a non-planar face (not
+  just sketch construction plane)
+- **Tangent to Face** — curve/edge tangent to a non-planar face along
+  its extent (not just 2D tangent)
+
+These require per-constraint projection/nearest-point queries against
+arbitrary topology, not just the sketch's construction plane.
+`rfstudio/core/snaputil.py`'s `pick_ray` / `nearest_point_on_shapes_to_ray`
+infrastructure is the starting point, but the constraint solver
+(`core/constraints.py`) would need new constraint tuple formats and
+Jacobian contributions.
+
+Gate: enables true in-context design (brackets, ribs, cutouts referencing
+adjacent parts).
+
+## 8. Per-entity under/over-defined diagnostics — single biggest daily usability gap
+
+Current `rfstudio/panel_sketch3d.py` shows only a global readiness string
+(`_update_status` → `panel_logic.sketch3d_readiness`). SolidWorks
+per-entity diagnostics need:
+
+- Per-row under/over/fully-defined badges in the point table
+- Highlight the specific constraints/points causing over-definition
+- Drag-to-diagnose: click an over-constrained point → show conflicting
+  constraints
+- Auto-repair suggestions (delete redundant constraint, relax dimension)
+
+Requires constraint Jacobian rank analysis per DOF (already partially
+available in `core/constraints.py`'s status dict) surfaced to the
+table widget rows (`panel_sketch3d.py` `_PointRow` widgets).
+
+Gate: turns "why won't this solve?" from minutes of guessing into
+seconds of looking.
+
+**Status:** global slice landed — `_solver_diag` runs the solver on
+the current points/constraints and `panel_logic.solver_status_text`
+appends "well-defined (N DOF)" / "under-defined: X of Y DOF free" /
+"over-defined: constraints conflict — remove or relax one" to the
+status line whenever dims exist. Still open: per-row badges,
+per-constraint highlighting, drag-to-diagnose, auto-repair (needs the
+per-DOF Jacobian breakdown the status dict doesn't expose yet).
+
+## 9. 3D spline handles with G2/G3 feedback — makes 3D splines actually editable
+
+Current 3D spline editing (`rfstudio/editmode.py` + `panel_sketch3d.py`'s
+drag callbacks) supports point drag only. Missing:
+
+- **Handles per control point** — tangent vectors (G1) and curvature
+  vectors (G2) as draggable handles in the 3D viewport
+- **Live G2/G3 curvature comb feedback** on the spline during drag
+  (reusing `rfstudio/core/qa.py`'s analytic `getDN` path)
+- **Handle snapping** to G1/G2 continuity with adjacent spans
+- **Virtual intersection handles** for tangency-to-face constraints
+
+`rfstudio/editmode.py`'s `PointEditor` already has a gizmo framework;
+the missing piece is the handle-to-control-point mapping and the
+curvature comb overlay (`rfstudio/core/qa.py` has the analytic
+derivatives via `_surf_dn` / `_analytic_cross_d2`).
+
+Gate: makes 3D splines usable for Class-A work instead of "place
+points, hope the interpolation behaves."
+
+## 10. Equation manager + configurations — moves from "one-off" to "reusable design"
+
+Current `rfstudio/panel_sketch3d.py` supports inline expressions
+(`=P0x+25`, `=2*width`) and named variables (`_variables` dict).
+Missing for production reuse:
+
+- **Global equation manager dialog** — named variables with units,
+  comments, suppression state, import/export CSV
+- **Design table / configuration table** — rows = configurations,
+  columns = variables + suppression; switch configs without rebuilding
+- **Suppression state per constraint/point** — "suppressed in Config B"
+- **Linked values / shared variables** across multiple sketch objects
+- **Import/export SolidWorks-style equations.txt** for round-trip
+
+The expression evaluator (`rfstudio/panel_logic.py` `evaluate_expression`)
+and variable storage (`_variables` dict + `_variables` addProperty on
+the FP object) are the foundation. The missing piece is the
+config-table data model and the UI.
+
+Gate: turns single-use sketches into parametric families.
+
+## 11. Multi-plane 3D sketch — eliminates the single-plane limitation
+
+Current `rfstudio/panel_sketch3d.py` uses one construction plane per
+session (`_plane_combo` + `_offset` + `_plane_base`/`_plane_normal`).
+SolidWorks-style multi-plane 3D sketch needs:
+
+- **Per-point plane assignment** — each point can live on a different
+  reference plane (existing plane, created plane, or inferred from
+  adjacent geometry)
+- **Plane creation in-sketch** — "create plane through 3 points" /
+  "offset from face" / "angle to plane" without leaving the sketch
+- **Plane-aware constraints** — distance/angle measured along/normal to
+  the point's local plane, not the sketch's global construction plane
+- **Plane switching** — Tab cycles through planes used in the sketch,
+  not just Camera/XY/YZ/ZX/Auto
+
+`rfstudio/panel_logic.py` already has `construction_plane`,
+`ray_plane_intersect`, `plane_normal_for` — the building blocks exist.
+The missing piece is per-point plane metadata in the point table
+(`panel_sketch3d.py` `_PointRow` adding a plane selector) and the
+constraint solver respecting per-point planes.
+
+Gate: removes the "flatten to one plane" workaround that forces
+workarounds for non-planar 3D wireframes.
+
+## 12. Assembly context / convert entities — in-context design
+
+No mechanism exists to reference geometry from other parts in the
+assembly while editing a sketch or surface. Required for true
+in-context design (brackets, ribs, cutouts referencing adjacent parts):
+
+- **Convert entities** — project edges/vertices from other parts into
+  the active sketch as reference geometry (with or without external
+  references)
+- **External references** — track dependencies on external geometry;
+  flag when referenced parts change; allow update/break/replace
+- **In-context editing** — open a part in the context of its assembly,
+  with other parts visible (transparent/ghosted) for reference
+- **Reference plane/axis from assembly geometry** — create sketch
+  planes/axes from faces/edges of other components
+
+Requires: assembly document structure awareness, external reference
+tracking (property `ExternalReferences` on sketch objects), and UI
+for managing reference state (update/replace/break).
+
+Gate: without this, every bracket/rib/cutout must be modeled
+isolated then manually positioned — the #1 productivity killer for
+assembly-driven design.
+
+## 13. Trim-aware exact G2 — currently falls back to sampled on trimmed faces
+
+`match_surface_exact_g2` (like its G1 sibling) refuses trimmed
+boundaries via `_side_is_trimmed` guard. However, `trim_face`
+reparameterizes the trimmed surface to the wire's bounding box, so
+a trimmed face looks identical to an untrimmed one to the guard —
+the exact G2 path is silently skipped and falls back to sampled
+`match_surface()`, losing exact G2.
+
+Fix: either (a) make `trim_face` preserve original parameterization
+(larger blast radius), or (b) detect trimming via edge/wire topology
+rather than parameter ranges. The latter is cleaner: check if the
+matched boundary edge is a subset of the surface's natural boundary.
+
+Gate: without this, any Class-A patch meeting a trimmed edge
+falls back to sampled approximation, losing exact G2 at the seam.
+
+## 14. Convert entities / project to sketch — project 3D edges into active sketch
+
+Sketch3D panel has "Project selected edges" but it only samples
+points and drops them on the construction plane. Missing:
+
+- **Project with constraints** — projected points should optionally
+  carry coincident/coincident-on-curve constraints to the source
+  edges, so the sketch updates when the source moves
+- **Project to construction plane vs. project along direction** —
+  orthographic (view direction) vs. normal-to-plane projection
+- **Silhouette projection** — project the silhouette of a solid
+  onto the sketch plane
+- **Intersection curve projection** — project the intersection of
+  the sketch plane with a solid/face
+
+Gate: without constrained projection, projected geometry is
+"dumb" — it doesn't update when the source geometry changes.
+
+**Status (implemented, 3 of 4 bullets):**
+
+- **Project with constraints** — each projected point now stores an
+  associative ref (`Sketch3DFP.ProjectedRefs`, `edge|obj|EdgeN|frac|
+  mode|dir`) with `ExternalSources` link dependencies and a persisted
+  `PlaneOrigin`/`PlaneNormal`; `execute()` re-projects the point from
+  its current source on every recompute, and re-projected points join
+  the solver's pinned set (source drives them exactly like an on-curve
+  constraint). Missing/deleted sources degrade to a free point.
+- **Plane normal vs. along direction** — "Along plane normal / Along
+  view direction" combo in the panel; the captured view direction is
+  stored per ref so rebuilds stay deterministic. Pure math in
+  `panel_logic.project_point_along`.
+- **Intersection curve projection** — new "Slice by sketch plane"
+  button cuts the selected solids with the construction plane
+  (`slice` refs, re-cut on recompute).
+- **Silhouette projection** — still open (needs outline extraction of
+  the projected solid; deferred).
+
+Verified: `test_panel_logic.py` (project-along + ref codec),
+`test_core.py` (assoc projection follows a moved source with the dim
+still solved; slice section follows a moved solid). Refs stay 1:1 with
+rows across add/remove/mirror/undo/template/merge.
+
+## 15. Configuration-aware equation manager — design tables with suppression
+
+`panel_sketch3d.py` has inline expressions (`=P0x+25`) and named
+variables (`_variables` dict), but no configuration table:
+
+- **Design table** — rows = configurations, columns = variables +
+  dimensions + suppression state; switch configs without rebuild
+- **Suppression per constraint/point/handle** — "suppressed in Config B"
+- **Configuration table UI** — spreadsheet-like grid in the panel,
+  add/remove configs, copy/paste from Excel/CSV
+- **Suppression per entity** — points, constraints, handles can be
+  suppressed per configuration
+- **Import/export equations.txt** — round-trip with SolidWorks-style
+  equation files
+
+Gate: without this, every variant requires a separate sketch file
+or manual parameter editing — no parametric families.
+
+## 16. Multi-body part support — single document, multiple solids
+
+All parametric FP objects (`*FP` classes) assume one `Part::Feature`
+= one surface/solid. Real parts often need multiple bodies (weldment
+cut list, multi-body Boolean, separate manufacture bodies):
+
+- **Multi-body FP base class** — `Part::Feature` with `Solids` list
+  property instead of single `Shape`
+- **Per-body properties** — material, appearance, manufacture flags
+  per solid
+- **Cut list / weldment BOM** — export per-body metadata
+- **Body visibility/selection** — show/hide/select individual bodies
+  in the tree/viewport
+
+Gate: without this, multi-body parts (weldments, mold tools,
+multi-lumen medical) require separate files or clumsy Compounds.
