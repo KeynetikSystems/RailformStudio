@@ -330,6 +330,21 @@ fresh `Unreleased` section above it.
     projection onto the face's tangent plane at the closest point,
     enforcing tangency during drag. Headless: `_bezier_g2_condition`,
     `_bezier_g3_condition` in `core/io.py`.
+ - Equation manager + configurations (issues.md #10): headless
+   `panel_logic.EquationManager` with variables (value, unit, comment,
+   suppressed, linked), design table (configs with variable overrides +
+   suppression per constraint/point/handle), active config switching,
+   SolidWorks equations.txt import/export (round-trip), JSON
+   serialization for persistence. Panel UI: "Equations / Configurations"
+   group with config combo (+/- config), suppression table (kind
+   constraint/point/handle + idx toggle), Export/Import equations.txt.
+   Variables UI: unit combo (mm/cm/m/in/deg/rad), comment field.
+   Sketch3DFP.execute() loads EqManagerState, applies active config
+   variable overrides, filters suppressed constraints/points from solver.
+   Headless: `test_equation_manager_basic`, `test_equation_manager_configs`,
+   `test_equation_manager_suppression`, `test_equation_manager_export_import`,
+   `test_equation_manager_persistence`. Linked values across objects still
+   open (needs doc-level EquationManager sharing).
 
 ### Changed
  - Fillet panel dual-model clarity: the legacy (nothing-selected)

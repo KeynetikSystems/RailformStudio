@@ -115,21 +115,45 @@ class Sketch3DFP(object):
     def execute(self, obj):
         from rfstudio import core
         from rfstudio import panel_logic
+        import json
         try:
+            # Load EquationManager state if present (issues.md #10 / #15)
+            eq_data = {}
+            if hasattr(obj, "EqManagerState") and obj.EqManagerState:
+                try:
+                    eq_data = json.loads(obj.EqManagerState)
+                except Exception:
+                    eq_data = {}
+            # Build variable namespace: global variables overridden by active config
+            variables = _parse_variables(list(getattr(obj, "Variables", []) or []))
+            if eq_data.get("configs"):
+                active_idx = eq_data.get("active_config", 0)
+                if 0 <= active_idx < len(eq_data["configs"]):
+                    cfg = eq_data["configs"][active_idx]
+                    variables.update(cfg.get("variables", {}))
             constraints = _parse_constraints(list(obj.Constraints))
-            variables = _parse_variables(list(getattr(obj, "Variables", [])
-                                              or []))
             raw_pts = list(obj.Points)
             # Issue #14: re-project points that reference external
             # geometry BEFORE resolving/solving, so expressions and the
-            # solver both see source-driven coordinates. Successfully
-            # re-projected points join the pinned set -- the source
-            # drives them exactly like an on-curve constraint would.
+            # solver both see source-driven coordinates.
             projected = _reproject_points(obj, raw_pts, panel_logic)
+            # Apply suppression from active config (issues.md #10 / #15)
+            suppressed_constraints = set()
+            suppressed_points = set()
+            if eq_data.get("configs"):
+                active_idx = eq_data.get("active_config", 0)
+                if 0 <= active_idx < len(eq_data["configs"]):
+                    cfg = eq_data["configs"][active_idx]
+                    suppressed_constraints.update(cfg.get("suppressed_constraints", []))
+                    suppressed_points.update(cfg.get("suppressed_points", []))
+            # Filter out suppressed constraints
+            constraints = [c for i, c in enumerate(constraints) if i not in suppressed_constraints]
             constraints = panel_logic.resolve_constraint_expressions(
                 constraints, variables,
                 [(p.x, p.y, p.z) for p in raw_pts])
             pinned = {c[1] for c in constraints if c[0] == "fix"} | projected
+            # Filter out suppressed points from pinning (they stay free)
+            pinned = {i for i in pinned if i not in suppressed_points}
             pts = core.solve_point_constraints(
                 raw_pts, constraints, pinned=pinned)
             bulges = [float(b) for b in obj.Bulges] if obj.Bulges else None
@@ -901,6 +925,55 @@ class Sketch3DPanel(object):
 
         self.adv_tools.content_layout.addLayout(tool_row2)
 
+        # --- Equations / Configurations (issues.md #10 / #15) --------------- #
+        self.adv_eq = _CollapsibleGroup("Equations / Configurations", collapsed=True)
+        # Design Table / Configurations
+        cfg_row = QtWidgets.QHBoxLayout()
+        cfg_row.addWidget(QtWidgets.QLabel("Configs:"))
+        self.cfg_combo = QtWidgets.QComboBox()
+        self.cfg_combo.setToolTip("Active configuration (design table row)")
+        self.cfg_combo.currentIndexChanged.connect(self._on_config_changed)
+        cfg_row.addWidget(self.cfg_combo)
+        add_cfg = QtWidgets.QPushButton("+ config")
+        add_cfg.clicked.connect(self._add_config)
+        cfg_row.addWidget(add_cfg)
+        del_cfg = QtWidgets.QPushButton("- config")
+        del_cfg.clicked.connect(self._del_config)
+        cfg_row.addWidget(del_cfg)
+        self.adv_eq.content_layout.addLayout(cfg_row)
+
+        # Suppression table
+        sup_row = QtWidgets.QHBoxLayout()
+        sup_row.addWidget(QtWidgets.QLabel("Suppress:"))
+        self.sup_kind = QtWidgets.QComboBox()
+        self.sup_kind.addItems(["constraint", "point", "handle"])
+        self.sup_kind.setToolTip("Entity kind to suppress in current config")
+        sup_row.addWidget(self.sup_kind)
+        self.sup_idx = QtWidgets.QSpinBox()
+        self.sup_idx.setRange(0, 999)
+        self.sup_idx.setPrefix("idx ")
+        self.sup_idx.setToolTip("Index of entity to suppress/unsuppress")
+        sup_row.addWidget(self.sup_idx)
+        sup_toggle = QtWidgets.QPushButton("Toggle suppress")
+        sup_toggle.clicked.connect(self._toggle_suppression)
+        sup_toggle.setToolTip("Toggle suppression of selected entity in active config")
+        sup_row.addWidget(sup_toggle)
+        self.adv_eq.content_layout.addLayout(sup_row)
+
+        # Import/Export equations.txt
+        io_row = QtWidgets.QHBoxLayout()
+        export_btn = QtWidgets.QPushButton("Export equations.txt")
+        export_btn.setToolTip("Export variables and configs to SolidWorks equations.txt")
+        export_btn.clicked.connect(self._export_equations)
+        io_row.addWidget(export_btn)
+        import_btn = QtWidgets.QPushButton("Import equations.txt")
+        import_btn.setToolTip("Import variables and configs from SolidWorks equations.txt")
+        import_btn.clicked.connect(self._import_equations)
+        io_row.addWidget(import_btn)
+        self.adv_eq.content_layout.addLayout(io_row)
+
+        self.adv_tools.content_layout.addWidget(self.adv_eq)
+
         lay.addWidget(self.adv_tools)
 
         row = QtWidgets.QHBoxLayout()
@@ -955,7 +1028,7 @@ class Sketch3DPanel(object):
         dim_row.addWidget(add_dim)
         lay.addLayout(dim_row)
 
-        # --- named variables for expressions ---------------------------- #
+        # --- named variables for expressions (issues.md #10) -------------------- #
         var_row = QtWidgets.QHBoxLayout()
         var_row.addWidget(QtWidgets.QLabel("Vars:"))
         self.var_name = QtWidgets.QLineEdit()
@@ -966,6 +1039,17 @@ class Sketch3DPanel(object):
         self.var_val.setRange(-1e6, 1e6)
         self.var_val.setDecimals(3)
         var_row.addWidget(self.var_val)
+        self.var_unit = QtWidgets.QComboBox()
+        self.var_unit.addItems(["mm", "cm", "m", "in", "deg", "rad", ""])
+        self.var_unit.setCurrentText("mm")
+        self.var_unit.setFixedWidth(55)
+        self.var_unit.setToolTip("Variable unit (for documentation & equations.txt)")
+        var_row.addWidget(self.var_unit)
+        self.var_comment = QtWidgets.QLineEdit()
+        self.var_comment.setPlaceholderText("comment")
+        self.var_comment.setFixedWidth(100)
+        self.var_comment.setToolTip("Optional comment (exported to equations.txt)")
+        var_row.addWidget(self.var_comment)
         add_var = QtWidgets.QPushButton("+ var")
         add_var.clicked.connect(self._add_var)
         var_row.addWidget(add_var)
@@ -1051,9 +1135,15 @@ class Sketch3DPanel(object):
         lay.addLayout(preview_row)
 
         self._ready = True
+        # --- Equation Manager (issues.md #10 / #15) -------------------- #
+        from rfstudio import panel_logic
+        self._eq_manager = panel_logic.get_equation_manager(
+            FreeCAD.ActiveDocument or FreeCAD.newDocument())
+        # Sync legacy _variables dict with EquationManager for backward compat
+        self._variables = self._eq_manager.get_all_variables()
         self._update_status()
 
-    # --- named variables -------------------------------------------------- #
+    # --- named variables (EquationManager-backed) --------------------- #
     def _add_var(self):
         name = self.var_name.text().strip()
         if not name or not (name[0].isalpha() or name[0] == "_") or \
@@ -1061,23 +1151,132 @@ class Sketch3DPanel(object):
             self.status.setText("Variable name must be identifier-like")
             return
         self._push_undo()
-        self._variables[name] = self.var_val.value()
+        unit = self.var_unit.text().strip() if hasattr(self, "var_unit") else "mm"
+        comment = self.var_comment.text().strip() if hasattr(self, "var_comment") else ""
+        self._eq_manager.add_variable(name, self.var_val.value(), unit, comment)
+        self._variables = self._eq_manager.get_all_variables()
         self._refresh_var_list()
         self.var_name.clear()
 
     def _clear_vars(self):
-        if self._variables:
+        if self._eq_manager.variables:
             self._push_undo()
+        self._eq_manager.variables.clear()
         self._variables = {}
         self._refresh_var_list()
 
     def _refresh_var_list(self):
         try:
             self.var_list.clear()
-            for name in sorted(self._variables):
-                self.var_list.addItem("%s = %.3f" % (name, self._variables[name]))
+            for name, meta in sorted(self._eq_manager.variables.items()):
+                val = meta["value"]
+                unit = meta.get("unit", "mm")
+                comment = meta.get("comment", "")
+                label = f"{name} = {val:.3f} {unit}"
+                if comment:
+                    label += f"  # {comment}"
+                self.var_list.addItem(label)
         except Exception:
             pass
+
+    # --- Equation Manager / Configurations (issues.md #10 / #15) -------- #
+    def _refresh_cfg_combo(self):
+        """Refresh the configuration combo box from EquationManager."""
+        try:
+            self.cfg_combo.blockSignals(True)
+            self.cfg_combo.clear()
+            for i, cfg in enumerate(self._eq_manager.configs):
+                self.cfg_combo.addItem(cfg["name"])
+            if self._eq_manager.configs:
+                self.cfg_combo.setCurrentIndex(self._eq_manager.active_config)
+            self.cfg_combo.blockSignals(False)
+        except Exception:
+            pass
+
+    def _on_config_changed(self, idx):
+        """Switch active configuration."""
+        if self._eq_manager.set_active_config(idx):
+            self._variables = self._eq_manager.get_all_variables()
+            self._refresh_var_list()
+            self._update_status()
+            self.status.setText(f"Switched to config: {self._eq_manager.configs[idx]['name']}")
+
+    def _add_config(self):
+        """Add a new configuration."""
+        from PySide import QtWidgets
+        name, ok = QtWidgets.QInputDialog.getText(
+            self.widget, "New Configuration", "Configuration name:")
+        if ok and name.strip():
+            self._push_undo()
+            self._eq_manager.add_config(name.strip())
+            self._refresh_cfg_combo()
+            self.cfg_combo.setCurrentIndex(len(self._eq_manager.configs) - 1)
+            self._on_config_changed(len(self._eq_manager.configs) - 1)
+
+    def _del_config(self):
+        """Delete the active configuration."""
+        if len(self._eq_manager.configs) <= 1:
+            self.status.setText("Cannot delete last configuration")
+            return
+        idx = self._eq_manager.active_config
+        name = self._eq_manager.configs[idx]["name"]
+        self._push_undo()
+        self._eq_manager.remove_config(idx)
+        self._refresh_cfg_combo()
+        self.status.setText(f"Deleted config: {name}")
+
+    def _toggle_suppression(self):
+        """Toggle suppression of an entity in the active config."""
+        kind = self.sup_kind.currentText()
+        idx = self.sup_idx.value()
+        cfg = self._eq_manager.get_active_config()
+        if not cfg:
+            return
+        key = f"suppressed_{kind}s"
+        suppressed = cfg.get(key, [])
+        if idx in suppressed:
+            suppressed.remove(idx)
+            action = "unsuppressed"
+        else:
+            suppressed.append(idx)
+            action = "suppressed"
+        cfg[key] = suppressed
+        self._push_undo()
+        self.status.setText(f"{kind.capitalize()} {idx} {action} in config '{cfg['name']}'")
+
+    def _export_equations(self):
+        """Export variables and configs to SolidWorks equations.txt."""
+        from PySide import QtWidgets
+        txt = self._eq_manager.export_equations_txt()
+        fname, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self.widget, "Export equations.txt", "equations.txt", "Text files (*.txt)")
+        if fname:
+            try:
+                with open(fname, "w") as f:
+                    f.write(txt)
+                self.status.setText(f"Exported equations.txt to {fname}")
+            except Exception as exc:
+                self.status.setText(f"Export failed: {exc}")
+
+    def _import_equations(self):
+        """Import variables and configs from SolidWorks equations.txt."""
+        from PySide import QtWidgets
+        fname, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self.widget, "Import equations.txt", "", "Text files (*.txt)")
+        if fname:
+            try:
+                with open(fname, "r") as f:
+                    txt = f.read()
+                ok, errors = self._eq_manager.import_equations_txt(txt)
+                if ok:
+                    self._variables = self._eq_manager.get_all_variables()
+                    self._refresh_var_list()
+                    self._refresh_cfg_combo()
+                    self.status.setText(f"Imported equations.txt from {fname}")
+                else:
+                    self.status.setText(f"Import errors: {'; '.join(errors[:3])}")
+            except Exception as exc:
+                self.status.setText(f"Import failed: {exc}")
 
     def _on_dim_list_clicked(self, item):
         """Highlight the constraint's points in the viewport when clicked in list."""
@@ -3250,7 +3449,15 @@ class Sketch3DPanel(object):
                     obj.SegmentTypes = types
                     obj.Bulges = [repr(b) for b in bulges]
                 obj.Constraints = _serialize_constraints(self._constraints)
+                # Variables: use EquationManager serialization for full state
                 obj.Variables = _serialize_variables(self._variables)
+                # EquationManager full state (issues.md #10 / #15)
+                eq_data = panel_logic.serialize_equation_manager(self._eq_manager)
+                if not hasattr(obj, "EqManagerState"):
+                    obj.addProperty("App::PropertyString", "EqManagerState",
+                                    "Sketch3D", "Equation manager state (JSON)")
+                import json
+                obj.EqManagerState = json.dumps(eq_data)
                 # Issue #14: associative projection payload -- per-point
                 # refs (already row-aligned via the panel's upkeep) +
                 # link dependencies + the projection plane captured now.
