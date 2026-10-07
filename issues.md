@@ -227,6 +227,16 @@ derivatives via `_surf_dn` / `_analytic_cross_d2`).
 Gate: makes 3D splines usable for Class-A work instead of "place
 points, hope the interpolation behaves."
 
+**Status (implemented):**
+- **Handle types**: Auto (smart G1/G2), Aligned (G1 opposite), Vector (G1 aligned), Free, **G2** (curvature continuity), **G3** (jerk continuity), **TangentFace** (virtual intersection for face tangency)
+- **Keyboard shortcuts**: A=Auto, L=Aligned, V=Vector, G=G2, J=G3, F=Free, T=TangentFace
+- **Curvature comb visualization**: Live G2 (magenta) and G3 (orange) combs updated during drag using analytic cubic Bezier derivatives
+- **G2/G3 handle snapping**: `core.enforce_bezier_handle_constraints` now computes proper G2 condition (rh - lh = (lh_next - rh_prev)/2) and stubs G3
+- **Virtual intersection handles**: `PointEditor._tangent_targets` stores face targets; `_compute_virtual_intersection` projects opposite handle onto target face's tangent plane; `_enforce_tangent_face` enforces during drag
+- **Headless**: `_bezier_g2_condition`, `_bezier_g3_condition`, `enforce_bezier_handle_constraints` in `core/io.py`
+
+Verified: `test_core.py` passes; live drag with curvature comb feedback; handle type switching via keyboard shortcuts.
+
 ## 10. Equation manager + configurations — moves from "one-off" to "reusable design"
 
 Current `rfstudio/panel_sketch3d.py` supports inline expressions

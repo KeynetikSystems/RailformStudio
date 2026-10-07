@@ -316,6 +316,20 @@ fresh `Unreleased` section above it.
    (index-aligned string lists rebuilt in `execute()`, graceful
    degradation) and the platform-wrap split for #10/#15 (expression
    evaluation wraps FreeCAD's engine; suppression state stays ours).
+ - 3D-spline handles with G2/G3 feedback (issues.md #9): BezierCurve
+    edit mode now supports G2/G3 handle types with live curvature comb
+    feedback. New handle types: **G2** (curvature continuity),
+    **G3** (jerk continuity), **TangentFace** (virtual intersection for
+    face tangency) alongside existing Auto/Aligned/Vector/Free.
+    Keyboard shortcuts: G=G2, J=G3, T=TangentFace (A/L/V/F unchanged).
+    `core.enforce_bezier_handle_constraints` now computes proper G2
+    condition (rh - lh = (lh_next - rh_prev)/2) and stubs G3; curvature
+    comb uses analytic cubic Bezier derivatives for exact G2 (magenta)
+    and G3 jerk (orange dotted). Virtual intersection handles: select a
+    face then press T on a handle — the opposite handle snaps to the
+    projection onto the face's tangent plane at the closest point,
+    enforcing tangency during drag. Headless: `_bezier_g2_condition`,
+    `_bezier_g3_condition` in `core/io.py`.
 
 ### Changed
  - Fillet panel dual-model clarity: the legacy (nothing-selected)

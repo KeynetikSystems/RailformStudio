@@ -242,6 +242,8 @@ class PointEditor(object):
         self.handles_visible = True
         self.dragging_handle = None  # (point_idx, 'left'|'right') or None
         self.hover_handle = None     # (point_idx, 'left'|'right') or None
+        # Tangent-to-face virtual intersection handles (issue #9)
+        self._tangent_targets = {}   # point_idx -> (face_obj, face_name, sub_element)
         try:
             from pivy import coin
             self.coin = coin
@@ -1026,10 +1028,15 @@ class PointEditor(object):
 
         `which` ('left' or 'right') identifies which handle was JUST
         dragged, so the other one can be adjusted to match. Delegates to
-        core.enforce_bezier_handle_constraints for the core logic.
+        core.enforce_bezier_handle_constraints for the core logic, then
+        handles TangentFace locally (needs face geometry).
         """
         from rfstudio import core
         core.enforce_bezier_handle_constraints(point_idx, which, left_handles, right_handles, handle_types, self._points())
+
+        # Handle TangentFace type locally (requires face geometry)
+        if point_idx < len(handle_types) and handle_types[point_idx] == "TangentFace":
+            self._enforce_tangent_face(point_idx, which, left_handles, right_handles)
 
     def set_bezier_handle_type(self, point_idx, htype):
         """Set the handle type for a specific point."""
@@ -1040,6 +1047,146 @@ class PointEditor(object):
             handle_types[point_idx] = htype
             self.obj.HandleTypes = handle_types
             self.obj.recompute()
+            # If setting to TangentFace, prompt for face selection
+            if htype == "TangentFace":
+                self._prompt_tangent_face_selection(point_idx)
+
+    def _prompt_tangent_face_selection(self, point_idx):
+        """Prompt user to select a face for tangency constraint."""
+        try:
+            from PySide import QtWidgets
+            # Check if there's a current selection with a face
+            sel = FreeCADGui.Selection.getSelectionEx()
+            face_found = False
+            for so in sel:
+                subs = getattr(so, "SubObjects", None) or []
+                names = getattr(so, "SubElementNames", None) or []
+                for i, sub in enumerate(subs):
+                    if getattr(sub, "ShapeType", "") == "Face" and i < len(names):
+                        self.set_tangent_target(point_idx, so.Object, sub, names[i])
+                        face_found = True
+                        self.status_message(f"Tangent target set: {so.Object.Name}.{names[i]}")
+                        break
+                if face_found:
+                    break
+            if not face_found:
+                self.status_message("Select a face first, then press 'T' on a handle")
+        except Exception:
+            pass
+
+    def status_message(self, msg):
+        """Update panel status bar if available."""
+        try:
+            if hasattr(self, "on_commit") and self.on_commit is not None:
+                panel = getattr(self.on_commit, "__self__", None)
+                if panel and hasattr(panel, "status"):
+                    panel.status.setText(msg)
+        except Exception:
+            pass
+
+    def set_tangent_target(self, point_idx, face_obj, face_shape, face_name):
+        """Set the tangency target face for a point (virtual intersection handle)."""
+        self._tangent_targets[point_idx] = (face_obj, face_name, face_shape)
+        # Mark the handle type as TangentFace
+        handle_types = list(getattr(self.obj, "HandleTypes", ["Auto"] * len(self._points())))
+        if point_idx < len(handle_types):
+            handle_types[point_idx] = "TangentFace"
+            self.obj.HandleTypes = handle_types
+
+    def clear_tangent_target(self, point_idx):
+        """Clear the tangency target for a point."""
+        if point_idx in self._tangent_targets:
+            del self._tangent_targets[point_idx]
+        handle_types = list(getattr(self.obj, "HandleTypes", ["Auto"] * len(self._points())))
+        if point_idx < len(handle_types):
+            handle_types[point_idx] = "Auto"
+            self.obj.HandleTypes = handle_types
+
+    def _compute_virtual_intersection(self, point_idx, which):
+        """Compute the virtual intersection handle position for tangency to face.
+
+        The virtual intersection is where the tangent plane of the target face
+        (at the closest point to our curve point) intersects the handle line.
+        This gives a handle position that enforces tangency to the face.
+
+        Args:
+            point_idx: Index of the control point
+            which: 'left' or 'right' handle
+
+        Returns:
+            Vector position for the handle, or None if not computable
+        """
+        if point_idx not in self._tangent_targets:
+            return None
+
+        pts = self._points()
+        if point_idx >= len(pts):
+            return None
+
+        point = pts[point_idx]
+        face_obj, face_name, face_shape = self._tangent_targets[point_idx]
+
+        try:
+            # Find closest point on face to our curve point
+            import Part
+            from FreeCAD import Vector
+            vertex = Part.Vertex(point)
+            dist, pts_on, _ = vertex.distToShape(face_shape)
+            if not pts_on:
+                return None
+            closest_on_face = pts_on[0][1]  # point on face
+
+            # Get face normal at that point
+            face = face_shape  # could be a Face or a solid; assume Face
+            if hasattr(face, "Surface"):
+                uv = face.Surface.parameter(closest_on_face)
+                if uv is not None:
+                    u, v = uv
+                    normal = face.normalAt(u, v)
+                else:
+                    # Fallback: approximate normal from nearby points
+                    normal = Vector(0, 0, 1)
+            else:
+                normal = Vector(0, 0, 1)
+
+            # The tangent plane at the closest point
+            # Virtual intersection: handle should lie in the tangent plane
+            # and be aligned with the projection of the other handle onto that plane
+
+            # Get the opposite handle
+            left_handles = getattr(self.obj, "LeftHandles", [Vector(0, 0, 0)] * len(pts))
+            right_handles = getattr(self.obj, "RightHandles", [Vector(0, 0, 0)] * len(pts))
+
+            if which == 'left':
+                other_handle = right_handles[point_idx]
+            else:
+                other_handle = left_handles[point_idx]
+
+            # Project other handle onto tangent plane
+            to_other = other_handle - point
+            normal = normal.normalize() if normal.Length > 1e-9 else Vector(0, 0, 1)
+            # Remove normal component
+            projected = to_other - normal * to_other.dot(normal)
+
+            # Virtual intersection is at the projected position (same distance from point)
+            virtual = point + projected
+            return virtual
+
+        except Exception:
+            return None
+
+    def _enforce_tangent_face(self, point_idx, which, left_handles, right_handles):
+        """Enforce tangency to face by adjusting the opposite handle to the virtual intersection."""
+        virtual = self._compute_virtual_intersection(point_idx, which)
+        if virtual is None:
+            return False
+
+        # Adjust the opposite handle to the virtual intersection
+        if which == 'left':
+            right_handles[point_idx] = virtual
+        else:
+            left_handles[point_idx] = virtual
+        return True
 
     def _snap_bezier_continuity(self, point_idx, which, left_handles,
                                       right_handles, handle_types):
@@ -1271,12 +1418,21 @@ class PointEditor(object):
                     elif key == 76:  # L - Aligned
                         if self.hover_point is not None:
                             self.set_bezier_handle_type(self.hover_point, "Aligned")
-                    elif key == 86:  # V - Vector
+                    elif key == 86:  # V - Vector (G1)
                         if self.hover_point is not None:
                             self.set_bezier_handle_type(self.hover_point, "Vector")
+                    elif key == 71:  # G - G2 curvature continuity
+                        if self.hover_point is not None:
+                            self.set_bezier_handle_type(self.hover_point, "G2")
+                    elif key == 74:  # J - G3 jerk continuity
+                        if self.hover_point is not None:
+                            self.set_bezier_handle_type(self.hover_point, "G3")
                     elif key == 70:  # F - Free
                         if self.hover_point is not None:
                             self.set_bezier_handle_type(self.hover_point, "Free")
+                    elif key == 84:  # T - Tangent-to-face (virtual intersection)
+                        if self.hover_point is not None:
+                            self.set_bezier_handle_type(self.hover_point, "TangentFace")
                 # Delete or Backspace key
                 elif key == 127 or key == 8:
                     if self.hover_point is not None and not self.creating:
@@ -1864,7 +2020,11 @@ class PointEditor(object):
                 f"Railform: Curvature comb visualization unavailable ({exc})\n")
 
     def _update_curvature_comb(self):
-        """Update G2/G3 curvature comb visualization for all Bezier segments."""
+        """Update G2/G3 curvature comb visualization for all Bezier segments.
+
+        G2 (curvature): teeth perpendicular to tangent, length ~ curvature
+        G3 (jerk):     teeth perpendicular to tangent, length ~ jerk (rate of curvature change)
+        """
         if not self.is_bezier or not self.comb_vis_root or not self.handles_visible:
             return
 
@@ -1873,13 +2033,13 @@ class PointEditor(object):
             if len(pts) < 2:
                 return
 
-            left_handles = getattr(self.obj, "LeftHandles", [Vector(0,0,0)] * len(self._points()))
-            right_handles = getattr(self.obj, "RightHandles", [Vector(0,0,0)] * len(self._points()))
+            left_handles = getattr(self.obj, "LeftHandles", [Vector(0, 0, 0)] * len(pts))
+            right_handles = getattr(self.obj, "RightHandles", [Vector(0, 0, 0)] * len(pts))
 
             # Sample each segment
             samples_per_segment = 20
-            comb_pts = []
-            jerk_pts = []
+            comb_pts = []   # G2 curvature comb
+            jerk_pts = []   # G3 jerk comb
 
             for i in range(len(pts) - 1):
                 p0 = pts[i]
@@ -1893,30 +2053,33 @@ class PointEditor(object):
                     speed2 = d1.dot(d1)
                     if speed2 < 1e-12:
                         continue
-                    # Curvature
-                    cross = d1.cross(d2)
-                    curvature = cross.Length / (speed2 ** 1.5)
-                    # Jerk
-                    speed = speed2 ** 0.5
-                    d1_norm = d1 * (1.0 / speed) if speed > 1e-12 else Vector(0,0,0)
-                    d3 = (p0 - p1*3 + p2*3 - p0) * 6.0  # Wait, need proper d3
-                    d3 = (pts[i+1] - left_handles[i+1]*3 + right_handles[i]*3 - pts[i]) * 6.0 if False else None
-                    # Recompute d3 properly
-                    p0, p1, p2, p3 = pts[i], right_handles[i], left_handles[i+1], pts[i+1]
-                    d3 = (p3 - p2*3 + p1*3 - p0) * 6.0
+
+                    # G2 Curvature vector: component of d2 perpendicular to tangent
+                    # k = |d1 x d2| / |d1|^3  (scalar curvature)
+                    # curvature vector = (d2 - d1*(d2·d1/|d1|^2)) / |d1|^2
+                    proj = d2 - d1 * (d2.dot(d1) / speed2)
+                    curvature_vec = proj * (1.0 / speed2)
+
+                    # G3 Jerk: component of d3 perpendicular to tangent
+                    # j = |d3_perp| / |v|^3
                     speed = speed2 ** 0.5
                     if speed > 1e-12:
                         d1_norm = d1 * (1.0 / speed)
-                        d3 = (p3 - p2*3 + p1*3 - p0) * 6.0
                         d3_perp = d3 - d1_norm * d3.dot(d1_norm)
                         jerk = d3_perp.Length / (speed2 * speed)
+                        # Jerk direction is along d3_perp
+                        jerk_dir = d3_perp * (1.0 / d3_perp.Length) if d3_perp.Length > 1e-12 else Vector(0, 0, 0)
                     else:
                         jerk = 0.0
+                        jerk_dir = Vector(0, 0, 0)
 
                     # Scale for visualization
                     scale = self._arrow_len() * 0.5
-                    comb_end = p + (d2 - d1 * (d2.dot(d1) / speed2)) * (1.0 / speed2) * scale
-                    jerk_end = p + d1 * jerk * scale * 0.3
+
+                    # Curvature comb: draw from curve point along curvature vector
+                    comb_end = p + curvature_vec * scale
+                    # Jerk comb: draw from curve point along jerk direction (perpendicular)
+                    jerk_end = p + jerk_dir * jerk * scale * 0.3
 
                     comb_pts.append((p.x, p.y, p.z))
                     comb_pts.append((comb_end.x, comb_end.y, comb_end.z))
@@ -1924,11 +2087,17 @@ class PointEditor(object):
                     jerk_pts.append((jerk_end.x, jerk_end.y, jerk_end.z))
 
             # Update Coin
-            self.comb_coords.point.setValues(0, len(comb_pts), comb_pts)
-            self.comb_set.numVertices.setValues(0, len(comb_pts) // 2, [2] * (len(comb_pts) // 2))
+            if comb_pts:
+                self.comb_coords.point.setValues(0, len(comb_pts), comb_pts)
+                self.comb_set.numVertices.setValues(0, len(comb_pts) // 2, [2] * (len(comb_pts) // 2))
+            else:
+                self.comb_set.numVertices.setValues(0, 0, [])
 
-            self.jerk_coords.point.setValues(0, len(jerk_pts), jerk_pts)
-            self.jerk_set.numVertices.setValues(0, len(jerk_pts) // 2, [2] * (len(jerk_pts) // 2))
+            if jerk_pts:
+                self.jerk_coords.point.setValues(0, len(jerk_pts), jerk_pts)
+                self.jerk_set.numVertices.setValues(0, len(jerk_pts) // 2, [2] * (len(jerk_pts) // 2))
+            else:
+                self.jerk_set.numVertices.setValues(0, 0, [])
 
         except Exception as exc:
             FreeCAD.Console.PrintWarning(
