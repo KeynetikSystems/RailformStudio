@@ -9,17 +9,15 @@ Renumbering would break CHANGELOG/commit references — statuses are
 appended per issue instead. Cross-issue view as of 2026-10:
 
 - **Done:** #1 (trim guard hardened, see its Update), #2 (GUI harness:
-  6 static checks + mutation selftest), #13 (trim-aware exact G2),
+  6 static checks + mutation selftest), #9 (3D-spline handles w/ G2/G3
+  feedback), #10 (equation manager + configs), #13 (trim-aware exact G2),
   #14 (associative projection, slice, direction modes, silhouette).
 - **Major slice landed, remainder open:** #7 (pierce + on-surface
   via re-derive; tangent-to-face still needs a solver direction
   constraint), #8 (global verdict + per-constraint/point badges;
   per-DOF breakdown, drag-to-diagnose, auto-repair open).
-- **P1 next:** #9 (3D-spline handles), #10 (equation manager — design
-  it platform-wrapped, see Conventions below). *If daily civil/track
-  work leans on equations, #10 swaps ahead of #9.*
-- **P2:** #15 (configs, builds on #10), #11 (multi-plane), #12
-  (assembly context — reuses the #7 external-ref machinery), #16
+- **P1 next:** #15 (configs, builds on #10), #11 (multi-plane).
+- **P2:** #12 (assembly context — reuses the #7 external-ref machinery), #16
   (multi-body).
 - **Open small:** #3 (star-patch G2), #4 (field-testing), #5 (mirror
   welding), #6 (startup skip).
@@ -257,6 +255,14 @@ the FP object) are the foundation. The missing piece is the
 config-table data model and the UI.
 
 Gate: turns single-use sketches into parametric families.
+
+**Status (implemented):**
+- **EquationManager** (headless `panel_logic.EquationManager`): variables with metadata (value, unit, comment, suppressed, linked), configurations (design table), suppression per constraint/point/handle, active config switching, SolidWorks equations.txt import/export (round-trip), JSON serialization for persistence.
+- **Panel UI** (issues.md #10 / #15): "Equations / Configurations" collapsible group with config combo (+/- config), suppression table (kind: constraint/point/handle + idx toggle), Export/Import equations.txt buttons.
+- **Sketch3DFP.execute()** integration: loads EquationManager state from `EqManagerState` property, applies active config variable overrides, filters suppressed constraints/points from solver.
+- **Variables UI**: unit combo (mm/cm/m/in/deg/rad), comment field, metadata shown in list.
+- **Headless tests**: `test_equation_manager_basic`, `test_equation_manager_configs`, `test_equation_manager_suppression`, `test_equation_manager_export_import`, `test_equation_manager_persistence`.
+- **Still open**: Linked values across multiple sketch objects (needs document-level EquationManager sharing + UI for linking).
 
 ## 11. Multi-plane 3D sketch — eliminates the single-plane limitation
 

@@ -389,6 +389,121 @@ def test_constraint_badges():
     out("  constraint badges OK")
 
 
+# --- Equation Manager tests (issues.md #10 / #15) --- #
+
+def test_equation_manager_basic():
+    """EquationManager: variable add/get/set, flat namespace for eval."""
+    class MockDoc:
+        Name = "TestDoc"
+    em = panel_logic.EquationManager(MockDoc())
+    em.add_variable("width", 100.0, "mm", "plate width")
+    em.add_variable("height", 50.0, "mm", "plate height")
+    assert em.get_variable_value("width") == 100.0
+    assert em.get_variable_meta("width")["unit"] == "mm"
+    assert em.get_variable_meta("width")["comment"] == "plate width"
+    flat = em.get_all_variables()
+    assert flat["width"] == 100.0
+    assert flat["height"] == 50.0
+    # update value
+    em.set_variable_value("width", 120.0)
+    assert em.get_variable_value("width") == 120.0
+    assert em.get_all_variables()["width"] == 120.0
+    out("  equation manager basic OK")
+
+
+def test_equation_manager_configs():
+    """EquationManager: design table / configurations."""
+    class MockDoc:
+        Name = "TestDoc"
+    em = panel_logic.EquationManager(MockDoc())
+    em.add_variable("width", 100.0)
+    em.add_variable("height", 50.0)
+    # Add configs
+    idx1 = em.add_config("ConfigA", variables={"width": 80.0, "height": 60.0})
+    idx2 = em.add_config("ConfigB", variables={"width": 120.0})
+    assert idx1 == 0 and idx2 == 1
+    # Active config overrides
+    em.set_active_config(0)
+    assert em.get_all_variables()["width"] == 80.0
+    assert em.get_all_variables()["height"] == 60.0
+    em.set_active_config(1)
+    assert em.get_all_variables()["width"] == 120.0
+    assert em.get_all_variables()["height"] == 50.0  # falls back to global
+    out("  equation manager configs OK")
+
+
+def test_equation_manager_suppression():
+    """EquationManager: suppression per constraint/point/handle per config."""
+    class MockDoc:
+        Name = "TestDoc"
+    em = panel_logic.EquationManager(MockDoc())
+    em.add_config("Default")
+    em.add_config("ConfigB", suppressed_constraints=[0, 2],
+                  suppressed_points=[1], suppressed_handles=[3])
+    em.set_active_config(1)
+    assert em.is_suppressed("constraint", 0) == True
+    assert em.is_suppressed("constraint", 1) == False
+    assert em.is_suppressed("constraint", 2) == True
+    assert em.is_suppressed("point", 1) == True
+    assert em.is_suppressed("point", 0) == False
+    assert em.is_suppressed("handle", 3) == True
+    out("  equation manager suppression OK")
+
+
+def test_equation_manager_export_import():
+    """EquationManager: SolidWorks equations.txt round-trip."""
+    class MockDoc:
+        Name = "TestDoc"
+    em = panel_logic.EquationManager(MockDoc())
+    em.add_variable("width", 100.0, "mm", "width")
+    em.add_variable("height", 50.0, "mm", "height")
+    em.add_config("ConfigA", variables={"width": 80.0})
+    em.configs[0]["suppressed_constraints"] = [0]
+    em.configs[0]["suppressed_points"] = [1]
+    em.configs[0]["suppressed_handles"] = [2]
+
+    txt = em.export_equations_txt()
+    # Check export format
+    assert '"width" = 100.0 "mm"' in txt
+    assert '"height" = 50.0 "mm"' in txt
+    assert '$CONFIG "ConfigA"' in txt
+    assert '"width" = 80.0' in txt
+    assert '$SUPPRESS_CONSTRAINTS 0' in txt
+    assert '$SUPPRESS_POINTS 1' in txt
+    assert '$SUPPRESS_HANDLES 2' in txt
+
+    # Import into new manager
+    em2 = panel_logic.EquationManager(MockDoc())
+    ok, errors = em2.import_equations_txt(txt)
+    assert ok, f"Import errors: {errors}"
+    assert em2.get_variable_value("width") == 100.0
+    assert em2.get_variable_meta("width")["unit"] == "mm"
+    assert em2.get_variable_meta("width")["comment"] == "width"
+    assert len(em2.configs) == 1
+    assert em2.configs[0]["name"] == "ConfigA"
+    assert em2.configs[0]["variables"]["width"] == 80.0
+    assert em2.configs[0]["suppressed_constraints"] == [0]
+    assert em2.configs[0]["suppressed_points"] == [1]
+    assert em2.configs[0]["suppressed_handles"] == [2]
+    out("  equation manager export/import OK")
+
+
+def test_equation_manager_persistence():
+    """EquationManager: serialize/deserialize round-trip."""
+    class MockDoc:
+        Name = "TestDoc"
+    em = panel_logic.EquationManager(MockDoc())
+    em.add_variable("width", 100.0, "mm", "width")
+    em.add_config("ConfigA", variables={"width": 80.0})
+    data = panel_logic.serialize_equation_manager(em)
+    em2 = panel_logic.EquationManager(MockDoc())
+    panel_logic.deserialize_equation_manager(MockDoc(), data)
+    # The registry returns the same instance for same doc
+    reg = panel_logic._equation_manager_registry()
+    assert reg["TestDoc"].get_variable_value("width") == 100.0
+    out("  equation manager persistence OK")
+
+
 if __name__ == "__main__" or True:  # freecadcmd may not set __main__
     for t in (test_readiness_ok, test_readiness_no_inputs_yet,
               test_readiness_below_minimum, test_readiness_above_maximum,
@@ -416,7 +531,12 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_project_point_along,
               test_proj_ref_roundtrip,
               test_proj_ref_relation_kinds,
-              test_constraint_badges):
+              test_constraint_badges,
+              test_equation_manager_basic,
+              test_equation_manager_configs,
+              test_equation_manager_suppression,
+              test_equation_manager_export_import,
+              test_equation_manager_persistence):
         try:
             t()
         except Exception as e:

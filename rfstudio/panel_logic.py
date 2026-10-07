@@ -492,6 +492,27 @@ _EXPR_FUNCS = {
 _EXPR_CONSTS = {"pi": _math.pi, "e": _math.e}
 
 
+# --- Equation manager data model (issues.md #10 / #15) ---------------- #
+# Variable metadata schema:
+#   name -> {"value": float, "unit": str, "comment": str,
+#            "suppressed": bool, "linked": bool}
+# Configuration table schema:
+#   configs = [{"name": str, "variables": {name: float},
+#               "suppressed_constraints": [idx, ...],
+#               "suppressed_points": [idx, ...]}]
+
+
+def variable_meta_default(name, value):
+    """Create default variable metadata entry."""
+    return {"value": float(value), "unit": "mm", "comment": "",
+            "suppressed": False, "linked": False}
+
+
+def variable_meta_to_flat(meta):
+    """Convert metadata dict to flat dict for expression evaluation."""
+    return {name: info["value"] for name, info in meta.items()}
+
+
 def evaluate_expression(expr, namespace):
     """Evaluate a driving-dimension expression safely (no imports,
     attributes, lambdas, or statements -- arithmetic + whitelisted
@@ -731,3 +752,306 @@ def parse_proj_ref(ref):
         return None
     return {"kind": kind, "obj": obj_name, "locator": locator,
             "t": t, "direction": direction}
+
+
+# --- Equation Manager & Configuration Table (issues.md #10 / #15) ----- #
+# The EquationManager provides a global equation manager dialog, design
+# table (configurations), suppression state, and SolidWorks equations.txt
+# import/export. It is headless-testable (no Qt dependency in the core).
+
+
+class EquationManager:
+    """Global equation manager for a document.
+
+    Manages named variables with metadata (units, comments, suppression,
+    linking), configuration tables (design tables), and suppression state
+    per constraint/point/handle. Provides SolidWorks-style equations.txt
+    import/export.
+
+    Data model (all plain Python types for headless testability):
+      variables = {name: {"value": float, "unit": str, "comment": str,
+                         "suppressed": bool, "linked": bool}}
+      configs = [{"name": str, "variables": {name: float},
+                  "suppressed_constraints": [idx, ...],
+                  "suppressed_points": [idx, ...],
+                  "suppressed_handles": [idx, ...]}]
+      linked_objects = [obj_name, ...]  # names of objects sharing variables
+
+    The active configuration index controls which variable values are
+    used for expression evaluation.
+    """
+
+    def __init__(self, doc):
+        self.doc = doc
+        self.variables = {}       # name -> meta dict
+        self.configs = []         # list of config dicts
+        self.active_config = 0    # index into configs
+        self.linked_objects = []  # names of objects sharing this manager
+
+    # --- Variable management ---
+
+    def add_variable(self, name, value=0.0, unit="mm", comment=""):
+        """Add or update a variable. Returns the metadata dict."""
+        if name in self.variables:
+            self.variables[name]["value"] = float(value)
+            if unit: self.variables[name]["unit"] = unit
+            if comment: self.variables[name]["comment"] = comment
+        else:
+            self.variables[name] = variable_meta_default(name, value)
+            self.variables[name]["unit"] = unit
+            self.variables[name]["comment"] = comment
+        self._propagate_to_linked(name)
+        return self.variables[name]
+
+    def remove_variable(self, name):
+        if name in self.variables:
+            del self.variables[name]
+            # Also remove from all configs
+            for cfg in self.configs:
+                cfg["variables"].pop(name, None)
+            self._propagate_to_linked(name, removed=True)
+
+    def set_variable_value(self, name, value):
+        if name in self.variables:
+            self.variables[name]["value"] = float(value)
+            self._propagate_to_linked(name)
+            return True
+        return False
+
+    def get_variable_value(self, name):
+        if name in self.variables:
+            return self.variables[name]["value"]
+        return None
+
+    def get_variable_meta(self, name):
+        return self.variables.get(name)
+
+    def get_all_variables(self):
+        """Return flat dict for expression evaluation (current config)."""
+        flat = variable_meta_to_flat(self.variables)
+        # Override with active config values if any
+        if self.configs and 0 <= self.active_config < len(self.configs):
+            cfg_vars = self.configs[self.active_config].get("variables", {})
+            flat.update(cfg_vars)
+        return flat
+
+    def _propagate_to_linked(self, name, removed=False):
+        """Propagate variable changes to linked sketch objects."""
+        # This is a hook; actual propagation happens via the panel
+        pass
+
+    # --- Configuration / Design Table management ---
+
+    def add_config(self, name, variables=None, suppressed_constraints=None,
+                   suppressed_points=None, suppressed_handles=None):
+        """Add a new configuration. Returns the config index."""
+        cfg = {"name": name,
+               "variables": dict(variables) if variables else {},
+               "suppressed_constraints": list(suppressed_constraints) if suppressed_constraints else [],
+               "suppressed_points": list(suppressed_points) if suppressed_points else [],
+               "suppressed_handles": list(suppressed_handles) if suppressed_handles else []}
+        self.configs.append(cfg)
+        return len(self.configs) - 1
+
+    def remove_config(self, idx):
+        if 0 <= idx < len(self.configs):
+            self.configs.pop(idx)
+            if self.active_config >= len(self.configs):
+                self.active_config = max(0, len(self.configs) - 1)
+            return True
+        return False
+
+    def set_active_config(self, idx):
+        if 0 <= idx < len(self.configs):
+            self.active_config = idx
+            return True
+        return False
+
+    def get_active_config(self):
+        if self.configs and 0 <= self.active_config < len(self.configs):
+            return self.configs[self.active_config]
+        return None
+
+    def update_config_variables(self, idx, variables):
+        if 0 <= idx < len(self.configs):
+            self.configs[idx]["variables"].update(variables)
+            return True
+        return False
+
+    def update_config_suppression(self, idx, constraints=None, points=None, handles=None):
+        if 0 <= idx < len(self.configs):
+            if constraints is not None:
+                self.configs[idx]["suppressed_constraints"] = list(constraints)
+            if points is not None:
+                self.configs[idx]["suppressed_points"] = list(points)
+            if handles is not None:
+                self.configs[idx]["suppressed_handles"] = list(handles)
+            return True
+        return False
+
+    def is_suppressed(self, kind, idx):
+        """Check if a constraint/point/handle is suppressed in active config."""
+        cfg = self.get_active_config()
+        if not cfg:
+            return False
+        key = f"suppressed_{kind}s"
+        return idx in cfg.get(key, [])
+
+    # --- Linked objects ---
+
+    def link_object(self, obj_name):
+        if obj_name not in self.linked_objects:
+            self.linked_objects.append(obj_name)
+
+    def unlink_object(self, obj_name):
+        if obj_name in self.linked_objects:
+            self.linked_objects.remove(obj_name)
+
+    # --- SolidWorks equations.txt import/export ---
+
+    def export_equations_txt(self):
+        """Export variables and configs to SolidWorks-style equations.txt format.
+
+        Format:
+          "VarName" = Value "Unit"  ' Comment
+          $CONFIG "ConfigName"
+          "VarName" = Value
+          $ENDCONFIG
+        """
+        lines = []
+        # Global variables
+        for name, meta in sorted(self.variables.items()):
+            if meta.get("suppressed"):
+                continue
+            val = meta["value"]
+            unit = meta.get("unit", "mm")
+            comment = meta.get("comment", "")
+            line = f'"{name}" = {val} "{unit}"'
+            if comment:
+                line += f"  '{comment}"
+            lines.append(line)
+        # Configurations
+        for cfg in self.configs:
+            lines.append(f'$CONFIG "{cfg["name"]}"')
+            for name, val in sorted(cfg.get("variables", {}).items()):
+                lines.append(f'"{name}" = {val}')
+            if cfg.get("suppressed_constraints"):
+                lines.append(f'  $SUPPRESS_CONSTRAINTS {",".join(map(str, cfg["suppressed_constraints"]))}')
+            if cfg.get("suppressed_points"):
+                lines.append(f'  $SUPPRESS_POINTS {",".join(map(str, cfg["suppressed_points"]))}')
+            if cfg.get("suppressed_handles"):
+                lines.append(f'  $SUPPRESS_HANDLES {",".join(map(str, cfg["suppressed_handles"]))}')
+            lines.append("$ENDCONFIG")
+        return "\n".join(lines)
+
+    def import_equations_txt(self, text):
+        """Import from SolidWorks-style equations.txt format.
+
+        Returns (success: bool, errors: list[str]).
+        """
+        errors = []
+        self.variables.clear()
+        self.configs.clear()
+        self.active_config = 0
+        current_cfg = None
+        in_cfg = False
+
+        for line_num, raw_line in enumerate(text.splitlines(), 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Config start
+            if line.startswith('$CONFIG'):
+                import re
+                m = re.match(r'\$CONFIG\s+"([^"]+)"', line)
+                if m:
+                    current_cfg = {"name": m.group(1), "variables": {},
+                                   "suppressed_constraints": [],
+                                   "suppressed_points": [],
+                                   "suppressed_handles": []}
+                    in_cfg = True
+                else:
+                    errors.append(f"Line {line_num}: bad $CONFIG syntax")
+                continue
+            # Config end
+            if line == '$ENDCONFIG':
+                if in_cfg and current_cfg:
+                    self.configs.append(current_cfg)
+                    current_cfg = None
+                    in_cfg = False
+                continue
+            # Suppression in config
+            if in_cfg and current_cfg is not None:
+                if line.startswith('$SUPPRESS_CONSTRAINTS'):
+                    parts = line.split()
+                    if len(parts) > 1:
+                        current_cfg["suppressed_constraints"] = [int(x) for x in parts[1].split(",") if x.strip()]
+                    continue
+                if line.startswith('$SUPPRESS_POINTS'):
+                    parts = line.split()
+                    if len(parts) > 1:
+                        current_cfg["suppressed_points"] = [int(x) for x in parts[1].split(",") if x.strip()]
+                    continue
+                if line.startswith('$SUPPRESS_HANDLES'):
+                    parts = line.split()
+                    if len(parts) > 1:
+                        current_cfg["suppressed_handles"] = [int(x) for x in parts[1].split(",") if x.strip()]
+                    continue
+                # Variable in config
+                import re
+                m = re.match(r'"([^"]+)"\s*=\s*([-\d.]+)', line)
+                if m:
+                    name, val = m.group(1), float(m.group(2))
+                    current_cfg["variables"][name] = val
+                continue
+            # Global variable
+            import re
+            m = re.match(r'"([^"]+)"\s*=\s*([-\d.]+)\s*"([^"]+)"(?:\s*\'(.*))?', line)
+            if m:
+                name, val, unit, comment = m.group(1), float(m.group(2)), m.group(3), m.group(4) or ""
+                self.add_variable(name, val, unit, comment)
+                continue
+            # Fallback without unit
+            m = re.match(r'"([^"]+)"\s*=\s*([-\d.]+)(?:\s*\'(.*))?', line)
+            if m:
+                name, val, comment = m.group(1), float(m.group(2)), m.group(3) or ""
+                self.add_variable(name, val, "mm", comment)
+                continue
+            errors.append(f"Line {line_num}: unrecognized format: {line[:50]}")
+        return len(errors) == 0, errors
+
+
+def _equation_manager_registry():
+    """Internal: document -> EquationManager registry (for headless access)."""
+    if not hasattr(_equation_manager_registry, "_cache"):
+        _equation_manager_registry._cache = {}
+    return _equation_manager_registry._cache
+
+
+def get_equation_manager(doc):
+    """Get or create the EquationManager for a document."""
+    reg = _equation_manager_registry()
+    name = doc.Name if hasattr(doc, "Name") else str(doc)
+    if name not in reg:
+        reg[name] = EquationManager(doc)
+    return reg[name]
+
+
+def serialize_equation_manager(em):
+    """Serialize EquationManager state for persistence."""
+    return {
+        "variables": em.variables,
+        "configs": em.configs,
+        "active_config": em.active_config,
+        "linked_objects": em.linked_objects,
+    }
+
+
+def deserialize_equation_manager(doc, data):
+    """Deserialize EquationManager state from persistence."""
+    em = get_equation_manager(doc)
+    em.variables = data.get("variables", {})
+    em.configs = data.get("configs", [])
+    em.active_config = data.get("active_config", 0)
+    em.linked_objects = data.get("linked_objects", [])
+    return em
