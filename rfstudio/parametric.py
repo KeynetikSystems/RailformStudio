@@ -16,6 +16,7 @@ import Part
 
 from rfstudio import core
 from rfstudio import groups
+from rfstudio.mirror import mirror_shape, plane_base_normal
 
 
 def _icon(name):
@@ -38,6 +39,7 @@ _KIND_ICON = {
     "Shell": "rfs_shell.svg", "ExtendSurf": "rfs_extend.svg",
     "BlendSurf": "rfs_blend.svg",
     "N_sidedPatch": "rfs_patch44.svg",
+    "Mirror": "rfs_mirror.svg", "MirrorGroup": "rfs_mirror.svg",
 }
 
 
@@ -663,34 +665,84 @@ class ApproxCurveFP(_BaseFP):
 
 
 class PolylineFP(_BaseFP):
-    """Polyline through points."""
+    """Polyline through points.
+
+    Corner FILLETS are a RECORD on this object -- `Fillets`, index-aligned
+    with Points (0 = sharp) -- SolidWorks-sketch style rather than a
+    second, linked curve object: `Points` keeps the SHARP corners (the
+    sketch geometry) and execute() rebuilds the tangent arcs from the
+    record on every recompute, so a fillet survives point edits and any
+    other recompute. Driven live by editmode.CornerFilletEditor's
+    handles. (The older derived-feature form -- a PolylineFillet object
+    linking this one -- is parametric.PolylineFilletFP, still supported
+    for existing documents.)"""
     Kind = "Polyline"
 
     def __init__(self, obj):
         obj.Proxy = self
         obj.addProperty("App::PropertyVectorList", "Points", "Polyline",
                         "Points")
+        obj.addProperty("App::PropertyFloatList", "Fillets", "Polyline",
+                        "Per-corner fillet radius, index-aligned with "
+                        "Points (0/missing = sharp). The fillet RECORD: "
+                        "Points stay sharp and the arcs are rebuilt from "
+                        "this list on every recompute. Driven live by "
+                        "the in-viewport corner handles; a uniform "
+                        "Radius panel writes the same value at every "
+                        "index.")
+        obj.addProperty("App::PropertyBool", "FilletClosed", "Polyline",
+                        "Also round the corner between the last and "
+                        "first point")
+        obj.FilletClosed = False
         obj.addProperty("App::PropertyBool", "ShowInputs", "Polyline",
                         "Show points")
         obj.ShowInputs = False
+
+    @staticmethod
+    def _fillet_map(obj, n):
+        """{corner_index: radius} from the `Fillets` record (indices
+        beyond the current point count ignored), or None when there is
+        nothing to round (no record / all-zero) -- in which case the
+        plain single-edge polyline is built, exactly as before fillets
+        existed."""
+        radii = list(getattr(obj, "Fillets", []) or [])
+        fmap = {i: float(r) for i, r in enumerate(radii[:n])
+                if r and r > 0}
+        return fmap or None
+
+    def _build_fillet_shape(self, obj, pts):
+        """Rounded wire from the record, or None if the fillet build
+        fails (caller falls back to the plain polyline)."""
+        fmap = self._fillet_map(obj, len(pts))
+        if fmap is None:
+            return None
+        return core.polyline_corner_fillet(
+            pts, fmap, closed=bool(getattr(obj, "FilletClosed", False)))
 
     def execute(self, obj):
         points = obj.Points
         if len(points) < 2:
             return
         try:
-            # A polyline as a SINGLE curve edge: a degree-1 (linear) B-spline
-            # through the points. Same straight-segment geometry as a polygon
-            # wire, but one edge -- uniform with the other Railform curves and
-            # cleaner for downstream loft/sweep. (Part has no `Polyline`; that
-            # raised "module 'Part' has no attribute 'Polyline'".)
             pts = list(points)
-            n = len(pts)
-            bs = Part.BSplineCurve()
-            knots = [float(i) for i in range(n)]     # one knot per point
-            mults = [2] + [1] * (n - 2) + [2]        # clamped ends (degree+1)
-            bs.buildFromPolesMultsKnots(pts, mults, knots, False, 1)
-            obj.Shape = bs.toShape()
+            shape = self._build_fillet_shape(obj, pts)
+            if shape is not None:
+                # Fillet record active: rebuild the rounded wire from the
+                # SHARP points -- the record is the constraint, Points is
+                # the sketch geometry, and neither overwrites the other.
+                obj.Shape = shape
+            else:
+                # A polyline as a SINGLE curve edge: a degree-1 (linear) B-spline
+                # through the points. Same straight-segment geometry as a polygon
+                # wire, but one edge -- uniform with the other Railform curves and
+                # cleaner for downstream loft/sweep. (Part has no `Polyline`; that
+                # raised "module 'Part' has no attribute 'Polyline'".)
+                n = len(pts)
+                bs = Part.BSplineCurve()
+                knots = [float(i) for i in range(n)]     # one knot per point
+                mults = [2] + [1] * (n - 2) + [2]        # clamped ends (degree+1)
+                bs.buildFromPolesMultsKnots(pts, mults, knots, False, 1)
+                obj.Shape = bs.toShape()
             groups.apply_input_visibility(obj, ["Points"])
         except Exception as exc:
             FreeCAD.Console.PrintError("Railform Polyline: %s\n" % exc)
@@ -699,6 +751,16 @@ class PolylineFP(_BaseFP):
         pts = list(points)
         n = len(pts)
         if n < 2:
+            return None
+        # Live point-drag preview must show the filleted result too --
+        # otherwise dragging a point of a filleted polyline flashes the
+        # sharp shape until the next full recompute (panel_curve.py and
+        # editmode.PointEditor both render this return value).
+        try:
+            shape = self._build_fillet_shape(obj, pts)
+            if shape is not None:
+                return shape
+        except Exception:
             return None
         try:
             bs = Part.BSplineCurve()
@@ -901,6 +963,13 @@ class MatchSurfaceFP(_BaseFP):
         obj.addProperty("App::PropertyBool", "ShowInputs", "Match",
                         "Keep the reference and target surfaces visible")
         obj.ShowInputs = True
+        # Persistent diagnostics (plain runtime attributes do NOT stick
+        # on FeaturePython objects -- AttributeError -- so these are
+        # real properties, unlike MirrorFP's _LastWeldOK pattern).
+        obj.addProperty("App::PropertyString", "MatchMethod", "Match",
+                        "Which algorithm produced the current shape (exact_g2/exact_g1/sampled)")
+        obj.addProperty("App::PropertyString", "MatchGrade", "Match",
+                        "Achieved continuity grade of the last recompute (G2/G1/G0/FAIL)")
 
     def execute(self, obj):
         ref_objs = obj.Reference or []
@@ -912,11 +981,153 @@ class MatchSurfaceFP(_BaseFP):
         if not tgt_surf or not ref_surfaces:
             return
         try:
-            obj.Shape = core.match_surface(tgt_surf, ref_surfaces,
-                                           continuity="G2", n=24, scale=1.0)
+            rebuilt, report, _chosen = core.match_surface_to_references(
+                tgt_surf, ref_surfaces,
+                continuity="G2", n=24, scale=1.0)
+            obj.Shape = rebuilt
+            # Guarded for documents created before these properties
+            # existed (no structural change during recompute otherwise).
+            try:
+                if hasattr(obj, "MatchMethod"):
+                    obj.MatchMethod = report.get("method", "sampled")
+                if hasattr(obj, "MatchGrade"):
+                    obj.MatchGrade = core.classify_continuity(report)
+            except Exception:
+                pass
             groups.apply_input_visibility(obj, ["Reference", "Target"])
         except Exception as exc:
             FreeCAD.Console.PrintError("Railform Match: %s\n" % exc)
+
+
+class MirrorFP(_BaseFP):
+    """One-way parametric mirror: Source -> a derived mirrored copy,
+    optionally welded into one continuous shell/solid. Two objects
+    (Source + this one), the mirror always re-derived from the source via
+    FreeCAD's own dependency graph -- for live bidirectional point-
+    dragging on a SINGLE curve instead (no second object), see
+    editmode.PointEditor.set_symmetry (CurvePanel's "Symmetric editing"
+    checkbox). Wraps rfstudio.mirror.mirror_shape, welding via
+    core.stitch_shell. See panel_solids.MirrorPanel (RFS_Mirror) for the
+    editing UI."""
+    Kind = "Mirror"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        obj.addProperty("App::PropertyLink", "Source", "Mirror",
+                        "Object to mirror (curve, surface, or solid)")
+        obj.addProperty("App::PropertyEnumeration", "Plane", "Mirror",
+                        "Mirror plane. 'Pick from model' is a transient "
+                        "UI-only value (see MirrorPanel) that always "
+                        "resolves to Custom's Base/Normal by the time "
+                        "execute() runs.")
+        obj.Plane = ["XY", "YZ", "ZX", "Custom", "Pick from model"]
+        obj.Plane = "XY"
+        obj.addProperty("App::PropertyVector", "Base", "Mirror",
+                        "Plane base point (Custom / Pick from model only)")
+        obj.Base = FreeCAD.Vector(0, 0, 0)
+        obj.addProperty("App::PropertyVector", "Normal", "Mirror",
+                        "Plane normal (Custom / Pick from model only)")
+        obj.Normal = FreeCAD.Vector(0, 0, 1)
+        obj.addProperty("App::PropertyBool", "WeldSeam", "Mirror",
+                        "Stitch Source and its mirror into one continuous "
+                        "shell/solid instead of two separate shapes")
+        obj.WeldSeam = False
+        obj.addProperty("App::PropertyBool", "ShowInputs", "Mirror",
+                        "Keep Source visible alongside the mirrored copy")
+        obj.ShowInputs = True
+
+    def execute(self, obj):
+        src = obj.Source
+        if src is None:
+            return
+        shape = getattr(src, "Shape", None)
+        if shape is None or shape.isNull():
+            return
+        try:
+            base, normal = plane_base_normal(obj.Plane, obj.Base, obj.Normal)
+            result, welded = mirror_shape(
+                shape, base, normal,
+                weld=bool(obj.WeldSeam), stitch_fn=core.stitch_shell)
+        except Exception as exc:
+            FreeCAD.Console.PrintError("Railform Mirror: %s\n" % exc)
+            return
+        obj.Shape = result
+        # Plain runtime attribute, not an addProperty -- MirrorPanel.recompute()
+        # reads this right after each self.obj.recompute() to report whether a
+        # requested weld actually succeeded; it doesn't need to survive a
+        # save/reload, only the current session.
+        obj._LastWeldOK = welded
+        if bool(obj.WeldSeam) and not welded:
+            FreeCAD.Console.PrintWarning(
+                "Railform Mirror: weld requested but stitching failed "
+                "(Source's boundary may not touch the mirror plane) -- "
+                "showing an unwelded compound instead.\n")
+        # Single-link source: apply_input_visibility only handles link
+        # LISTS (see groups.py), so drive Source's visibility from
+        # ShowInputs directly -- same pattern as PolylineFilletFP.
+        if getattr(src, "ViewObject", None) is not None:
+            src.ViewObject.Visibility = bool(obj.ShowInputs)
+
+
+class MirrorGroupFP(_BaseFP):
+    """Mirror every object in Sources across one plane in a single step --
+    the per-folder counterpart to MirrorFP. Select everything under a
+    Railform Curves/Surfaces folder, invoke RFS_MirrorGroup: each source
+    is mirrored independently (optionally welded to ITS OWN mirror), and
+    all N results are combined into one compound Shape. To weld the
+    WHOLE resulting assembly into one continuous shell instead, run
+    StitchShellPanel on the result afterward -- not reinvented here."""
+    Kind = "MirrorGroup"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        obj.addProperty("App::PropertyLinkList", "Sources", "MirrorGroup",
+                        "Objects to mirror (curves, surfaces, or solids)")
+        obj.addProperty("App::PropertyEnumeration", "Plane", "MirrorGroup",
+                        "Mirror plane")
+        obj.Plane = ["XY", "YZ", "ZX", "Custom"]
+        obj.Plane = "XY"
+        obj.addProperty("App::PropertyVector", "Base", "MirrorGroup",
+                        "Plane base point (Custom only)")
+        obj.Base = FreeCAD.Vector(0, 0, 0)
+        obj.addProperty("App::PropertyVector", "Normal", "MirrorGroup",
+                        "Plane normal (Custom only)")
+        obj.Normal = FreeCAD.Vector(0, 0, 1)
+        obj.addProperty("App::PropertyBool", "WeldSeam", "MirrorGroup",
+                        "Weld each source to its own mirror (independently, "
+                        "not the whole group into one shell)")
+        obj.WeldSeam = False
+        obj.addProperty("App::PropertyBool", "ShowInputs", "MirrorGroup",
+                        "Keep all sources visible alongside their mirrors")
+        obj.ShowInputs = True
+
+    def execute(self, obj):
+        sources = [s for s in (obj.Sources or []) if getattr(s, "Shape", None)]
+        if not sources:
+            return
+        try:
+            base, normal = plane_base_normal(obj.Plane, obj.Base, obj.Normal)
+            results, welds = [], []
+            for src in sources:
+                result, welded = mirror_shape(
+                    src.Shape, base, normal,
+                    weld=bool(obj.WeldSeam), stitch_fn=core.stitch_shell)
+                results.append(result)
+                welds.append(welded)
+            obj.Shape = Part.Compound(results)
+        except Exception as exc:
+            FreeCAD.Console.PrintError("Railform MirrorGroup: %s\n" % exc)
+            return
+        # Plain runtime attribute (not addProperty), index-aligned with
+        # Sources as of this execute() call -- session-only, same
+        # convention as MirrorFP's own _LastWeldOK.
+        obj._LastWeldOK = welds
+        if bool(obj.WeldSeam) and not all(welds):
+            FreeCAD.Console.PrintWarning(
+                "Railform MirrorGroup: %d/%d source(s) welded -- the rest "
+                "fell back to an unwelded compound (boundary may not touch "
+                "the mirror plane).\n" % (sum(welds), len(welds)))
+        groups.apply_input_visibility(obj, ["Sources"])
 
 
 # --------------------------------------------------------------------------- #
@@ -927,7 +1138,8 @@ _FP = {"Loft": LoftFP, "Gordon": GordonFP, "Coons": CoonsFP,
        "InterpCurve": InterpCurveFP, "ControlCurve": ControlCurveFP,
        "ApproxCurve": ApproxCurveFP, "Polyline": PolylineFP,
        "BezierCurve": BezierCurveFP, "PolylineFillet": PolylineFilletFP,
-       "JoinCurve": JoinCurveFP}
+       "JoinCurve": JoinCurveFP, "Mirror": MirrorFP,
+       "MirrorGroup": MirrorGroupFP}
 _LABEL = {"Loft": "RailformLoft", "Gordon": "RailformGordon",
           "Coons": "RailformCoons", "Sweep": "RailformSweep",
           "ExtendSurf": "RailformExtendSurf",
@@ -939,7 +1151,8 @@ _LABEL = {"Loft": "RailformLoft", "Gordon": "RailformGordon",
           "ApproxCurve": "RailformApproxCurve", "Polyline": "RailformPolyline",
           "BezierCurve": "RailformBezierCurve",
           "PolylineFillet": "RailformPolylineFillet",
-          "JoinCurve": "RailformJoinCurve"}
+          "JoinCurve": "RailformJoinCurve", "Mirror": "RailformMirror",
+          "MirrorGroup": "RailformMirrorGroup"}
 
 # which link-list properties each kind exposes (panel reads this)
 GROUPS = {
@@ -964,6 +1177,8 @@ GROUPS = {
     "BezierCurve": [("Points", "Points", "Control points"),
                     ("LeftHandles", "Left Handles", "Left control handles"),
                     ("RightHandles", "Right Handles", "Right control handles")],
+    "MirrorGroup": [("Sources", "Sources",
+                     "Curves, surfaces, or solids to mirror (>= 1)")],
 }
 LIMITS = {"Loft":   {"Profiles": (2, None), "GuideRails": (0, None)},
           "Gordon": {},
@@ -977,7 +1192,18 @@ LIMITS = {"Loft":   {"Profiles": (2, None), "GuideRails": (0, None)},
           "ControlCurve": {"Points": (2, None), "Weights": (0, None)},
           "ApproxCurve": {"Points": (2, None)},
           "Polyline": {"Points": (2, None)},
-          "BezierCurve": {"Points": (2, None)}}
+          "BezierCurve": {"Points": (2, None)},
+          "MirrorGroup": {"Sources": (1, None)}}
+
+
+def _style_curve_vobj(vobj):
+    """Thicker blue wire on new curve objects -- the SolidWorks sketch
+    wire look, so fresh curves don't render as hairlines."""
+    try:
+        vobj.LineColor = (0.20, 0.45, 1.00)
+        vobj.LineWidth = 3.0
+    except Exception:
+        pass
 
 
 def make_surface(kind, doc=None):
@@ -995,6 +1221,7 @@ def make_curve(kind, doc=None):
     obj = doc.addObject("Part::FeaturePython", _LABEL[kind])
     _FP[kind](obj)
     if obj.ViewObject is not None:
+        _style_curve_vobj(obj.ViewObject)
         # Attach the ViewProvider proxy (CurveVP) so double-clicking the
         # curve enters point-edit mode via setEdit(). Do NOT instantiate a
         # PointEditor here: PointEditor is the interactive editor, not a
@@ -1017,6 +1244,7 @@ def make_polyline_fillet(source, doc=None):
     if source is not None:
         obj.Source = source
     if obj.ViewObject is not None:
+        _style_curve_vobj(obj.ViewObject)
         CurveVP(obj.ViewObject)
     groups.add_to_group(obj, "Curves")
     return obj
@@ -1031,6 +1259,7 @@ def make_join_curve(sources, doc=None):
     if sources:
         obj.Sources = list(sources)
     if obj.ViewObject is not None:
+        _style_curve_vobj(obj.ViewObject)
         CurveVP(obj.ViewObject)
     groups.add_to_group(obj, "Curves")
     return obj

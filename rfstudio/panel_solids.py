@@ -30,7 +30,8 @@ except Exception:                     # older shim: widgets live in QtGui
     QtWidgets = QtGui
 
 from rfstudio import parametric
-from rfstudio.panel_base import _EditPanelBase, _selected_objects
+from rfstudio.panel_base import _EditPanelBase, _selected_objects, \
+    drop_callbacks
 from rfstudio import gizmo
 
 
@@ -604,6 +605,14 @@ class MirrorPanel(_EditPanelBase):
                 self._src_lbl.setText("Source: " + self._src_name())
         self.recompute()
 
+    def _extra_teardown(self):
+        # If the dialog is closed (accept OR reject) while "Pick from
+        # model" is still waiting for a click, _stop_pick_mode() removes
+        # the SoMouseButtonEvent callback -- otherwise it keeps firing
+        # against this closed panel/its obj on every later 3D-view click.
+        if getattr(self, '_pick_mode', False):
+            self._stop_pick_mode()
+
     def _src_name(self):
         o = getattr(self.obj, "Source", None)
         return o.Label if o else "(none)"
@@ -659,12 +668,14 @@ class MirrorPanel(_EditPanelBase):
     def _stop_pick_mode(self):
         """Stop face picking mode."""
         self._pick_mode = False
-        if self._pick_cb:
+        if getattr(self, "_pick_cb", None) is not None:
             try:
                 doc = FreeCADGui.ActiveDocument
                 view = doc.ActiveView if doc is not None else None
-                if view:
-                    view.removeEventCallback("SoMouseButtonEvent", self._pick_cb)
+                if view is not None:
+                    drop_callbacks(view, (
+                        ("SoMouseButtonEvent", self, "_pick_cb"),
+                    ))
             except Exception:
                 pass
             self._pick_cb = None

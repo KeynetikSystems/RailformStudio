@@ -10,7 +10,349 @@ fresh `Unreleased` section above it.
 
 ## Unreleased
 
+### Added
+ - GUI smoke harness hardened into a real regression net
+   (`rfstudio/test_gui_imports.py`, <1s, zero FreeCAD dependency,
+   `python rfstudio/test_gui_imports.py` from anywhere): six checks --
+   (1) mocked import of all 25 rfstudio modules (repo-root path
+   auto-fixed -- previously every import failed with `No module named
+   'rfstudio'`; `panel_sketch3d`/`panel_nurbspull`/`compat` coverage
+   added), (2) undefined `self.<method>()` calls, (3) scope-aware
+   bare-undefined names (lambda args, closures, try/except-bound
+   imports, module dunders -- the old checker had 829 false
+   positives), (4) `rfstudio.<mod>.<attr>` cross-module references
+   resolve (catches the KnotEditor class of silent rename/delete
+   regressions), (5) no Qt class bases in lazily-loaded modules (the
+   workbench-load crash class), (6) addEventCallback
+   add/remove/null symmetry per class. Checks 3-6 are mutation-tested
+   by `test_gui_checks_selftest.py` (planted-bug self-test).
+ - `panel_base.drop_callbacks(view, specs)`: single defensive
+   `removeEventCallback` path -- per-callback try/except (one failure
+   no longer skips every later removal or the scene cleanup after
+   it), IDs always nulled in `finally` (a double teardown can no
+   longer hand a stale numeric id -- which FreeCAD reuses -- back to
+   the view), idempotent, missing attributes tolerated. All 15 raw
+   call sites in `editmode`/`panel_curve`/`panel_sketch3d`/
+   `panel_surface`/`panel_solids` route through it; statically
+   enforced by harness check #6.
+ - `panel_base._status_label()` + `_STATUS_STYLE`/`_ERROR_STYLE`: one
+   source for the grey/red status line previously inlined ~20 times
+   across panel builds with drifting padding (adopted in
+   `PolylineFilletPanel`; other panels can migrate incrementally).
+ - 3D-sketch status line now carries the solver verdict (issues.md #8
+   slice): `panel_logic.solver_status_text` translates the existing
+   (previously unread) `solve_point_constraints` status dict into
+   "well-defined: fully constrained (N DOF)" / "under-defined: X of Y
+   coordinate DOF still free" / "over-defined: constraints conflict
+   (residual ...) -- remove or relax one", appended by
+   `Sketch3DPanel._solver_diag` whenever dims exist (no dims = zero
+   cost; failure degrades to no suffix). Headless:
+   `test_solver_status_text`.
+ - IN-PLACE polyline fillet (SolidWorks-sketch behavior): running
+   *Fillet polyline* with a polyline selected now records the fillet
+   ON that polyline instead of creating a second, linked curve object.
+   `PolylineFP` gained a `Fillets` record (per-corner radii,
+   index-aligned with `Points`) + `FilletClosed`; `Points` keep the
+   sharp corners and `execute()`/`compute()` rebuild the tangent arcs
+   from the record on every recompute (including live point-drag
+   preview). The corner-handle editor (`CornerFilletEditor`) and
+   `PolylineFilletPanel` have in-place modes that read/write the
+   record; the panel adds *Clear all*. The legacy derived
+   `PolylineFillet` object is still fully supported: created when
+   nothing is selected, and edited in place when one is selected.
+   Headless: `test_polyline_fillet_record_in_place`.
+ - Exact G2 surface matching (`core.match_surface_exact_g2`): copies
+   the first three control rows across knot-compatible boundaries
+   (shared prep pipeline `_exact_match_prep`: side detection, trim
+   guard, BSpline conversion, along- AND cross-knot harmonization,
+   degree elevation), giving G0/G1/G2 by construction -- proven to
+   12 digits on curved geometry (cylinder-vs-plane seam:
+   max_g2=2.54e-12). `match_surface_to_references` tries it first for
+   G2 requests (report method `exact_g2`, surfaced in the Match panel
+   diagnostics); `MatchSurfaceFP.execute` was fixed to route through
+   it (it previously passed a LIST as the target face and always
+   errored) with persistent MatchMethod/MatchGrade string properties.
+   Five headless tests (identical, curved, reject, method, FP).
+ - Fixed two real bugs the G2 work exposed: (1) `_nearest_facing_sides`
+   paired transverse edges on midpoint luck, folding seams --
+   pairing is now direction-aware (parallel preferred, distance
+   fallback preserved); (2) QA's G2 finite differences stepped
+   outside the parameter domain AND carried O(J*eps) jerk-truncation
+   error that swamped genuine G2 seams -- `surface_deviation` now
+   uses analytic `getDN` first (inward FD fallback); (3)
+   `groups.apply_input_visibility` crashed on single-Link properties
+   (`'Part.Feature' object is not iterable`), which had silently
+   broken every Match execute.
+ - Hardened the per-move snap sweep further (`Access violation`
+   persisted after degenerate-edge filtering): the stand-in ray/axis
+   segment fed to OCCT is now bounded by the candidates' bbox
+   (`_bounded_ray_half_len`: eye-to-box + span, e.g. 61 units for a
+   small model) instead of a fixed 2e7-unit edge, which forced
+   BRepExtrema over an enormous parameter range; plus normalized
+   two `SoLineSet.numVertices.setValues(0, [...])` calls to the
+   proven 3-arg form (headless `test_snaputil_ray_span_is_bbox_bounded`).
+ - Fixed repeating `Access violation` while drawing with Snap on:
+   every mousemove ran OCCT `distToShape` against every document
+   edge with no validity filtering, and BRepExtrema segfaults
+   (instead of raising -- uncatchable by try/except) on degenerate
+   input such as null shapes or zero-length edges. New
+   `snaputil._valid_dist_shape` rejects those up front; applied at
+   collection time in `collect_snap_shapes` plus defensively in all
+   three `distToShape` loops and the intersection-pair scan
+   (headless `test_snaputil_skips_degenerate_edges`). The panel
+   also recomputes the OCCT snap only after the cursor moves > 2 px
+   instead of on every mousemove event.
+ - Hardened `RFS_Sketch3D` against repeated `Access violation`
+   crashes while drawing: all Coin3D scene-graph removals now go
+   through `_safe_remove_child` (membership-checked via `findChild`
+   -- a blind `removeChild` on a detached node faults inside Coin
+   instead of raising, surfacing as `Access violation` rather than a
+   catchable exception); the snap marker overlay now rebuilds only
+   when the snap point actually moves instead of on every mousemove;
+   the triad pick logic was factored from three duplicated
+   `SoRayPickAction` copies into one `_pick_triad` helper with null
+   guards, and placement clicks landing on the triad now go to the
+   gizmo instead of also dropping a point.
+ - Fixed `RFS_Sketch3D` plane-triad crash on panel open
+   (`SoMFInt32_setValue expected at most 2 arguments, got 3`):
+   `SoLineSet.numVertices.setValue(0, 2)` is not a valid pivy
+   overload -- replaced with `setValues(0, 1, [2])`, matching every
+   other `numVertices` call in the file. Also deleted a ~105-line
+   dead duplicate of the triad methods (`_setup_plane_triad` /
+   `_make_triad_axis` / `_make_triad_center` / `_remove_plane_triad`)
+   that was shadowed by the newer copies; the live versions are the
+   ones with node names and event-callback cleanup.
+ - Tier 3 ecosystem in `RFS_Sketch3D`: sketch templates (Save/Load
+   template buttons serialize points, constraints, segment types,
+   bulges, and variables to a JSON file via file dialog; load
+   rebuilds the sketch under a single undo step), break-apart
+   (one Part::Feature per detected closed loop) and merge-selected
+   (append selected wires' edge endpoints as Line rows, undoable),
+   plus a section-view toggle (Coin3D clipping plane aligned to the
+   construction plane, cleaned up on accept/reject).
+ - Fixed `RFS_Sketch3D` panel-open crash (`AttributeError:
+   _plane_grid_root` / `_drawing`, repeated ~21x in the Report view):
+   combo population emits signals during `__init__`, but the state
+   attributes lived halfway down the constructor. All panel state now
+   initializes first, and `_update_status` / `_on_plane_changed` /
+   `_table_changed` return early until the panel is fully built
+   (`_ready` flag).
+ - Tier 1 interaction polish in `RFS_Sketch3D`: snapshot-based
+   undo (Ctrl+Z / Undo button covers points, constraints, solves,
+   drags, variables), constraint badges (3D crosses at every
+   constraint anchor in the dim overlay), hover readout (status line
+   shows the live tooltip when the cursor nears a badge), Enter
+   loads the hovered constraint into the editors, and list-item
+   tooltips stay live across edits (`constraint_anchor`,
+   `constraint_glyph`, `constraint_tooltip` in `panel_logic`,
+   covered by new headless tests).
+ - Tier 2 power features in `RFS_Sketch3D`: mirror about XY/YZ/ZX
+   via a new `mirror` solver constraint (LM + relaxation, headless
+   `test_solve_point_constraints_mirror`) with Mirror-now plus Live
+   auto-pairing and drag-partner sync; corner chamfer
+   (`core.wire_corner_chamfer`, constant or per-corner setback,
+   headless test) beside the fillet checkbox; Bezier segment type
+   with per-span bulge tension in `core.sketch3d_wire` (headless
+   test); driving-dimension `=expressions` with named variables
+   (safe AST evaluator, persisted on the Sketch3D object and
+   re-resolved on every recompute, headless tests); project-selected-edges
+   onto the construction plane; and Use-as-Loft-profile/rail handoff
+   buttons that accept the sketch and open Loft prefilled.
+ - Live drag-to-edit points plus keyboard shortcuts in `RFS_Sketch3D`:
+   a "Drag points" toggle grabs any sketch point in the 3D view and
+   moves it on the construction plane (snap-aware, axis-lock aware)
+   with the X/Y/Z spinboxes updating live and the dimension preview
+   rebuilding during the drag. Viewport shortcuts: X/Y/Z toggles the
+   axis lock, Tab cycles the plane family (Camera/XY/YZ/ZX/Auto), Esc
+   drops the active drag. Pure helpers (`apply_axis_lock`,
+   `cycle_plane`) live in `panel_logic`, covered by
+   `test_apply_axis_lock` / `test_cycle_plane`.
+ - `RFS_Sketch3D`: true 3D sketch authoring. New
+   `rfstudio/panel_sketch3d.py` task panel -- click points onto an
+   offset construction plane parallel to the camera, snap to arbitrary
+   existing 3D geometry (reuses snaputil), or type X/Y/Z directly
+   per point, then bake to any supported parametric curve kind via
+   `parametric.make_curve`. Pure decision logic (construction_plane /
+   ray_plane_intersect / sketch3d_readiness / points_are_planar)
+   extracted to `rfstudio/panel_logic.py` and covered headlessly by
+   `test_panel_logic.py`; end-to-end geometry covered by
+   `test_sketch3d_interp_curve_through_nonplanar_points` in
+   `test_core.py`. Inspired by the limitation that the existing
+   draw tools place points on the view plane only (always planar).
+ - Dimension-driven sketch: the 3D sketch panel now has a
+   `Dim P_i -> P_j = d` constraint list; "Solve dims" runs the
+   points through `core.solve_point_constraints` (damped LM), so a
+   typed length actually moves the movable points — the SW
+   "dimensions drive the sketch" workflow. Headless test:
+   `test_sketch3d_dim_solve_drives_points`.
+ - Mixed drafting entities in one sketch: per-segment entity tags
+   (Spline / Line / Arc, AutoCAD-bulge arcs) on each point row;
+   accept emits either the classic single parametric curve (all-Spline)
+   or a new parametric `Sketch3DWireFP` object rebuilt from
+   `core.sketch3d_wire`. Headless test:
+   `test_sketch3d_wire_mixed_entities`.
+ - **Tangent / concentric / symmetric constraints** added to
+   core.solve_point_constraints (both damped LM and relaxation
+   fallback) and exposed as panel constraint rows. Headless tests:
+   test_solve_point_constraints_tangent/concentric/symmetric.
+ - **Wire corner fillet**: `core.wire_corner_fillet` rounds every interior
+   corner of a general Wire (Line, Arc, BSpline, Ellipse, etc.) by
+   inserting tangent circular arcs. Supports constant radius or a
+   per-corner dict for Illustrator-style live-corner radii. Integrated
+   into the RFS_Sketch3D panel with a "Fillet corners" checkbox and
+   radius spinbox (enabled for closed loops). Headless tests:
+   test_wire_corner_fillet_open_polyline / closed_polyline /
+   per_corner_dict / mixed_wire.
+ - **Ellipse / Rectangle segment types** added to the 3D sketch
+   panel. The `sketch3d_wire` core function now supports "Ellipse"
+   (half-ellipse with bulge = minor/major ratio, sign chooses side)
+   and "Rectangle" (right-angled corner, bulge = turn direction).
+   These integrate with the existing mixed-entity wire and parametric
+   Sketch3D object. Headless test: test_sketch3d_wire_ellipse_rectangle.
+   now create the object's view provider with a SolidWorks-style wire
+   display: blue line color (0.2, 0.45, 1.0) and 3 px width, instead
+   of the default gray hairline.
+  - **On-canvas constraint creation**: new "Add Constraint" mode in the
+     3D Sketch panel -- click two points in the 3D view to create a
+     distance/coincide/horizontal/vertical constraint with a live
+     preview line and drag-to-set-value; the constraint is added to
+     the list and solved on "Solve dims". Constraint list items now
+     highlight their points in the viewport when clicked.
+  - **Drag-to-fillet**: when a closed loop exists, hovering near a
+     corner shows a fillet handle; drag to set the radius live (like
+     Illustrator/SW corner widget). Creates/updates a fillet constraint
+     in the list.
+  - `RFS_Sketch3D` follow-up: visible construction-plane grid in the
+   3D view (two-tier, world-space lines through the plane's parametric
+   basis) plus a Plane combo (Camera / XY / YZ / ZX) that switches the
+   point-placement plane family on the fly -- closer to SolidWorks'
+   3D-sketch plane flipping. `plane_normal_for` / `plane_basis`
+   extracted to `panel_logic` and covered in `test_panel_logic.py`.
+ - Native fallback providers for the last three
+   single-point-of-failure actions:
+   - `RFS_Analysis` → `engines.native_analysis`
+     (core.surface_review_summary + review_recommendation, printed to
+     the Report view), Curves delegation kept as fallback.
+   - `RFS_ControlPoly4` → `engines.native_control_poly4`
+     (core.control_poly_curve, degree-3 from 4 points), Silk's
+     ControlPoly4 kept as fallback.
+   - `RFS_StarPatch` → degraded native last resort
+     `engines.native_star_patch` (core.n_sided_patch, exact G0/G1
+     only) behind Silk's true-G2 ControlGridNStar66 in the chain.
+   Every curated action now has a native provider in its chain
+   (`deps.report_single_points_of_failure` reports `[]`).
+ - `engines.validate_providers()`: static, headlessly-runnable wiring
+   check of every provider chain (known provider kind, native names
+   resolve on the module, engine mod is a known mod, every DELEGATIONS
+   entry has a chain). Wired into workbench.Initialize and covered by
+   `test_engines_validate_providers_healthy` /
+   `test_engines_validate_providers_catches_typos`.
+ - `native_analysis` face-selection helper `_selected_faces()`.
+ - New core tests: n_sided_patch square smoke test, 4-point degree-3
+   control_poly_curve, last-three native fallback chain assertions.
+ - `issues.md` populated with the six tracked limitations (trim guard,
+   GUI coverage, star-patch G2, native field-testing, mirror welding,
+   early-GUI verification skip).
+ - Associative projection / convert-entities (issues.md #14, 3 of 4
+   bullets): "Project selected edges" now records a per-point source
+   reference instead of a dumb coordinate copy. `Sketch3DFP` gained
+   `ProjectedRefs` (index-aligned with Points: `edge|obj|EdgeN|frac|
+   mode|dir` / `slice|...`), `ExternalSources` (link deps so a moved
+   source touches the sketch), and `PlaneOrigin`/`PlaneNormal`
+   (execute() has no access to the panel's live construction plane);
+   `execute()` re-projects every referenced point from CURRENT source
+   geometry and pins those points in the solve (source drives them,
+   like an on-curve constraint -- a distance dim between a projected
+   and a free point moves only the free one); missing/deleted sources
+   degrade to free points. New "Along plane normal / Along view
+   direction" combo (captured direction stored per ref, so rebuilds
+   stay deterministic) via `panel_logic.project_point_along`; new
+   "Slice by sketch plane" button cuts selected solids with the
+   construction plane as associative `slice` refs (re-cut on
+   recompute). Panel keeps refs 1:1 with rows across add/remove/
+   mirror/undo/template/merge, and the accept() gate now routes
+   projected-only sketches through `Sketch3DFP`. Headless:
+   `test_project_point_along`, `test_proj_ref_roundtrip`,
+   `test_sketch3d_assoc_projection_follows_source`,
+   `test_sketch3d_slice_projection_follows_source`. Silhouette
+   projection still open (deferred, see issues.md #14).
+
+### Changed
+ - Fillet panel dual-model clarity: the legacy (nothing-selected)
+   flow now states up front that it creates a LINKED `PolylineFillet`
+   object and how to get in-place filleting instead (select the
+   polyline BEFORE running the tool); the no-source status line gives
+   the exact next action ("select one in the 3D view, then press
+   'Set source from selection'") instead of "Pick a polyline to
+   round.".
+ - `engines.run_engine_command` now catches exceptions raised while an
+   engine command runs and returns False, so ProviderCommand falls
+   through to the next provider instead of propagating a traceback.
+ - `commands.py` delegate tooltips reflect the new fallback reality
+   (native-first / native-last-resort per action).
+ - `issues.md` / `package.xml` version bump to 0.1.0.
+
 ### Fixed
+- `Sketch3DPanel` dim-preview row was stranded inside
+  `_remove_constraint_highlight()` -- built against an undefined `lay`
+  (NameError swallowed by that method's caller's `except Exception`),
+  so `dim_preview_btn` was never added to the panel, `_ready` never
+  became True (the status line never updated after build), dim-list
+  clicks died before drawing their highlight, and every other
+  `dim_preview_btn` use raised AttributeError. The block (`dim_preview
+  btn` + `_ready = True` + `_update_status()`) is back at the end of
+  `__init__` where it belongs. Caught by the GUI harness's bare-name
+  check -- the only check in the suite that saw it.
+- Harness itself: `_BUILTIN_NAMES = set(dir(__builtins__))` silently
+  became *dict* methods when `test_gui_imports` was imported instead of
+  run (2066 false positives) -- now `dir(builtins)`; dead duplicate
+  helper copies (three functions defined twice) removed.
+  `panel_logic.points_form_closed_loop` was defined twice with
+  identical bodies (second shadowed first) -- one copy removed.
+- Workbench load failure (`name 'QtWidgets' is not defined`): the
+  shared `_CollapsibleGroup`/`_ShortcutHintBar` helpers were classes
+  subclassing `QtWidgets.*` at import time, but `panel_base.py` loads
+  Qt lazily. They are now factory functions (same call API:
+  `_CollapsibleGroup("Advanced")`, `.content_layout`,
+  `.set_shortcuts`), so plain `import panel_base` works headless and
+  at startup again.
+- `rfstudio.editmode.KnotEditor` restored: a scripted edit deleted the
+  `class KnotEditor(object):` header line, silently folding the whole
+  class body (35 methods) into `PointEditor` as stray methods. The
+  module still imported and `PointEditor` worked, but the curve
+  panel's "Edit knots" path raised
+  `module 'rfstudio.editmode' has no attribute 'KnotEditor'` roughly
+  19 times per session from `panel_curve.py`. Verified after the
+  one-line restore: all four editor classes present, no within-class
+  method shadowing introduced by the fold-in, `panel_curve` imports
+  clean headless.
+- `panel_sketch3d._remove_plane_triad`: stale event-callback IDs are
+  now nulled after removal (and on the early-return path), so a failed
+  triad setup can no longer leave dangling `addEventCallback`
+  registrations behind on the view.
+- The inert `match_surface_exact_g1` trim guard (issues.md #1):
+  `_exact_match_prep` (shared by exact_g1/_g2) now checks
+  matched-edge compatibility (`_matched_edges_compatible` in
+  `rfstudio/core/util.py`): the two boundary edges must coincide
+  geometrically (length within 1%, endpoints coincident), else it
+  refuses with ValueError and falls back to sampled, trim-aware
+  matching. Row-copying is only valid when the two edges are the same
+  curve, regardless of trim history -- this catches the trim case
+  (lengths 10 vs 6) that parameter-range checks cannot see, since
+  `trim_face` keeps the original surface object. `_side_is_trimmed`
+  was also fixed to compare against the surface's natural bounds
+  (BSpline knots, analytic extents) instead of the possibly
+  reparameterized face range, and a broken world-axis extent check
+  that false-positived on non-XY-planar faces was removed.
+- Mirror-module headless tests re-aligned with the current
+  `(base, normal)` plane API and `(shape, welded)` return contract of
+  `rfstudio.mirror` — `test_plane_base_normal`, `test_mirror_point`,
+  `test_find_symmetric_pairs`, `test_mirror_shape` all pass again.
+- `test_match_surface_exact_g1_rejects_trimmed_boundary`: was asserting
+  a refusal the old parameter-range guard could never trigger. Since
+  the matched-edge compatibility check landed (above), the guard is no
+  longer inert, and the test now asserts the real `ValueError` again
+  (lengths 10 vs 6).
 - `core._chain_loop` (Coons patch): fixed a `Part.Wire`/`Part.Edge` type
   mismatch that made every `RFS_Fill`-style Coons patch call raise
   `AttributeError: 'Part.Wire' object has no attribute 'valueAt'`.

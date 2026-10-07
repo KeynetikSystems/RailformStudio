@@ -104,7 +104,15 @@ def apply_input_visibility(obj, link_props, show_attr="ShowInputs"):
     show = bool(getattr(obj, show_attr))
     links = []
     for prop in link_props:
-        links.extend(getattr(obj, prop, None) or [])
+        val = getattr(obj, prop, None) or []
+        # Single-link properties (App::PropertyLink, e.g. Match's
+        # Target) yield one object, not a list -- extend() on it raised
+        # "'Part.Feature' object is not iterable" and killed every
+        # Match execute after the shape was already built.
+        if isinstance(val, (list, tuple)):
+            links.extend(val)
+        elif val is not None:
+            links.append(val)
     set_inputs_visibility(links, show)
 
 

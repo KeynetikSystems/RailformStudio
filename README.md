@@ -41,16 +41,34 @@ inheriting their maintenance or forking their code.
 > FreeCADGui/PySide dependency); the rest -- widget layout, dialogs opening,
 > viewport overlays -- is GUI-tested by hand.
 
+**Provider chains:** every curated action in the "delegation" toolbar
+has an ordered provider chain (`engines.PROVIDERS`): a native
+implementation first where one exists, the original Curves/Silk command
+as fallback. `deps.report_single_points_of_failure` therefore reports
+an empty list — no curated action depends on a single engine any more.
+`engines.validate_providers()` statically checks every chain (typo'd
+native names, unknown provider kinds, DELEGATIONS/PROVIDERS drift) at
+workbench activation and in `test_core.py`.
+
 ## Verify headlessly
 ```powershell
 & "C:\Program Files\FreeCAD 1.1\bin\freecadcmd.exe" test_core.py
 & "C:\Program Files\FreeCAD 1.1\bin\freecadcmd.exe" test_panel_logic.py
+python rfstudio\test_gui_imports.py        # GUI static smoke (<1s, no FreeCAD)
+python test_gui_checks_selftest.py         # mutation-tests the harness itself
+python test_panel_base.py                  # panel scaffolding (mocked Qt)
 ```
-Expect `core tests done` / `panel_logic tests done` with no `FAIL` lines.
+Expect `core tests done` / `panel_logic tests done` with no `FAIL` lines,
+and `All checks passed (25 modules, ...)` from the GUI harness. The GUI
+harness fakes FreeCAD/Qt/Coin and statically checks the whole panel
+layer: mocked imports, undefined self-calls, bare undefined names,
+cross-module references, import-time Qt class bases, and event-callback
+add/remove/null symmetry — it has caught real shipped bugs (deleted
+class headers, a stranded widget block in the sketch panel).
 (`test_panel_logic.py` has no FreeCAD dependency at all -- `python
 test_panel_logic.py` also works.)
 
-## GUI smoke test (needs your eyes — can't be automated here)
+## GUI smoke test (what only real Qt/Coin can show)
 1. Restart FreeCAD → pick **Railform Studio** in the workbench dropdown.
 2. Report panel should say "Curves + Silk detected" (or warn what's missing).
 3. Toolbars appear: **Rails / Surface / Clean / Inspect / Exchange**.

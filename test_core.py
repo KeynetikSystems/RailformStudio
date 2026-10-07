@@ -485,6 +485,55 @@ def test_snaputil_axis_snap_stays_on_axis():
     out("  snaputil axis-snap OK  crossing=(3,0,0) on-axis; far target rejected")
 
 
+def test_snaputil_skips_degenerate_edges():
+    """Degenerate edges must never reach OCCT distToShape: BRepExtrema
+    segfaults on them instead of raising (uncatchable by try/except),
+    which crashed every cursor move ('Access violation') with Snap on
+    whenever such an edge existed anywhere in the document. The
+    collector drops them and every distToShape loop skips them, while
+    healthy edges keep snapping."""
+    from rfstudio import snaputil
+    good = Part.Edge(Part.LineSegment(Vector(0, 0, 0), Vector(10, 0, 0)))
+    assert snaputil._valid_dist_shape(good) is True
+    assert snaputil._valid_dist_shape(None) is False
+    assert snaputil._valid_dist_shape("not-a-shape") is False
+    try:
+        bad = Part.Edge(Part.LineSegment(Vector(1, 1, 1), Vector(1, 1, 1)))
+    except Exception:
+        bad = None   # OCCT refused to even build it -- also acceptable
+    shapes = [good] if bad is None else [good, bad]
+    if bad is not None:
+        assert snaputil._valid_dist_shape(bad) is False, "zero-length edge kept"
+    # Ray straight down through x=3 must still land on (3,0,0) with the
+    # degenerate entry present in the candidate list.
+    pt, d, _ = snaputil.nearest_point_on_shapes_to_ray(
+        Vector(3, 0, 50), Vector(0, 0, -1), shapes)
+    assert pt is not None and pt.distanceToPoint(Vector(3, 0, 0)) < 1e-6, pt
+    assert d < 1e-6, d
+    out("  snaputil degenerate OK  bad-skipped=%s snap=(3,0,0)"
+        % (bad is not None))
+
+
+def test_snaputil_ray_span_is_bbox_bounded():
+    """The stand-in ray segment must span the candidates' bbox as seen
+    from the ray origin -- not a fixed 2e7-unit edge, which forces
+    BRepExtrema over an enormous parameter range (slow, fragile, and a
+    segfault vector behind the 'Access violation while drawing'
+    crashes). Small model -> small span; snapping stays exact,
+    including from a far eye."""
+    from rfstudio import snaputil
+    edge = Part.Edge(Part.LineSegment(Vector(0, 0, 0), Vector(10, 0, 0)))
+    hl = snaputil._bounded_ray_half_len(Vector(3, 0, 50), [edge], 1e7)
+    assert hl < 1e7 and hl > 50.0, hl   # covers eye->model, not 2e7
+    assert snaputil._bounded_ray_half_len(Vector(0, 0, 0), [], 1e7) == 1e7
+    assert snaputil._bounded_ray_half_len(
+        Vector(0, 0, 0), [None, "junk"], 1e7) == 1e7
+    pt, d, _ = snaputil.nearest_point_on_shapes_to_ray(
+        Vector(3, 0, 1e6), Vector(0, 0, -1), [edge])
+    assert pt is not None and pt.distanceToPoint(Vector(3, 0, 0)) < 1e-3, pt
+    out("  snaputil ray-span  OK  half_len=%.1f far-eye snap=(3,0,0)" % hl)
+
+
 def test_on_curve_constraint_pulls_point_onto_edge():
     """The on_curve constraint must pull a free point onto a fixed target
     edge via the simultaneous solver (Feature: point-on-curve constraint)."""
@@ -811,6 +860,152 @@ def test_match_surface_exact_g1_identical_planes():
         % (report["max_g0"], report["max_g1_deg"]))
 
 
+def test_match_surface_exact_g2_identical_planes():
+    """Two identical planar faces must match with zero G0/G1/G2 deviation
+    -- the trivial correctness check for match_surface_exact_g2's
+    three-row control-net copy, mirroring the exact_g1 identical test
+    plus the curvature row the G1 path doesn't touch."""
+    ref = bspline_face(Part.Face(Part.makePlane(10, 10, Vector(-5, -5, 0))))
+    tgt = bspline_face(Part.Face(Part.makePlane(10, 10, Vector(-5, -5, 0))))
+    rebuilt = core.match_surface_exact_g2(ref, tgt)
+    assert rebuilt.Faces, "exact_g2 produced no faces"
+    report = core.surface_deviation(rebuilt.Faces[0], ref, samples=8)
+    assert report["max_g0"] < 1e-6, report["max_g0"]
+    assert report["max_g1_deg"] < 1e-6, report["max_g1_deg"]
+    assert report["max_g2"] < 1e-4, report["max_g2"]
+    assert core.classify_continuity(report) == "G2", report
+    out("  match_g2 identical  OK  max_g0=%.2e max_g1=%.2e max_g2=%.2e"
+        % (report["max_g0"], report["max_g1_deg"], report["max_g2"]))
+
+
+def test_nearest_facing_sides_prefers_parallel_edges():
+    """Boundary pairing must prefer a parallel edge pair over a
+    transverse one that happens to have nearer midpoints: stitching
+    across a corner folds the seam (exact G0 since the poles coincide,
+    garbage G1/G2). Fixture: a tangent plane against a partial-cylinder
+    ruling, where the plane's transverse bottom edge midpoint ties with
+    its parallel side edge against the ruling -- the pair must run
+    parallel. (A full 360-degree cylinder is deliberately NOT used: its
+    umin/umax rulings coincide in 3D, so side identity is ambiguous and
+    outward senses flip 0/180 between runs.)"""
+    from rfstudio.core.util import _nearest_facing_sides, _side_uv_trimmed
+    cyl = Part.makeCylinder(50, 20, Vector(0, 0, 0), Vector(0, 0, 1), 120)
+    ref_cyl = [f for f in cyl.Faces
+               if isinstance(f.Surface, Part.Cylinder)][0]
+    plane = Part.Face(Part.makePlane(
+        20, 20, Vector(50, -10, 0), Vector(1, 0, 0)))
+    sa, sb, _, _ = _nearest_facing_sides(ref_cyl, plane)
+
+    def _dir(face, side):
+        pr = face.ParameterRange
+        p0 = face.valueAt(*_side_uv_trimmed(face, pr, side, 0.4, {}))
+        p1 = face.valueAt(*_side_uv_trimmed(face, pr, side, 0.6, {}))
+        d = p1 - p0
+        assert d.Length > 1e-9
+        d.normalize()
+        return d
+
+    align = abs(_dir(ref_cyl, sa).dot(_dir(plane, sb)))
+    assert align >= 0.5, (sa, sb, align)
+    out("  facing sides      OK  sides=(%d,%d) align=%.3f" % (sa, sb, align))
+
+
+def test_match_surface_exact_g2_curved_reference():
+    """Load-bearing G2 test on CURVED geometry: planes have zero
+    curvature everywhere, so G2 holds trivially on plane-plane seams
+    and can't prove the third row works. A cylindrical reference
+    (real, nonzero curvature) against a tangent plane target forces
+    the copied third row to carry actual curvature -- after exact_g2
+    the seam must still grade G2 with near-zero max_g2.
+
+    The reference is pre-fitted (bspline_face, like every other
+    exact-match fixture): the matcher converts analytic input to
+    BSpline internally and matches THAT surface, so QA must measure
+    against the same surface the matcher saw -- grading against the
+    raw analytic cylinder would measure the conversion gap, not the
+    match (conversion fidelity has its own dedicated test). A partial
+    (120-degree) cylinder is used rather than a full one: a full
+    cylinder's umin/umax rulings coincide in 3D, making side identity
+    ambiguous (outward senses flip 0/180 between pairings). The plane
+    is positioned so its y=0 edge coincides with the theta=0 ruling --
+    an exact row copy is only valid when the two boundary edges are
+    the same seam (see _matched_edges_compatible); a plane whose edge
+    merely crosses the ruling is correctly refused."""
+    cyl = Part.makeCylinder(50, 20, Vector(0, 0, 0), Vector(0, 0, 1), 120)
+    laterals = [f for f in cyl.Faces
+                if isinstance(f.Surface, Part.Cylinder)]
+    assert laterals, "makeCylinder produced no lateral face"
+    ref = bspline_face(laterals[0])
+    tgt_plane = Part.Face(Part.makePlane(
+        20, 20, Vector(50, 0, 0), Vector(1, 0, 0)))
+    tgt = bspline_face(tgt_plane)
+    rebuilt = core.match_surface_exact_g2(ref, tgt)
+    assert rebuilt.Faces, "exact_g2 produced no faces"
+    report = core.surface_deviation(rebuilt.Faces[0], ref, samples=12)
+    assert core.classify_continuity(report) == "G2", report
+    out("  match_g2 curved     OK  max_g0=%.2e max_g1=%.3fdeg max_g2=%.2e"
+        % (report["max_g0"], report["max_g1_deg"], report["max_g2"]))
+
+
+def test_match_surface_exact_g2_incompatible_raises():
+    """Knot-incompatible boundaries must raise ValueError (fail loud so
+    match_surface_to_references falls back to sampled matching),
+    mirroring the exact_g1 rejection contract."""
+    ref = bspline_face(Part.Face(Part.makePlane(10, 10, Vector(-5, -5, 0))))
+    grid = [[Vector(x, y, (x - 1.5) * (y - 1.5) * 0.3)
+            for y in range(4)] for x in range(4)]
+    tgt = incompatible_bspline_face(grid)
+    try:
+        core.match_surface_exact_g2(ref, tgt)
+        raise AssertionError("expected ValueError for incompatible boundaries")
+    except ValueError as exc:
+        out("  match_g2 reject     OK  %r" % exc)
+
+
+def test_match_surface_to_references_reports_exact_g2():
+    """A G2 request over knot-compatible faces must take the new exact_g2
+    path (not exact_g1, not sampled) and say so in report["method"]."""
+    target = bspline_face(Part.Face(Part.makePlane(10, 10, Vector(-5, -5, 0))))
+    ref = bspline_face(Part.Face(Part.makePlane(10, 10, Vector(-5, -5, 0))))
+    _, report, _ = core.match_surface_to_references(
+        target, [ref], continuity="G2", n=12)
+    assert report["method"] == "exact_g2", report["method"]
+    assert core.classify_continuity(report) == "G2", report
+    out("  match_g2 method     OK  method=%s grade=G2" % report["method"])
+
+
+def test_match_surface_fp_execute_uses_references():
+    """MatchSurfaceFP.execute must route through
+    match_surface_to_references (multi-reference + exact paths), not
+    the previous single-face call that passed a LIST as tgt_face and
+    always errored out, leaving the object shapeless. Diagnostics land
+    in persistent MatchMethod/MatchGrade string properties (plain
+    runtime attributes do not stick on FeaturePython objects)."""
+    from rfstudio import parametric
+    doc = FreeCAD.newDocument("match_fp_test") if hasattr(FreeCAD, "newDocument") \
+        else None
+    if doc is None:
+        out("  match FP          SKIP (no document API available)")
+        return
+    try:
+        ref = doc.addObject("Part::Feature", "Ref")
+        ref.Shape = Part.makePlane(10, 10, Vector(-5, -5, 0))
+        tgt = doc.addObject("Part::Feature", "Tgt")
+        tgt.Shape = Part.makePlane(10, 10, Vector(-5, -5, 0))
+        m = parametric.make_surface("Match", doc=doc)
+        m.Reference = [ref]
+        m.Target = tgt
+        doc.recompute()
+        assert m.Shape is not None and not m.Shape.isNull() \
+            and m.Shape.Faces, "Match FP produced no shape"
+        assert getattr(m, "MatchMethod", None) == "exact_g2", \
+            getattr(m, "MatchMethod", None)
+        out("  match FP          OK  method=%s faces=%d"
+            % (m.MatchMethod, len(m.Shape.Faces)))
+    finally:
+        FreeCAD.closeDocument(doc.Name)
+
+
 def test_match_surface_exact_g1_incompatible_raises():
     """Two faces whose boundary knot vectors can't be harmonized (very
     different pole layouts) must raise ValueError -- callers rely on this
@@ -1002,10 +1197,16 @@ def test_match_surface_exact_g1_rejects_trimmed_boundary():
         Vector(5, 5, 0), Vector(5, -1, 0)])
     trimmed_b = core.trim_face(full_b, wire)
     try:
-        core.match_surface_exact_g1(ref, trimmed_b)
-        raise AssertionError(
-            "expected ValueError for a trimmed target boundary")
+        result = core.match_surface_exact_g1(ref, trimmed_b)
+        # CURRENT (documented) behaviour: core.trim_face reparameterizes
+        # the trimmed face's surface to the wire's own bounding extent,
+        # so the face looks geometrically identical to a fresh untrimmed
+        # After the _side_is_trimmed fix (using surface's natural bounds),
+        # trimmed faces should now be correctly rejected with ValueError.
+        # If this test fails, the _side_is_trimmed fix is not working.
+        raise AssertionError("Expected ValueError for trimmed face, but got none")
     except ValueError as exc:
+        # Correct behavior: exact_g1 refuses trimmed faces (trim-aware fallback)
         out("  match_g1 trim reject OK  %r" % exc)
 
 
@@ -1560,15 +1761,18 @@ def test_native_qa_providers_registered():
 
 def test_report_single_points_of_failure():
     """deps.report_single_points_of_failure must flag exactly the curated
-    actions whose provider chain has NO native entry -- e.g. RFS_StarPatch
-    (true G2 N-sided patching, explicitly not planned for a native
-    rewrite per engines.py's triage comment), while a native-covered
-    action like RFS_MultiLoft or RFS_Combs must NOT be flagged."""
+    actions whose provider chain has NO native entry. After the last
+    three gaps were closed (RFS_Analysis/RFS_ControlPoly4/RFS_StarPatch
+    got native providers), EVERY curated action must have a native
+    fallback -- flagged must be empty. If a future action regresses to
+    engine-only, this test fails and says which one."""
     from rfstudio import deps, engines
     flagged = deps.report_single_points_of_failure(engines.PROVIDERS)
-    assert "RFS_StarPatch" in flagged
+    assert "RFS_StarPatch" not in flagged
     assert "RFS_MultiLoft" not in flagged
     assert "RFS_Combs" not in flagged
+    assert flagged == [], (
+        "engine-only curated actions regressed: %s" % flagged)
     for cmd_id in flagged:
         chain = engines.PROVIDERS[cmd_id]
         assert not any(p[0] == "native" for p in chain), (cmd_id, chain)
@@ -1622,6 +1826,514 @@ def test_providers_cover_every_delegated_action():
                 m, t = rest
                 assert m and t
     out("  providers coverage OK  n=%d actions" % len(engines.DELEGATIONS))
+
+
+def test_engines_validate_providers_healthy():
+    """The new static wiring check must pass on the real PROVIDERS
+    table -- any typo'd native name or unknown provider kind fails it."""
+    from rfstudio import engines
+    problems = engines.validate_providers()
+    assert problems == [], problems
+    out("  validate_providers OK  problems=%d" % len(problems))
+
+
+def test_engines_validate_providers_catches_typos():
+    """validate_providers must actually fire on a broken chain -- a
+    validator that never reports is not a validator."""
+    from rfstudio import engines
+    bad = dict(engines.PROVIDERS)
+    bad["RFS_MultiLoft"] = [("native", "native_multiloft_TYPO")]
+    bad["RFS_Zebra"] = [("bogus", "x")]
+    problems = engines.validate_providers(bad)
+    assert any("TYPO" in p for p in problems), problems
+    assert any("unknown provider kind" in p for p in problems), problems
+    out("  validate_providers catches problems OK  n=%d" % len(problems))
+
+
+def test_last_three_actions_have_native_fallbacks():
+    """RFS_Analysis/RFS_ControlPoly4 get native-first chains (like the
+    QA tools); RFS_StarPatch gets engine-first with a degraded native
+    last resort -- either way, no action is engine-only any more."""
+    from rfstudio import engines
+    a = engines.PROVIDERS["RFS_Analysis"]
+    assert a[0] == ("native", "native_analysis"), a
+    assert any(p[0] == "engine" for p in a), a
+    c = engines.PROVIDERS["RFS_ControlPoly4"]
+    assert c[0] == ("native", "native_control_poly4"), c
+    assert any(p[0] == "engine" for p in c), c
+    s = engines.PROVIDERS["RFS_StarPatch"]
+    assert s[0][0] == "engine", s   # Silk's true G2 wins when present
+    assert ("native", "native_star_patch") in s, s
+    for fn in ("native_analysis", "native_control_poly4",
+               "native_star_patch"):
+        assert hasattr(engines, fn), fn
+    out("  last-three native fallbacks OK")
+
+
+def test_n_sided_patch_square_smoke():
+    """The native star-patch fallback's geometry must produce a usable
+    shape on a trivial square loop (>= 3 sides, any N)."""
+    import Part
+    from FreeCAD import Vector as V
+    pts = [V(0, 0, 0), V(10, 0, 0), V(10, 10, 0), V(0, 10, 0)]
+    edges = [Part.makeLine(pts[i], pts[(i + 1) % 4]) for i in range(4)]
+    patch = core.n_sided_patch(edges)
+    assert patch is not None
+    assert patch.Faces, "n_sided_patch returned no faces"
+    out("  n_sided_patch OK  faces=%d" % len(patch.Faces))
+
+
+def test_control_poly_curve_4pt_degree3():
+    """The native ControlPoly4 provider's geometry: 4 control points
+    must yield a single degree-3 clamped B-spline edge."""
+    pts = [Vector(0, 0, 0), Vector(3, 4, 0), Vector(7, 4, 0),
+           Vector(10, 0, 0)]
+    edge = core.control_poly_curve(pts, degree=3)
+    assert len(edge.Edges) == 1
+    assert edge.Edges[0].Curve.Degree == 3
+    out("  control_poly_curve(4pt) OK  deg=%d"
+        % edge.Edges[0].Curve.Degree)
+
+
+def test_sketch3d_interp_curve_through_nonplanar_points():
+    """The RFS_Sketch3D pipeline end-to-end at the geometry layer:
+    make_curve + Points + recompute must build an interpolating curve
+    through a genuinely non-planar 4-point set (points_are_planar
+    False), i.e. the curve exists and passes through its first and
+    last point."""
+    from rfstudio import panel_logic, parametric
+    pts = [Vector(0, 0, 0), Vector(10, 0, 5), Vector(20, 10, 0),
+           Vector(30, 10, 8)]
+    assert not panel_logic.points_are_planar(
+        [(p.x, p.y, p.z) for p in pts])
+    doc = FreeCAD.newDocument()
+    obj = parametric.make_curve("InterpCurve", doc=doc)
+    obj.Points = pts
+    doc.recompute()
+    assert obj.Shape is not None and obj.Shape.Edges, "no shape built"
+    edge = obj.Shape.Edges[0]
+    p0 = edge.valueAt(edge.FirstParameter)
+    p1 = edge.valueAt(edge.LastParameter)
+    assert p0.distanceToPoint(pts[0]) < 1e-6, p0
+    assert p1.distanceToPoint(pts[-1]) < 1e-6, p1
+    out("  sketch3d interp   OK  len=%.2f non-planar pts=%d"
+        % (edge.Length, len(pts)))
+
+
+def test_polyline_fillet_record_in_place():
+    """SolidWorks-sketch-style IN-PLACE fillet: the fillet is a RECORD
+    on the polyline (`Fillets`, index-aligned with Points) -- not a
+    second linked curve object. Points keep the SHARP corners, the
+    rounded shape is rebuilt from the record on every recompute (i.e.
+    the 'constraint record' survives recompute), and clearing the record
+    restores the plain polyline."""
+    from rfstudio import parametric
+    doc = FreeCAD.newDocument()
+    obj = parametric.make_curve("Polyline", doc=doc)
+    pts = [Vector(0, 0, 0), Vector(10, 0, 0), Vector(10, 10, 0),
+           Vector(20, 10, 0)]
+    obj.Points = pts
+    doc.recompute()
+    n_plain = len(obj.Shape.Edges)
+    assert n_plain == 1, "plain polyline should be a single edge, got %d" % n_plain
+    # record a fillet at corner 1 only
+    obj.Fillets = [0.0, 4.0, 0.0, 0.0]
+    doc.recompute()
+    n_rounded = len(obj.Shape.Edges)
+    assert n_rounded > n_plain, "fillet record produced no extra edges"
+    # the RECORD changed, not the geometry: Points stay sharp
+    for i, p in enumerate(pts):
+        assert obj.Points[i].distanceToPoint(p) < 1e-9, \
+            "Points were modified by the fillet record (i=%d)" % i
+    # ... and the fillet survives an unrelated recompute
+    obj.ShowInputs = True
+    doc.recompute()
+    assert len(obj.Shape.Edges) == n_rounded, "fillet lost on recompute"
+    # closed record rounds the wrap corner too (>= edges than open)
+    obj.Fillets = [3.0] * len(pts)
+    obj.FilletClosed = True
+    doc.recompute()
+    n_closed = len(obj.Shape.Edges)
+    assert n_closed >= n_rounded, (n_rounded, n_closed)
+    # clearing the record restores the plain single-edge polyline
+    obj.Fillets = [0.0] * len(pts)
+    obj.FilletClosed = False
+    doc.recompute()
+    n_cleared = len(obj.Shape.Edges)
+    assert n_cleared == n_plain, "clearing record did not restore: %d" % n_cleared
+    FreeCAD.closeDocument(doc.Name)
+    out("  inplace fillet    OK  plain=%d rounded=%d closed=%d cleared=%d"
+        % (n_plain, n_rounded, n_closed, n_cleared))
+
+
+def test_sketch3d_wire_mixed_entities():
+    """Mixed-entity sketch: Line/Arc/Spline/Line in one Wire, with a
+    nonzero arc bulge producing a genuine circular arc edge."""
+    pts = [Vector(0, 0, 0), Vector(10, 0, 0), Vector(20, 10, 0),
+           Vector(30, 10, 5), Vector(40, 0, 5)]
+    wire = core.sketch3d_wire(pts, ["Line", "Arc", "Spline", "Line"],
+                              [0.0, 0.5, 0.0, 0.0])
+    import Part
+    types = [type(e.Curve).__name__ for e in wire.Edges]
+    assert types[0] == "Line", types
+    assert types[1] == "Circle", types        # the arc
+    assert types[2] == "BSplineCurve", types  # the spline run
+    assert types[3] == "Line", types
+    assert isinstance(wire.Edges[1].Curve, Part.Circle)
+    chord = (pts[2] - pts[1]).Length
+    assert wire.Edges[1].Length > chord, "bulge=0.5 arc should be longer than its chord"
+    bad = [(0, 0, 0, 1)]
+    try:
+        core.sketch3d_wire(pts, ["Line", "Arc", "Spline", "Bogus"])
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+    out("  sketch3d_wire   OK  edges=%d types=%s" % (len(wire.Edges), types))
+
+
+def test_sketch3d_wire_ellipse_rectangle():
+    """Ellipse and Rectangle segment types must produce valid edges."""
+    import Part
+    # Ellipse: 3 points, 2 segments (Line + Ellipse)
+    pts = [Vector(0, 0, 0), Vector(10, 0, 0), Vector(20, 0, 0)]
+    wire = core.sketch3d_wire(pts, ["Line", "Ellipse"], [0.0, 0.5])
+    types = [type(e.Curve).__name__ for e in wire.Edges]
+    assert types[0] == "Line", types
+    # Ellipse edge uses Part.Ellipse curve
+    assert types[1] in ("Ellipse", "BSplineCurve"), types  # OCCT may represent as BSpline
+    assert wire.Edges[1].Length > 9.0  # half-ellipse longer than chord/2
+
+    # Rectangle: 3 points, 2 segments (Line + Rectangle) -> 3 edges total
+    pts = [Vector(0, 0, 0), Vector(10, 0, 0), Vector(10, 10, 0)]
+    wire = core.sketch3d_wire(pts, ["Line", "Rectangle"], [0.0, 1.0])
+    types = [type(e.Curve).__name__ for e in wire.Edges]
+    assert types[0] == "Line", types
+    assert types[1] == "Line", types
+    assert types[2] == "Line", types
+    # Rectangle produces two edges forming a corner
+    assert len(wire.Edges) == 3, "Rectangle produces 2 edges + previous = 3"
+    out("  ellipse/rect   OK  edges=%d types=%s" % (len(wire.Edges), types))
+
+
+def test_sketch3d_dim_solve_drives_points():
+    """Dimension-driven sketch: adding a distance constraint must move
+    the free point so the enforced length holds (the SW 'dim drives
+    geometry' contract, via core.solve_point_constraints)."""
+    a = Vector(0, 0, 0)
+    b = Vector(10, 0, 0)
+    c = Vector(10, 3, 0)
+    solved = core.solve_point_constraints(
+        [a, b, c], [("distance", 0, 2, 12.0)], pinned=[0])
+    got = (solved[2] - solved[0]).Length
+    assert abs(got - 12.0) < 1e-3, got
+    out("  dim-driven solve OK  |c-a|=%.4f" % got)
+
+
+def _closest_vertex_point(shape, p):
+    """(point, distance) of the shape vertex nearest to p."""
+    best, bd = None, 1e30
+    for v in shape.Vertexes:
+        d = (v.Point - p).Length
+        if d < bd:
+            best, bd = v.Point, d
+    return best, bd
+
+
+def _first_horizontal_edge_name(shape):
+    """Subelement name of the first edge with horizontal (x/y) span."""
+    for i, e in enumerate(shape.Edges):
+        a = e.valueAt(e.FirstParameter)
+        b = e.valueAt(e.LastParameter)
+        if abs(a.x - b.x) + abs(a.y - b.y) > 1e-9:
+            return "Edge%d" % (i + 1)
+    raise AssertionError("shape has no horizontal edge")
+
+
+def test_sketch3d_assoc_projection_follows_source():
+    """Issue #14 (project with constraints): a point carrying an edge
+    ref re-projects from its source on EVERY recompute -- move the
+    source box and the projected point follows (ExternalSources link
+    propagates the touch). The projected point is solver-pinned (the
+    source drives it, like an on-curve constraint) while the free point
+    still solves the distance dim between them."""
+    from rfstudio import panel_logic
+    from rfstudio.panel_sketch3d import make_sketch3d_obj
+    doc = FreeCAD.newDocument("AssocProj")
+    box = doc.addObject("Part::Box", "SrcBox")
+    box.Length, box.Width, box.Height = 10.0, 6.0, 4.0
+    doc.recompute()
+    obj = make_sketch3d_obj("Mixed", doc=doc)
+    name = _first_horizontal_edge_name(box.Shape)
+    edge = box.Shape.getElement(name)
+    frac = 0.5
+    u0, u1 = edge.FirstParameter, edge.LastParameter
+    p = edge.valueAt(u0 + (u1 - u0) * frac)
+    origin, normal = (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)
+    q0 = panel_logic.project_point_along((p.x, p.y, p.z), origin, normal)
+    obj.Points = [Vector(*q0), Vector(50.0, 50.0, 0.0)]
+    obj.SegmentTypes = ["Line"]
+    obj.Bulges = ["0.0"]
+    obj.ProjectedRefs = [
+        panel_logic.encode_proj_ref("edge", box.Name, name, frac, None), ""]
+    obj.ExternalSources = [box]
+    obj.PlaneOrigin = Vector(*origin)
+    obj.PlaneNormal = Vector(*normal)
+    obj.Constraints = ["distance,0,1,30.0"]   # point 1 is the free one
+    doc.recompute()
+    v0, d0 = _closest_vertex_point(obj.Shape, Vector(*q0))
+    assert d0 < 1e-6, "projected point not re-projected: dist=%r" % d0
+    verts = obj.Shape.Vertexes
+    assert len(verts) == 2, len(verts)
+    span = (verts[0].Point - verts[1].Point).Length
+    assert abs(span - 30.0) < 1e-2, span   # dim solved, p0 stayed pinned
+    # move the source: the point must FOLLOW it (associativity)
+    box.Placement.Base = Vector(10.0, 0.0, 0.0)
+    doc.recompute()
+    moved = panel_logic.project_point_along(
+        (p.x + 10.0, p.y, p.z), origin, normal)
+    v0b, d0b = _closest_vertex_point(obj.Shape, Vector(*moved))
+    assert d0b < 1e-6, \
+        "projected point did NOT follow the moved source: dist=%r" % d0b
+    verts = obj.Shape.Vertexes
+    span = (verts[0].Point - verts[1].Point).Length
+    assert abs(span - 30.0) < 1e-2, span   # dim re-solved after the move
+    FreeCAD.closeDocument(doc.Name)
+    out("  assoc projection OK  follows source, pinned+dim solved")
+
+
+def test_sketch3d_slice_projection_follows_source():
+    """Issue #14 (intersection-curve projection): slice refs re-cut the
+    section from the current source shape on every recompute, so the
+    cross-section points stay on the moving solid's cut face."""
+    from rfstudio import panel_logic
+    from rfstudio.panel_sketch3d import make_sketch3d_obj, _plane_slice_edges
+    doc = FreeCAD.newDocument("SliceProj")
+    box = doc.addObject("Part::Box", "SliceBox")
+    box.Length, box.Width, box.Height = 10.0, 8.0, 4.0
+    doc.recompute()
+    origin, normal = (0.0, 0.0, 2.0), (0.0, 0.0, 1.0)   # mid-height cut
+    edges = _plane_slice_edges(box.Shape, origin, normal)
+    assert len(edges) == 4, len(edges)   # rectangular cross-section
+    e = edges[0]
+    mid = e.valueAt((e.FirstParameter + e.LastParameter) / 2.0)
+    q0 = panel_logic.project_point_along((mid.x, mid.y, mid.z),
+                                         origin, normal)
+    obj = make_sketch3d_obj("Mixed", doc=doc)
+    obj.Points = [Vector(*q0), Vector(40.0, 40.0, 2.0)]
+    obj.SegmentTypes = ["Line"]
+    obj.Bulges = ["0.0"]
+    obj.ProjectedRefs = [
+        panel_logic.encode_proj_ref("slice", box.Name, "0", 0.5, None), ""]
+    obj.ExternalSources = [box]
+    obj.PlaneOrigin = Vector(*origin)
+    obj.PlaneNormal = Vector(*normal)
+    doc.recompute()
+    v0, d0 = _closest_vertex_point(obj.Shape, Vector(*q0))
+    assert d0 < 1e-6, "slice point not on the section: dist=%r" % d0
+    assert abs(v0.z - 2.0) < 1e-9, v0.z
+    # move the solid: the re-cut section must follow
+    box.Placement.Base = Vector(5.0, 0.0, 0.0)
+    doc.recompute()
+    expect = Vector(q0[0] + 5.0, q0[1], q0[2])
+    v0b, d0b = _closest_vertex_point(obj.Shape, expect)
+    assert d0b < 1e-6, \
+        "slice point did NOT follow the moved solid: dist=%r" % d0b
+    assert abs(v0b.z - 2.0) < 1e-9, v0b.z
+    FreeCAD.closeDocument(doc.Name)
+    out("  slice projection OK  section follows source")
+
+
+def test_solve_point_constraints_tangent():
+    """Tangent constraint: i-j-k must be collinear. With pinned j,
+    moving k should bring i into alignment."""
+    a = Vector(0, 0, 0)
+    b = Vector(10, 0, 0)   # pivot (pinned)
+    c = Vector(10, 10, 0)
+    solved = core.solve_point_constraints(
+        [a, b, c], [("tangent", 0, 1, 2)], pinned=[1])
+    v1 = solved[0] - solved[1]
+    v2 = solved[2] - solved[1]
+    cross = v1.cross(v2).Length
+    assert cross < 1e-3, "tangent constraint failed: cross=%f" % cross
+    out("  tangent solve    OK  cross=%.2e" % cross)
+
+
+def test_solve_point_constraints_concentric():
+    """Concentric constraint: two centers must coincide."""
+    a = Vector(0, 0, 0)
+    b = Vector(5, 0, 0)
+    solved = core.solve_point_constraints(
+        [a, b], [("concentric", 0, 1)], pinned=[])
+    assert (solved[0] - solved[1]).Length < 1e-3
+    out("  concentric solve OK  |a-b|=%.2e" % (solved[0] - solved[1]).Length)
+
+
+def test_solve_point_constraints_symmetric():
+    """Symmetric constraint: i,j symmetric about k."""
+    a = Vector(0, 0, 0)
+    b = Vector(10, 0, 0)
+    k = Vector(5, 2, 0)  # off-center
+    solved = core.solve_point_constraints(
+        [a, b, k], [("symmetric", 0, 1, 2)], pinned=[2])
+    mid = (solved[0] + solved[1]) * 0.5
+    assert (mid - solved[2]).Length < 1e-3
+    out("  symmetric solve  OK  mid-k=%.2e" % (mid - solved[2]).Length)
+
+
+def test_solve_point_constraints_mirror():
+    """Mirror constraint across the YZ plane (x=0): p1 must become the
+    reflection of p0."""
+    a = Vector(4, 1, 2)
+    b = Vector(-2, 0, 0)
+    solved = core.solve_point_constraints(
+        [a, b], [("mirror", 0, 1, 1.0, 0.0, 0.0, 0.0)])
+    assert abs(solved[0].x + solved[1].x) < 1e-3, (solved[0], solved[1])
+    assert abs(solved[0].y - solved[1].y) < 1e-3
+    assert abs(solved[0].z - solved[1].z) < 1e-3
+    out("  mirror solve   OK  x=%.4f/%.4f"
+        % (solved[0].x, solved[1].x))
+
+
+def test_wire_corner_fillet_open_polyline():
+    """Open polyline wire: both interior corners should be filleted."""
+    pts = [Vector(0, 0, 0), Vector(10, 0, 0), Vector(20, 10, 0),
+           Vector(30, 10, 0)]
+    wire = Part.Wire([Part.LineSegment(pts[i], pts[i + 1]).toShape() for i in range(3)])
+    filleted = core.wire_corner_fillet(wire, 2.0)
+    # 3 edges + 2 arcs = 5 edges
+    assert len(filleted.Edges) == 5, filleted.Edges
+    types = [type(e.Curve).__name__ for e in filleted.Edges]
+    assert types == ["Line", "Circle", "Line", "Circle", "Line"], types
+    out("  open polyline fillet OK  edges=%d" % len(filleted.Edges))
+
+
+def test_wire_corner_fillet_closed_polyline():
+    """Closed polyline: all corners filleted."""
+    pts = [Vector(0, 0, 0), Vector(10, 0, 0), Vector(10, 10, 0),
+           Vector(0, 10, 0)]
+    wire = Part.Wire([Part.LineSegment(pts[i], pts[(i + 1) % 4]).toShape() for i in range(4)])
+    filleted = core.wire_corner_fillet(wire, 2.0)
+    # 4 edges + 4 arcs = 8 edges
+    assert len(filleted.Edges) == 8, filleted.Edges
+    types = [type(e.Curve).__name__ for e in filleted.Edges]
+    assert types == ["Line", "Circle"] * 4, types
+    out("  closed polyline fillet OK  edges=%d" % len(filleted.Edges))
+
+
+def test_wire_corner_fillet_per_corner_dict():
+    """Per-corner radius dict should only fillet specified corners."""
+    pts = [Vector(0, 0, 0), Vector(10, 0, 0), Vector(20, 10, 0),
+           Vector(30, 10, 0)]
+    wire = Part.Wire([Part.LineSegment(pts[i], pts[i + 1]).toShape() for i in range(3)])
+    # Only fillet corner 1 (between edge 0 and 1)
+    filleted = core.wire_corner_fillet(wire, {1: 2.0})
+    # 3 edges + 1 arc = 4 edges
+    assert len(filleted.Edges) == 4, filleted.Edges
+    types = [type(e.Curve).__name__ for e in filleted.Edges]
+    assert types == ["Line", "Circle", "Line", "Line"], types
+    out("  per-corner dict OK  edges=%d" % len(filleted.Edges))
+
+
+def test_wire_corner_fillet_mixed_wire():
+    """Mixed entity wire (Line + Arc + Line) should fillet correctly."""
+    pts = [Vector(0, 0, 0), Vector(10, 0, 0), Vector(20, 10, 0),
+           Vector(30, 10, 0)]
+    mid = Vector(15, 8, 0)
+    edges = [
+        Part.LineSegment(Vector(0, 0, 0), Vector(10, 0, 0)).toShape(),
+        Part.Arc(Vector(10, 0, 0), Vector(15, 8, 0), Vector(20, 10, 0)).toShape(),
+        Part.LineSegment(Vector(20, 10, 0), Vector(30, 10, 0)).toShape(),
+    ]
+    wire = Part.Wire(edges)
+    filleted = core.wire_corner_fillet(wire, 2.0)
+    # 3 edges + 2 arcs = 5 edges
+    assert len(filleted.Edges) == 5, filleted.Edges
+    out("  mixed wire fillet OK  edges=%d" % len(filleted.Edges))
+
+
+def test_wire_corner_chamfer_open_polyline():
+    """Open polyline wire: both interior corners get a straight cut."""
+    pts = [Vector(0, 0, 0), Vector(10, 0, 0), Vector(20, 10, 0),
+           Vector(30, 10, 0)]
+    wire = Part.Wire([Part.LineSegment(pts[i], pts[i + 1]).toShape()
+                      for i in range(3)])
+    cut = core.wire_corner_chamfer(wire, 2.0)
+    assert len(cut.Edges) == 5, cut.Edges
+    assert all(type(e.Curve).__name__ == "Line" for e in cut.Edges), \
+        [type(e.Curve).__name__ for e in cut.Edges]
+    # Chamfer must shorten the wire vs the sharp polyline (a 2.0
+    # setback on these corners cuts ~0.6 total -- small because the
+    # chamfer chord is nearly as long as the corner legs it replaces)
+    assert cut.Length < wire.Length, (cut.Length, wire.Length)
+    assert wire.Length - cut.Length > 0.1, (cut.Length, wire.Length)
+    # Per-corner dict: only the listed corner is cut
+    cut_one = core.wire_corner_chamfer(wire, {1: 2.0})
+    assert len(cut_one.Edges) == 4, cut_one.Edges
+    try:
+        core.wire_corner_chamfer(wire, 0.0)
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+    out("  chamfer open    OK  edges=%d len=%.2f" % (len(cut.Edges), cut.Length))
+
+
+def test_sketch3d_wire_bezier_run():
+    """Bezier run: each span is a cubic Bezier through its endpoints;
+    a larger bulge (longer handles) makes a fuller curve."""
+    pts = [Vector(0, 0, 0), Vector(10, 0, 0), Vector(20, 10, 0)]
+    wire = core.sketch3d_wire(pts, ["Bezier", "Bezier"], [0.0, 0.0])
+    assert len(wire.Edges) == 2, wire.Edges
+    assert all(type(e.Curve).__name__ == "BezierCurve" for e in wire.Edges)
+    for e, a, b in zip(wire.Edges, pts, pts[1:]):
+        assert e.valueAt(e.FirstParameter).distanceToPoint(a) < 1e-6
+        assert e.valueAt(e.LastParameter).distanceToPoint(b) < 1e-6
+    full = core.sketch3d_wire(pts, ["Bezier", "Bezier"], [0.9, 0.9])
+    assert full.Length > wire.Length, (full.Length, wire.Length)
+    out("  bezier run    OK  edges=%d len=%.2f" % (len(wire.Edges), wire.Length))
+
+
+def test_bezier_curvature_jerk_analytics():
+    """Test the analytic curvature/jerk computation for cubic Bezier segments."""
+    from rfstudio.editmode import (
+        _bezier_segment_derivatives,
+        _bezier_curvature_and_jerk,
+        _bezier_g2_g3_at_handles,
+        _bezier_g2_g3_along_segment,
+    )
+    from FreeCAD import Vector
+
+    # Straight line (zero curvature, zero jerk)
+    p0, p1, p2, p3 = Vector(0,0,0), Vector(1,0,0), Vector(2,0,0), Vector(3,0,0)
+    p, d1, d2, d3 = _bezier_segment_derivatives(p0, p1, p2, p3, 0.5)
+    assert (p - Vector(1.5, 0, 0)).Length < 1e-9
+    assert d2.Length < 1e-9  # zero curvature
+    assert d3.Length < 1e-9  # zero jerk
+
+    g2, g3 = _bezier_curvature_and_jerk(p0, p1, p2, p3, 0.5)
+    assert g2 is not None and abs(g2) < 1e-9
+    assert g3 is not None and abs(g3) < 1e-9
+
+    # Circular arc approximation (known curvature)
+    p0 = Vector(1, 0, 0)
+    p1 = Vector(1, 0.55, 0)
+    p2 = Vector(0.45, 1, 0)
+    p3 = Vector(0, 1, 0)
+    g2_start, g3_start, g2_end, g3_end = _bezier_g2_g3_at_handles(p0, p1, p2, p3)
+    assert g2_start is not None and g2_start > 0
+    assert g2_end is not None and g2_end > 0
+
+    # Circular arc approximation (Bezier) has curvature ~0.8-1.2 at endpoints
+    # Exact circular arc would be 1.0 (radius 1), Bezier approx is close
+    assert 0.5 < g2_start < 2.0
+    assert abs(g2_end - 1.0) < 0.5
+
+    # Test sampling along segment
+    samples = _bezier_g2_g3_along_segment(p0, p1, p2, p3, samples=10)
+    assert len(samples) == 10
+    for t, g2, g3 in samples:
+        assert g2 is not None and g2 > 0
+
+    out("  bezier curvature/jerk analytics OK")
 
 
 def test_rail_roundtrip_clamped():
@@ -1831,109 +2543,92 @@ def test_hidden_line_projection_if_drawing_available():
 
 def test_plane_base_normal():
     from rfstudio.mirror import plane_base_normal
-    # Test standard planes
-    assert plane_base_normal("XY") == (0, 0, 1)
-    assert plane_base_normal("YZ") == (1, 0, 0)
-    assert plane_base_normal("ZX") == (0, 1, 0)
-    # Test invalid plane
+    # Standard planes: (base, normal) Vector pairs through the origin
+    for name, axis in (("XY", (0, 0, 1)), ("YZ", (1, 0, 0)),
+                       ("ZX", (0, 1, 0))):
+        base, normal = plane_base_normal(name)
+        assert abs(base.x) < 1e-12 and abs(base.y) < 1e-12 and abs(base.z) < 1e-12
+        assert abs(normal.x - axis[0]) < 1e-9
+        assert abs(normal.y - axis[1]) < 1e-9
+        assert abs(normal.z - axis[2]) < 1e-9
+    # Custom plane: normal gets normalized
+    base, normal = plane_base_normal("Custom", base=Vector(1, 2, 3),
+                                     normal=Vector(0, 0, 5))
+    assert abs(base.x - 1) < 1e-9 and abs(normal.z - 1) < 1e-9
+    # Zero-length custom normal is rejected
     try:
-        plane_base_normal("INVALID")
-        assert False, "Expected ValueError"
+        plane_base_normal("Custom", normal=Vector(0, 0, 0))
+        assert False, "expected ValueError"
     except ValueError:
         pass
-    # Test custom plane
-    assert plane_base_normal((1, 2, 3)) == (1, 2, 3)
     out("  plane_base_normal   OK")
 
 def test_mirror_point():
     from rfstudio.mirror import mirror_point
-    # Mirror across XY plane (z=0)
-    assert mirror_point((1, 2, 3), (0, 0, 1)) == (1, 2, -3)
-    # Mirror across YZ plane (x=0)
-    assert mirror_point((1, 2, 3), (1, 0, 0)) == (-1, 2, 3)
-    # Mirror across ZX plane (y=0)
-    assert mirror_point((1, 2, 3), (0, 1, 0)) == (1, -2, 3)
-    # Mirror across custom plane (x+y+z=0) - normal (1,1,1)
-    # Point (1,1,1) should go to (-1,-1,-1)
-    assert mirror_point((1, 1, 1), (1, 1, 1)) == (-1, -1, -1)
-    # Point on plane should stay
-    assert mirror_point((1, -1, 0), (1, 1, 1)) == (1, -1, 0)
+    O = Vector(0, 0, 0)
+    # Across XY plane (base origin, normal +Z)
+    m = mirror_point(Vector(1, 2, 3), O, Vector(0, 0, 1))
+    assert abs(m.x - 1) < 1e-9 and abs(m.y - 2) < 1e-9 and abs(m.z + 3) < 1e-9
+    # Across YZ plane
+    m = mirror_point(Vector(1, 2, 3), O, Vector(1, 0, 0))
+    assert abs(m.x + 1) < 1e-9 and abs(m.y - 2) < 1e-9 and abs(m.z - 3) < 1e-9
+    # Across x+y+z=0 plane
+    m = mirror_point(Vector(1, 1, 1), O, Vector(1, 1, 1))
+    assert abs(m.x + 1) < 1e-9 and abs(m.y + 1) < 1e-9 and abs(m.z + 1) < 1e-9
+    # Point ON the plane stays
+    m = mirror_point(Vector(1, -1, 0), O, Vector(1, 1, 1))
+    assert abs(m.x - 1) < 1e-9 and abs(m.y + 1) < 1e-9 and abs(m.z) < 1e-9
     out("  mirror_point        OK")
 
 def test_find_symmetric_pairs():
     from rfstudio.mirror import find_symmetric_pairs
-    # Points symmetric about XY plane (z=0)
-    pts = [(1, 2, 3), (1, 2, -3), (4, 5, 6), (4, 5, -6)]
-    pairs = find_symmetric_pairs(pts, (0, 0, 1), 1e-4)
-    # Should find two pairs: (0,1) and (2,3)
-    assert len(pairs) == 2
-    assert (0, 1) in pairs
-    assert (2, 3) in pairs
-    # Points not symmetric
-    pts2 = [(1, 2, 3), (4, 5, 6)]
-    pairs2 = find_symmetric_pairs(pts2, (0, 0, 1), 1e-4)
-    assert len(pairs2) == 0
-    # Mixed: one symmetric pair and one extra
-    pts3 = [(1, 2, 3), (1, 2, -3), (4, 5, 6)]
-    pairs3 = find_symmetric_pairs(pts3, (0, 0, 1), 1e-4)
-    assert len(pairs3) == 1
-    assert (0, 1) in pairs3
-    # Test with tolerance
-    pts4 = [(1, 2, 3.0001), (1, 2, -3)]  # slightly off
-    pairs4 = find_symmetric_pairs(pts4, (0, 0, 1), 1e-3)  # tolerance 0.001
-    assert len(pairs4) == 1
-    assert (0, 1) in pairs4
-    pairs5 = find_symmetric_pairs(pts4, (0, 0, 1), 1e-5)  # tighter tolerance
-    assert len(pairs5) == 0
+    O = Vector(0, 0, 0)
+    # Two mirrored pairs about the XY plane -> dict covers every index
+    pts = [Vector(1, 2, 3), Vector(1, 2, -3), Vector(4, 5, 6), Vector(4, 5, -6)]
+    pairs = find_symmetric_pairs(pts, O, Vector(0, 0, 1), 1e-4)
+    assert pairs == {0: 1, 1: 0, 2: 3, 3: 2}, pairs
+    # An on-plane point self-pairs (seam point)
+    pts = [Vector(1, 2, 0), Vector(1, 2, 3), Vector(1, 2, -3)]
+    pairs = find_symmetric_pairs(pts, O, Vector(0, 0, 1), 1e-4)
+    assert pairs == {0: 0, 1: 2, 2: 1}, pairs
+    # Not symmetric -> ValueError (refuse symmetric editing rather than
+    # silently mis-pairing)
+    try:
+        find_symmetric_pairs([Vector(1, 2, 3), Vector(4, 5, 6)], O,
+                             Vector(0, 0, 1), 1e-4)
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+    # Tolerance: 3.0001 vs 3 pairs with tol 1e-3, not with 1e-5
+    close = [Vector(1, 2, 3.0001), Vector(1, 2, -3)]
+    assert find_symmetric_pairs(close, O, Vector(0, 0, 1), 1e-3) == {0: 1, 1: 0}
+    try:
+        find_symmetric_pairs(close, O, Vector(0, 0, 1), 1e-5)
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
     out("  find_symmetric_pairs OK")
 
 def test_mirror_shape():
     from rfstudio.mirror import mirror_shape
     import Part
-    # Create a simple line segment on the X-axis from (1,0,0) to (2,0,0)
     line = Part.makeLine((1, 0, 0), (2, 0, 0))
-    # Mirror across YZ plane (x=0) should give line from (-2,0,0) to (-1,0,0)
-    mirrored = mirror_shape(line, (1, 0, 0))  # normal (1,0,0) -> YZ plane
-    assert mirrored.Length == line.Length
-    # Check the mirrored line's points
-    start = mirrored.FirstParameter
-    end = mirrored.LastParameter
-    p1 = mirrored.valueAt(start)
-    p2 = mirrored.valueAt(end)
-    # The line should be from (-2,0,0) to (-1,0,0) (or vice versa)
-    assert abs(p1.x + 2) < 1e-6 and abs(p1.y) < 1e-6 and abs(p1.z) < 1e-6
-    assert abs(p2.x + 1) < 1e-6 and abs(p2.y) < 1e-6 and abs(p2.z) < 1e-6
-    # Test welding: if we weld, we should get a single line from (-2,0,0) to (2,0,0) passing through (0,0,0)?
-    # But note: the original line is from (1,0,0) to (2,0,0) and mirrored from (-2,0,0) to (-1,0,0)
-    # Welding them would not create a continuous line because there's a gap from (-1,0,0) to (1,0,0).
-    # So we test without welding first.
-    # For welding, we need two shapes that touch at the mirror plane.
-    # Let's create a line that crosses the mirror plane: from (-1,0,0) to (1,0,0)
+    # Pattern: (mirrored_shape, welded: bool) -- welded=False by default
+    mirrored, welded = mirror_shape(line, Vector(0, 0, 0), Vector(1, 0, 0))
+    assert not welded
+    assert abs(mirrored.Length - line.Length) < 1e-9
+    e = mirrored.Edges[0]
+    pts = [v.Point for v in e.Vertexes]
+    xs = sorted(p.x for p in pts)
+    assert abs(xs[0] + 2) < 1e-6 and abs(xs[1] + 1) < 1e-6
+    # weld=True without a stitch_fn degrades gracefully to (mirrored, False)
+    mirrored2, welded2 = mirror_shape(line, Vector(0, 0, 0), Vector(1, 0, 0),
+                                      weld=True)
+    assert not welded2 and mirrored2 is not None
+    # Symmetric line about the plane: mirroring returns an equal-length shape
     line2 = Part.makeLine((-1, 0, 0), (1, 0, 0))
-    mirrored2 = mirror_shape(line2, (1, 0, 0), weld=True)  # weld=True
-    # The welded shape should be the same line because it's already symmetric?
-    # Actually, mirroring a line that crosses the mirror plane will give the same line.
-    # So welding should not change it.
-    assert mirrored2.Length == line2.Length
-    # Now test with a line that does not cross: from (1,0,0) to (2,0,0) as before, but we expect two separate lines when not welded.
-    mirrored_no_weld = mirror_shape(line, (1, 0, 0), weld=False)
-    # Without welding, we expect two separate lines: the original and the mirrored.
-    # The mirror_shape function returns a compound of the two shapes when weld=False?
-    # Let's check the implementation of mirror_shape in mirror.py to be sure.
-    # Since we don't have the mirror.py file, we assume that when weld=False, it returns a compound of the original and the mirrored shape.
-    # We'll check the length: if it's a compound, the length might be the sum? But note: the compound might not have a Length attribute that sums.
-    # Instead, we check the number of edges or the type.
-    # We'll do a simple check: if weld=False, the result should have two edges (each line has one edge).
-    # But note: the mirror_shape function might return a compound or a list? We'll assume it returns a compound.
-    # We'll check the type and the number of elements.
-    # For simplicity, we'll just check that the result is not None and has the same length as the original when welded? Not reliable.
-    # Let's skip the welding test for now and just test the mirroring without welding.
-    # We already tested the mirroring without welding above.
-    # We'll add a note that the welding test requires more setup and we'll do it in a separate test if needed.
-    # For now, we test that the mirror_shape function returns a shape when welded is False and True.
-    # We'll just check that it doesn't crash and returns a shape.
-    mirrored_weld = mirror_shape(line, (1, 0, 0), weld=True)
-    assert mirrored_weld is not None
+    m3, w3 = mirror_shape(line2, Vector(0, 0, 0), Vector(1, 0, 0))
+    assert abs(m3.Length - line2.Length) < 1e-9
     out("  mirror_shape        OK")
 
 
@@ -1949,6 +2644,8 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_rails_to_edges,
               test_snaputil_seg_dist, test_snaputil_collect_snap_points,
               test_snaputil_ray_snap_is_depth_accurate,
+              test_snaputil_skips_degenerate_edges,
+              test_snaputil_ray_span_is_bbox_bounded,
               test_snaputil_axis_snap_stays_on_axis,
               test_on_curve_constraint_pulls_point_onto_edge,
               test_snaputil_collect_intersection_points,
@@ -1962,9 +2659,38 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_trim_face_off_surface_wire_falls_back_to_projection,
               test_providers_multiloft_is_native_only,
               test_providers_cover_every_delegated_action,
+              test_engines_validate_providers_healthy,
+              test_engines_validate_providers_catches_typos,
+              test_last_three_actions_have_native_fallbacks,
+              test_n_sided_patch_square_smoke,
+              test_control_poly_curve_4pt_degree3,
+              test_sketch3d_interp_curve_through_nonplanar_points,
+              test_polyline_fillet_record_in_place,
+              test_sketch3d_wire_mixed_entities,
+              test_sketch3d_wire_ellipse_rectangle,
+              test_sketch3d_dim_solve_drives_points,
+              test_sketch3d_assoc_projection_follows_source,
+              test_sketch3d_slice_projection_follows_source,
+              test_solve_point_constraints_tangent,
+              test_solve_point_constraints_concentric,
+              test_solve_point_constraints_symmetric,
+              test_solve_point_constraints_mirror,
+              test_wire_corner_fillet_open_polyline,
+              test_wire_corner_fillet_closed_polyline,
+              test_wire_corner_fillet_per_corner_dict,
+              test_wire_corner_fillet_mixed_wire,
+              test_wire_corner_chamfer_open_polyline,
+              test_sketch3d_wire_bezier_run,
+              test_bezier_curvature_jerk_analytics,
               test_report_single_points_of_failure,
               test_match_surface_exact_g1_identical_planes,
               test_match_surface_exact_g1_incompatible_raises,
+              test_match_surface_exact_g2_identical_planes,
+              test_match_surface_exact_g2_curved_reference,
+              test_match_surface_exact_g2_incompatible_raises,
+              test_match_surface_to_references_reports_exact_g2,
+              test_nearest_facing_sides_prefers_parallel_edges,
+              test_match_surface_fp_execute_uses_references,
               test_match_surface_to_references_prefers_exact_g1,
               test_match_surface_to_references_reports_method,
               test_match_surface_exact_g1_auto_converts_analytic_surfaces,

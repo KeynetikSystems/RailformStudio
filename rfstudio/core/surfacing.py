@@ -8,7 +8,7 @@ import Part
 import FreeCAD                      # Console only -- not Gui, works headless
 from FreeCAD import Vector
 
-from .util import (_compute_finite_difference_epsilon, _cross_tan_from_surface_tangent, _face_from_input, _finite_difference_second_derivative, _finite_difference_third_derivative, _hermite3, _hermite5, _hermite7, _nearest_facing_sides, _side_is_trimmed, _side_uv_trimmed, grid_to_surface)
+from .util import (_compute_finite_difference_epsilon, _cross_tan_from_surface_tangent, _face_from_input, _finite_difference_second_derivative, _finite_difference_third_derivative, _hermite3, _hermite5, _hermite7, _matched_edges_compatible, _nearest_facing_sides, _side_is_trimmed, _side_uv_trimmed, grid_to_surface)
 from .qa import (adjacency_graph, classify_continuity, network_continuity_report, surface_deviation)
 
 
@@ -1224,10 +1224,11 @@ def match_surface_to_references(target_face, reference_faces, continuity="G2",
     evaluate a short list of possible reference faces and choose the one that
     yields the best seam quality instead of blindly picking the first.
 
-    For each candidate this now tries match_surface_exact_g1() FIRST when
-    G1 or G2 continuity is requested -- an exact, control-net-level match
-    rather than match_surface()'s sampled Hermite approximation (see that
-    function's docstring). It only succeeds when the two faces' boundary
+    For each candidate this now tries the exact control-net matcher
+    FIRST -- match_surface_exact_g2() for G2 requests, or
+    match_surface_exact_g1() for G1 -- rather than match_surface()'s
+    sampled Hermite approximation (see those functions' docstrings).
+    Either only succeeds when the two faces' boundary
     parametrizations are knot-compatible; whenever it isn't (raises
     ValueError), this transparently falls back to the sampled
     match_surface() path exactly as before, so behaviour for incompatible
@@ -1236,8 +1237,8 @@ def match_surface_to_references(target_face, reference_faces, continuity="G2",
     seam needs the sampled approximation, it doesn't remove the need to
     verify numerically when it does fall back.
 
-    The returned report dict now also carries report["method"], either
-    "exact_g1" or "sampled" -- with two match algorithms now silently
+    The returned report dict now also carries report["method"], one of
+    "exact_g2", "exact_g1" or "sampled" -- with two match algorithms now silently
     competing for each candidate reference face, a "the match looks
     different than expected" bug report needs a fast way to tell which
     one actually produced the result without re-deriving it from scratch;
@@ -1262,7 +1263,13 @@ def match_surface_to_references(target_face, reference_faces, continuity="G2",
             base_score = (base_report["max_g0"], base_report["max_g1_deg"], base_report["max_g2"])
             rebuilt = None
             method = "sampled"
-            if continuity in ("G1", "G2"):
+            if continuity == "G2":
+                try:
+                    rebuilt = match_surface_exact_g2(ref, target_face)
+                    method = "exact_g2"
+                except Exception:
+                    rebuilt = None      # not knot-compatible -- fall through
+            elif continuity == "G1":
                 try:
                     rebuilt = match_surface_exact_g1(ref, target_face)
                     method = "exact_g1"
@@ -1286,6 +1293,169 @@ def match_surface_to_references(target_face, reference_faces, continuity="G2",
     return best_shape, best_report, best_face
 
 
+
+
+def _pole_ij_match(side, depth, along, nu, nv):
+    """1-based OCCT (i,j) pole index `depth` rows in from `side`
+    (0=umin,1=umax,2=vmin,3=vmax), at position `along` running along
+    the shared edge. Shared by match_surface_exact_g1/_g2."""
+    if side == 0:
+        return (1 + depth, 1 + along)
+    if side == 1:
+        return (nu - depth, 1 + along)
+    if side == 2:
+        return (1 + along, 1 + depth)
+    return (1 + along, nv - depth)
+
+
+def _as_bspline_match(face, which, fname):
+    """BSpline conversion shared by the exact matchers: native
+    BSplineSurfaces are copied, other OCCT types go through
+    toBSpline(), and unbounded analytics (planes, cylinders, ...)
+    are fit over the face's own parameter range instead. Error text
+    is identical to match_surface_exact_g1's historical messages when
+    fname="match_surface_exact_g1", so existing callers matching on
+    that text keep working."""
+    surf = face.Surface
+    if isinstance(surf, Part.BSplineSurface):
+        return surf.copy()
+    try:
+        return surf.toBSpline()
+    except Exception:
+        pass
+    # Analytic surfaces (planes, cylinders, cones, ...) are
+    # mathematically infinite/unbounded in their own parametrization,
+    # so an unbounded toBSpline() always raises ("Will raise an
+    # exception if surface is infinite in U or V"). Fit a
+    # BSplineSurface to a grid of points sampled over the FACE's
+    # actual (bounded) parameter range instead -- exact for planes,
+    # a close approximation for curved analytics -- rather than
+    # rejecting every analytic neighbor outright.
+    try:
+        u0, u1, v0, v1 = face.ParameterRange
+        n = 8
+        grid = [[surf.value(u0 + i * (u1 - u0) / (n - 1.0),
+                             v0 + j * (v1 - v0) / (n - 1.0))
+                 for j in range(n)] for i in range(n)]
+        bs = Part.BSplineSurface()
+        bs.interpolate(grid)
+        return bs
+    except Exception as exc:
+        raise ValueError(
+            "%s: %s surface type (%s) can't be "
+            "converted to a BSplineSurface (%s) -- fall back to "
+            "match_surface()" % (fname, which, type(surf).__name__, exc))
+
+
+def _harmonize_match_knots(s1, ax1, s2, ax2, fname, tol=1e-9):
+    """Union (per-knot max multiplicity) knot harmonization shared by
+    the exact matchers, with the defensive re-check that insertion
+    really produced identical sequences on both sides."""
+    k1 = list(getattr(s1, "get" + ax1 + "Knots")())
+    m1 = list(getattr(s1, "get" + ax1 + "Multiplicities")())
+    k2 = list(getattr(s2, "get" + ax2 + "Knots")())
+    m2 = list(getattr(s2, "get" + ax2 + "Multiplicities")())
+    merged = {}
+    for k, m in zip(k1, m1):
+        merged[k] = max(merged.get(k, 0), m)
+    for k, m in zip(k2, m2):
+        merged[k] = max(merged.get(k, 0), m)
+    ks = sorted(merged)
+    ms = [merged[k] for k in ks]
+    try:
+        getattr(s1, "insert" + ax1 + "Knots")(ks, ms, tol, False)
+        getattr(s2, "insert" + ax2 + "Knots")(ks, ms, tol, False)
+    except Exception as exc:
+        raise ValueError(
+            "%s: knot harmonization failed (%s) "
+            "-- boundary parametrizations aren't compatible; fall "
+            "back to match_surface()" % (fname, exc))
+    # Defensive re-check: insertion can silently no-op on a knot
+    # outside a surface's actual span rather than raising, so confirm
+    # the two axes ended up with the SAME knot sequence, not just
+    # that insertKnots didn't complain.
+    k1b = list(getattr(s1, "get" + ax1 + "Knots")())
+    k2b = list(getattr(s2, "get" + ax2 + "Knots")())
+    if len(k1b) != len(k2b) or any(abs(a - b) > 1e-6 for a, b in zip(k1b, k2b)):
+        raise ValueError(
+            "%s: boundary parametrizations aren't "
+            "knot-compatible even after harmonization (different "
+            "parameter ranges, not just different refinement) -- "
+            "fall back to match_surface()" % fname)
+
+
+def _exact_match_prep(ref_face, tgt_face, fname, harmonize_cross=False):
+    """Shared pipeline for match_surface_exact_g1/_g2: side detection,
+    trim guard, BSpline conversion, along-edge knot harmonization,
+    degree elevation, and pole-count agreement. Returns
+    (ref_s, tgt_s, rs, ts, ref_is_u, tgt_is_u, n_along).
+
+    With harmonize_cross=True (the G2 path) the CROSS-boundary knot
+    vectors are unioned too and both cross degrees elevated to match:
+    the cross-derivative scale factors then coincide on both sides,
+    which is what makes a copied third pole row equalize the cross
+    SECOND derivatives (not just their direction). Without it, copied
+    rows only guarantee derivative direction -- enough for G1-angle,
+    insufficient for the G2 vector equality surface_deviation
+    measures. Cross harmonization is an exact refinement (shape
+    unchanged), like the along-edge one.
+
+    Raises ValueError (fail loud, let the caller fall back to sampled
+    match_surface()) whenever any step can't be satisfied."""
+    ref_face = _face_from_input(ref_face)
+    tgt_face = _face_from_input(tgt_face)
+    rs, ts, ref_pr, tgt_pr = _nearest_facing_sides(ref_face, tgt_face)
+    if _side_is_trimmed(ref_face, ref_pr, rs) or _side_is_trimmed(tgt_face, tgt_pr, ts):
+        raise ValueError(
+            "%s: the matched boundary is a trimmed "
+            "edge, not the full untrimmed iso-parameter line -- an exact "
+            "control-net copy would use the wrong material extent; fall "
+            "back to match_surface() (trim-aware sampling) instead" % fname)
+    ok, why = _matched_edges_compatible(ref_face, ref_pr, rs,
+                                        tgt_face, tgt_pr, ts)
+    if not ok:
+        raise ValueError("%s: %s -- fall back to match_surface()" % (fname, why))
+    ref_s = _as_bspline_match(ref_face, "ref_face's", fname)
+    tgt_s = _as_bspline_match(tgt_face, "tgt_face's", fname)
+    ref_is_u, tgt_is_u = rs < 2, ts < 2
+    axis_ref = "V" if ref_is_u else "U"
+    axis_tgt = "V" if tgt_is_u else "U"
+    _harmonize_match_knots(ref_s, axis_ref, tgt_s, axis_tgt, fname)
+    cross_ref = "U" if ref_is_u else "V"
+    cross_tgt = "U" if tgt_is_u else "V"
+    if harmonize_cross:
+        _harmonize_match_knots(ref_s, cross_ref, tgt_s, cross_tgt, fname)
+    deg_ref_a = ref_s.VDegree if ref_is_u else ref_s.UDegree
+    deg_tgt_a = tgt_s.VDegree if tgt_is_u else tgt_s.UDegree
+    target_a = max(deg_ref_a, deg_tgt_a)
+    try:
+        if harmonize_cross:
+            deg_ref_c = ref_s.UDegree if ref_is_u else ref_s.VDegree
+            deg_tgt_c = tgt_s.UDegree if tgt_is_u else tgt_s.VDegree
+            target_c = max(deg_ref_c, deg_tgt_c)
+            ref_u = target_c if ref_is_u else target_a
+            ref_v = target_a if ref_is_u else target_c
+            tgt_u = target_c if tgt_is_u else target_a
+            tgt_v = target_a if tgt_is_u else target_c
+        else:
+            ref_u = ref_s.UDegree if ref_is_u else target_a
+            ref_v = target_a if ref_is_u else ref_s.VDegree
+            tgt_u = tgt_s.UDegree if tgt_is_u else target_a
+            tgt_v = target_a if tgt_is_u else tgt_s.VDegree
+        ref_s.increaseDegree(ref_u, ref_v)
+        tgt_s.increaseDegree(tgt_u, tgt_v)
+    except Exception as exc:
+        raise ValueError(
+            "%s: degree elevation failed (%s) -- "
+            "fall back to match_surface()" % (fname, exc))
+    n_ref = ref_s.NbVPoles if ref_is_u else ref_s.NbUPoles
+    n_tgt = tgt_s.NbVPoles if tgt_is_u else tgt_s.NbUPoles
+    if n_ref != n_tgt:
+        raise ValueError(
+            "%s: pole counts along the shared edge "
+            "still disagree after harmonization (%d vs %d) -- fall back "
+            "to match_surface()" % (fname, n_ref, n_tgt))
+    return ref_s, tgt_s, rs, ts, ref_is_u, tgt_is_u, n_ref
 
 
 def match_surface_exact_g1(ref_face, tgt_face, n_rows=2):
@@ -1390,6 +1560,12 @@ def match_surface_exact_g1(ref_face, tgt_face, n_rows=2):
             "edge, not the full untrimmed iso-parameter line -- an exact "
             "control-net copy would use the wrong material extent; fall "
             "back to match_surface() (trim-aware sampling) instead")
+    ok, why = _matched_edges_compatible(ref_face, ref_pr, rs,
+                                        tgt_face, tgt_pr, ts)
+    if not ok:
+        raise ValueError(
+            "match_surface_exact_g1: %s -- fall back to match_surface()"
+            % why)
 
     def _as_bspline(face, which):
         surf = face.Surface
@@ -1504,6 +1680,65 @@ def match_surface_exact_g1(ref_face, tgt_face, n_rows=2):
             ti, tj = _pole_ij(ts, depth, along, tgt_s.NbUPoles, tgt_s.NbVPoles)
             tgt_s.setPole(ti, tj, ref_s.getPole(ri, rj))
 
+    return tgt_s.toShape()
+
+
+
+def match_surface_exact_g2(ref_face, tgt_face):
+    """Exact-by-construction G0/G1/G2 rebuild of tgt_face's edge nearest
+    ref_face, for knot-compatible boundary parametrizations.
+
+    Same shared pipeline as match_surface_exact_g1 (side detection,
+    trim guard, BSpline conversion, knot harmonization, degree
+    elevation -- see _exact_match_prep), then copies the first THREE
+    pole rows from ref's edge instead of two. Why three rows is exact:
+    after harmonization both surfaces share the along-edge knot
+    vector, and with harmonize_cross=True they also share the
+    cross-boundary knot vector and cross degree -- so the
+    cross-boundary first and second derivatives at any edge point are
+    fixed linear combinations of the boundary-adjacent pole rows with
+    IDENTICAL coefficients on both sides. Equal rows 0-2 therefore
+    equalize position, first and second cross derivatives exactly:
+    G0/G1/G2 by construction, not by sampling. Verify on the returned
+    faces with surface_deviation()/classify_continuity() -- the same
+    QA step every other match path requires.
+
+    Scope honesty (the caveat match_surface_exact_g1's docstring
+    raises, applied here): the third row IS forced from ref, so tgt
+    is reshaped up to two rows deep from the seam; everything
+    interior to that keeps tgt's own poles exactly (harmonization and
+    degree elevation are exact refinements -- they change pole
+    counts, never the shape). If tgt's interior fights the copied
+    rows (visible unfairness near the seam), use
+    match_surface(continuity="G2") and verify numerically instead.
+
+    ANALYTIC REFERENCES: a curved analytic ref (cylinder, sphere,
+    ...) is interpolated over the face's parameter range before
+    matching (exact for planes, an approximation for curved
+    analytics) -- and curvature AMPLIFIES conversion error, so QA
+    against the raw analytic face can show a large max_g2 even when
+    the match itself is exact. Grade the match against the converted
+    surface the matcher saw (or pre-fit a dense BSpline yourself);
+    conversion mechanics have their own dedicated test.
+
+    Trimmed faces are refused with ValueError, like exact_g1: the
+    row copy has no concept of trimming. Raises ValueError (never a
+    silent wrong answer) whenever any step can't be satisfied, so
+    callers fall back to match_surface()'s sampled, trim-aware path
+    -- see match_surface_to_references(), which tries this function
+    first for G2 requests and records which path fired in its report
+    (key "method": "exact_g2").
+    """
+    fname = "match_surface_exact_g2"
+    ref_s, tgt_s, rs, ts, _riu, _tiu, n_along = _exact_match_prep(
+        ref_face, tgt_face, fname, harmonize_cross=True)
+    for depth in range(3):
+        for along in range(n_along):
+            ri, rj = _pole_ij_match(rs, depth, along,
+                                    ref_s.NbUPoles, ref_s.NbVPoles)
+            ti, tj = _pole_ij_match(ts, depth, along,
+                                    tgt_s.NbUPoles, tgt_s.NbVPoles)
+            tgt_s.setPole(ti, tj, ref_s.getPole(ri, rj))
     return tgt_s.toShape()
 
 
@@ -1656,5 +1891,10 @@ __all__ = [
     'match_surface',
     'match_surface_to_references',
     'match_surface_exact_g1',
+    'match_surface_exact_g2',
+    '_pole_ij_match',
+    '_as_bspline_match',
+    '_harmonize_match_knots',
+    '_exact_match_prep',
     'blend_surface',
 ]
