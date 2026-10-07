@@ -2143,6 +2143,153 @@ def test_sketch3d_slice_projection_follows_source():
     out("  slice projection OK  section follows source")
 
 
+def test_constraint_violations_per_constraint():
+    """issues.md #8: per-constraint violation magnitudes aligned 1:1
+    with the constraint list -- satisfied sets read ~0, a violated dim
+    shows up ONLY on its own entry, 'fix' always reads 0 (it pins, it
+    doesn't solve), and corrupt indices never raise (badges must not
+    break the panel)."""
+    a, b, c = Vector(0, 0, 0), Vector(10, 0, 0), Vector(0, 5, 0)
+    pts = [a, b, c]
+    cons = [("distance", 0, 1, 10.0),     # satisfied: |a-b| = 10
+            ("distance", 1, 2, 25.0),     # violated: |b-c| = ~11.18
+            ("fix", 0)]                   # pins, never a violation
+    v = core.constraint_violations(pts, cons)
+    assert len(v) == 3, v
+    assert abs(v[0]) < 1e-9, v
+    assert abs(v[1] - abs(b.distanceToPoint(c) - 25.0)) < 1e-9, v
+    assert v[2] == 0.0, v
+    # corrupt index -> 0.0, not an exception
+    assert core.constraint_violations(pts, [("distance", 0, 9, 1.0)]) == \
+        [0.0]
+    # point indices used to tint the involved point-table rows
+    assert tuple(core.constraint_point_indices(("distance", 0, 1, 5.0))) \
+        == (0, 1)
+    assert tuple(core.constraint_point_indices(("mirror", 2, 3, 1, 0, 0,
+                                                5.0, 0.0))) == (2, 3)
+    out("  per-constraint viol OK  bad=%.3f mm" % v[1])
+
+
+def test_sketch3d_pierce_and_onsurf_follow_source():
+    """issues.md #7 (pierce / on surface): points are re-derived from
+    the CURRENT source on every recompute through the #14 machinery --
+    pierce to the plane-edge crossing, face-pierce to the nearest point
+    of the plane n face section curve, on-surface to the face's nearest
+    point -- and follow their sources when they move. An edge that
+    never crosses the plane leaves its point free (untouched)."""
+    from rfstudio import panel_logic
+    from rfstudio.panel_sketch3d import make_sketch3d_obj
+    doc = FreeCAD.newDocument("Pierce7")
+    box = doc.addObject("Part::Box", "P7Box")
+    box.Length, box.Width, box.Height = 10.0, 6.0, 4.0
+    cross = doc.addObject("Part::Feature", "P7Cross")
+    cross.Shape = Part.makePolygon(
+        [Vector(2, 3, -5), Vector(2, 3, 5)])      # crosses z=2
+    nop = doc.addObject("Part::Feature", "P7NoCross")
+    nop.Shape = Part.makePolygon(
+        [Vector(4, 4, 3), Vector(6, 4, 3)])       # parallel to z=2 plane
+    doc.recompute()
+
+    def _face_name(shape, want):
+        for i, f in enumerate(shape.Faces):
+            u0, u1, v0, v1 = f.ParameterRange
+            n = f.normalAt((u0 + u1) / 2.0, (v0 + v1) / 2.0)
+            if want((n.x, n.y, n.z)):
+                return "Face%d" % (i + 1)
+        raise AssertionError("no matching face")
+
+    side_name = _face_name(box.Shape, lambda t: t[0] > 0.9)   # x-max wall
+    top_name = _face_name(box.Shape, lambda t: t[2] > 0.9)    # top wall
+    obj = make_sketch3d_obj("Mixed", doc=doc)
+    # start every relation point OFF its target: recompute must compute
+    obj.Points = [Vector(9, 9, 9), Vector(10, 3, 9),
+                  Vector(5, 5, 9), Vector(7, 7, 7)]
+    obj.SegmentTypes = ["Line"] * 3
+    obj.Bulges = ["0.0"] * 3
+    obj.ProjectedRefs = [
+        panel_logic.encode_proj_ref("pierce", cross.Name, "Edge1",
+                                    0.0, None),
+        panel_logic.encode_proj_ref("pierce", box.Name, side_name,
+                                    0.0, None),
+        panel_logic.encode_proj_ref("onsurf", box.Name, top_name,
+                                    0.0, None),
+        panel_logic.encode_proj_ref("pierce", nop.Name, "Edge1",
+                                    0.0, None),
+    ]
+    obj.ExternalSources = [cross, box, nop]
+    obj.PlaneOrigin = Vector(0.0, 0.0, 2.0)
+    obj.PlaneNormal = Vector(0.0, 0.0, 1.0)
+    doc.recompute()
+
+    def _has(pt, tol=1e-6):
+        return any((v.Point - pt).Length < tol
+                   for v in obj.Shape.Vertexes)
+
+    got = [v.Point for v in obj.Shape.Vertexes]
+    assert _has(Vector(2, 3, 2)), got       # edge pierce = crossing point
+    assert _has(Vector(10, 3, 2)), got      # face pierce on the section
+    assert _has(Vector(5, 5, 4)), got       # onsurf on the top face
+    assert _has(Vector(7, 7, 7)), got       # never crosses -> stayed free
+    # move every source +7x: relations must FOLLOW
+    box.Placement.Base = Vector(7.0, 0.0, 0.0)
+    cross.Placement.Base = Vector(7.0, 0.0, 0.0)
+    doc.recompute()
+    got = [v.Point for v in obj.Shape.Vertexes]
+    assert _has(Vector(9, 3, 2)), got       # edge pierce followed
+    assert _has(Vector(17, 3, 2)), got      # face pierce followed
+    assert _has(Vector(12, 5, 4)), got      # onsurf followed
+    assert _has(Vector(7, 7, 7)), got       # free point untouched
+    FreeCAD.closeDocument(doc.Name)
+    out("  pierce/onsurf     OK  all relations follow their sources")
+
+
+def test_sketch3d_silhouette_follows_source():
+    """issues.md #14 (silhouette projection): the edge-level silhouette
+    of a box along +Z is its 8 rim edges (adjacent facing signs differ:
+    front/back/grazing), a sampled point re-derives from the source on
+    recompute, and the outline follows the solid when it moves."""
+    from rfstudio import panel_logic
+    from rfstudio.panel_sketch3d import make_sketch3d_obj, \
+        _silhouette_edges
+    doc = FreeCAD.newDocument("Sil14")
+    box = doc.addObject("Part::Box", "SilBox")
+    box.Length, box.Width, box.Height = 10.0, 6.0, 4.0
+    doc.recompute()
+    sil = _silhouette_edges(box.Shape, (0.0, 0.0, 1.0))
+    assert len(sil) == 8, len(sil)   # top rim (4) + bottom rim (4)
+    e = sil[0]
+    frac = 0.5
+    mid = e.valueAt(e.FirstParameter +
+                    (e.LastParameter - e.FirstParameter) * frac)
+    origin, normal = (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)
+    q0 = panel_logic.project_point_along(
+        (mid.x, mid.y, mid.z), origin, normal)
+    obj = make_sketch3d_obj("Mixed", doc=doc)
+    obj.Points = [Vector(*q0), Vector(50.0, 50.0, 0.0)]
+    obj.SegmentTypes = ["Line"]
+    obj.Bulges = ["0.0"]
+    obj.ProjectedRefs = [
+        panel_logic.encode_proj_ref("sil", box.Name, "0", frac, None), ""]
+    obj.ExternalSources = [box]
+    obj.PlaneOrigin = Vector(*origin)
+    obj.PlaneNormal = Vector(*normal)
+    doc.recompute()
+    v0, d0 = _closest_vertex_point(obj.Shape, Vector(*q0))
+    assert d0 < 1e-6, "silhouette point wrong: %r" % d0
+    on_rim = (abs(v0.x - 0.0) < 1e-6 or abs(v0.x - 10.0) < 1e-6 or
+              abs(v0.y - 0.0) < 1e-6 or abs(v0.y - 6.0) < 1e-6)
+    assert on_rim, "point not on the box rim: %s" % v0
+    # move the solid: outline follows
+    box.Placement.Base = Vector(5.0, 0.0, 0.0)
+    doc.recompute()
+    moved = panel_logic.project_point_along(
+        (mid.x + 5.0, mid.y, mid.z), origin, normal)
+    v0b, d0b = _closest_vertex_point(obj.Shape, Vector(*moved))
+    assert d0b < 1e-6, "silhouette did NOT follow: %r" % d0b
+    FreeCAD.closeDocument(doc.Name)
+    out("  silhouette        OK  8 rim edges, outline follows source")
+
+
 def test_solve_point_constraints_tangent():
     """Tangent constraint: i-j-k must be collinear. With pinned j,
     moving k should bring i into alignment."""
@@ -2671,6 +2818,9 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_sketch3d_dim_solve_drives_points,
               test_sketch3d_assoc_projection_follows_source,
               test_sketch3d_slice_projection_follows_source,
+              test_constraint_violations_per_constraint,
+              test_sketch3d_pierce_and_onsurf_follow_source,
+              test_sketch3d_silhouette_follows_source,
               test_solve_point_constraints_tangent,
               test_solve_point_constraints_concentric,
               test_solve_point_constraints_symmetric,

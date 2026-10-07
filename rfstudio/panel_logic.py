@@ -199,7 +199,7 @@ def solver_status_text(status):
     "rank"}) -- issues.md #8 (per-entity diagnostics), the low-risk
     slice: surface the solver verdict that already exists on the
     status line instead of leaving it in a dict nobody reads. The
-    per-constraint highlighting half of #8 comes later.
+    per-constraint half of #8 is constraint_badges() below.
 
     Pure dict -> str, no FreeCAD/numpy needed: headless-testable in
     test_panel_logic. Unknown/empty state yields "" so callers can
@@ -227,6 +227,26 @@ def solver_status_text(status):
     if state == "unknown":
         return "solver verdict unavailable (numpy missing)"
     return ""
+
+
+# issues.md #8 badge threshold: satisfied sets land ~1e-9 after a solve,
+# so 1e-4 (mm for positions, rad for angles) has huge headroom while
+# any human-visible misplacement clears it by orders of magnitude.
+_BADGE_TOL = 1e-4
+
+
+def constraint_badges(violations, tol=_BADGE_TOL):
+    """issues.md #8 (per-constraint badges): True = constraint visibly
+    violated at the CURRENT point positions (panel paints it red),
+    False = satisfied within tolerance. Input is the per-constraint
+    list from core.constraint_violations, aligned 1:1 with the
+    constraints.
+
+    Pure list[float] -> list[bool] so the badge decision is testable
+    headlessly; on the live panel this means dragging a point off its
+    dim turns the badge red BEFORE accept (recompute re-solves and
+    clears it)."""
+    return [abs(v) > tol for v in (violations or [])]
 
 
 def points_are_planar(points, tol=1e-6):
@@ -647,7 +667,7 @@ def project_point_along(pt, origin, normal, direction=None):
     return (pt[0] + s * dx, pt[1] + s * dy, pt[2] + s * dz)
 
 
-# --- associative projection refs (issue #14) ---------------------------- #
+# --- associative projection refs (issues #14 / #7) --------------------- #
 # One string per point on Sketch3DFP.ProjectedRefs, '' = free point:
 #   'edge|<ObjectName>|EdgeN|<frac>|<n|d>|<dir>'   source edge, frac is
 #       the normalized parameter (0..1 across First..Last) so a rebuilt
@@ -655,6 +675,12 @@ def project_point_along(pt, origin, normal, direction=None):
 #       spot.
 #   'slice|<ObjectName>|<edgeIndex>|<frac>|<n|d>|<dir>'  cross-section
 #       edge from plane-of-sketch intersecting the source shape.
+#   'sil|<ObjectName>|<edgeIndex>|<frac>|<n|d>|<dir>'  silhouette edge
+#       (edges whose adjacent faces disagree in facing along <dir>).
+#   'pierce|<ObjectName>|EdgeN/FaceN|0|n|'  plane-edge crossing /
+#       plane-face intersection curve point (issue #7).
+#   'onsurf|<ObjectName>|FaceN|0|n|'  nearest point on the face
+#       (issue #7); t/mode/dir unused (0 / 'n' / '').
 # mode 'n' = project along the persisted plane normal, 'd' = along the
 # stored direction vector (captured view direction at project time) --
 # both deterministic across recompute.
@@ -683,7 +709,8 @@ def parse_proj_ref(ref):
     if len(parts) != _PROJ_REF_FIELDS:
         return None
     kind, obj_name, locator, t_s, mode, dir_s = parts
-    if kind not in ("edge", "slice") or not obj_name or not locator:
+    if kind not in ("edge", "slice", "sil", "pierce", "onsurf") or \
+            not obj_name or not locator:
         return None
     try:
         t = float(t_s)

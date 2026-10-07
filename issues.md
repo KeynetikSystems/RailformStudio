@@ -3,6 +3,47 @@
 Tracked gaps, ordered by severity. Each entry links to where the
 limitation lives in code so it doesn't have to be rediscovered.
 
+## Suggested priority map (annotation, not a renumber)
+
+Renumbering would break CHANGELOG/commit references — statuses are
+appended per issue instead. Cross-issue view as of 2026-10:
+
+- **Done:** #1 (trim guard hardened, see its Update), #2 (GUI harness:
+  6 static checks + mutation selftest), #13 (trim-aware exact G2),
+  #14 (associative projection, slice, direction modes, silhouette).
+- **Major slice landed, remainder open:** #7 (pierce + on-surface
+  via re-derive; tangent-to-face still needs a solver direction
+  constraint), #8 (global verdict + per-constraint/point badges;
+  per-DOF breakdown, drag-to-diagnose, auto-repair open).
+- **P1 next:** #9 (3D-spline handles), #10 (equation manager — design
+  it platform-wrapped, see Conventions below). *If daily civil/track
+  work leans on equations, #10 swaps ahead of #9.*
+- **P2:** #15 (configs, builds on #10), #11 (multi-plane), #12
+  (assembly context — reuses the #7 external-ref machinery), #16
+  (multi-body).
+- **Open small:** #3 (star-patch G2), #4 (field-testing), #5 (mirror
+  welding), #6 (startup skip).
+
+## Conventions for closing issues
+
+**Record-on-object (the in-place template).** Parametric behavior that
+must survive document reloads is stored as index-aligned string lists
+on the FP object (`PolylineFP.Fillets`, `Sketch3DFP.ProjectedRefs`,
+`Constraints`) and rebuilt in `execute()` on recompute. Invariants:
+keep the record 1:1 with its index base at EVERY mutation point
+(add/remove/mirror/undo/template/merge — pad with `''`, pop, snapshot);
+store plain strings (repr floats, `|` separators) so documents stay
+portable; degrade gracefully on missing/corrupt entries (free point,
+never a failed recompute).
+
+**Platform-wrap (decide before building evaluators).** Prefer FreeCAD's
+own expression engine / Assembly workbench / TechDraw where they fit.
+Split for #10/#15: expression *evaluation* should wrap FreeCAD
+expressions (months saved); *suppression state* (config-dependent
+on/off) has no platform support and stays in our records. #12 is
+external references (cross-document links + the #7/#14 re-derive
+machinery) — not Assembly WB constraint solving.
+
 ## 1. `match_surface_exact_g1` trim guard is currently inert
 
 `core.match_surface_exact_g1` refuses (ValueError) when the matched
@@ -112,6 +153,24 @@ Jacobian contributions.
 Gate: enables true in-context design (brackets, ribs, cutouts referencing
 adjacent parts).
 
+**Status (implemented, 2 of 3 bullets):** pierce and On Surface landed
+WITHOUT the solver Jacobian work this issue originally assumed — they
+use the #14 record/re-derive machinery: refs in `ProjectedRefs`
+(`pierce|obj|EdgeN/FaceN|0|n|`, `onsurf|obj|FaceN@u,v|0|n|`) resolved in
+`Sketch3DFP.execute()` and pinned in the solve (enforcement =
+re-projection). Pierce = plane-edge crossing via sampled bisection
+(`_pierce_point`) or, for a face, the nearest point of the plane ∩ face
+section (`_nearest_on_edges`); never-crossing edges leave the point
+free. On Surface anchors in the face's **parameter space** (UV learned
+on first derive, range-checked every recompute, nearest-point fallback
+when the source rebuilds) so the point travels with the face through
+translation AND rotation instead of clamping at the face boundary.
+Panel: `pt#` spinbox + "Pierce to selection" / "On face to selection"
+in Advanced. Headless: `test_sketch3d_pierce_and_onsurf_follow_source`.
+Still open: **Tangent to Face** — a direction constraint needs a real
+Jacobian contribution in `core/constraints.py` (not expressible as a
+point re-derive).
+
 ## 8. Per-entity under/over-defined diagnostics — single biggest daily usability gap
 
 Current `rfstudio/panel_sketch3d.py` shows only a global readiness string
@@ -135,9 +194,18 @@ seconds of looking.
 the current points/constraints and `panel_logic.solver_status_text`
 appends "well-defined (N DOF)" / "under-defined: X of Y DOF free" /
 "over-defined: constraints conflict — remove or relax one" to the
-status line whenever dims exist. Still open: per-row badges,
-per-constraint highlighting, drag-to-diagnose, auto-repair (needs the
-per-DOF Jacobian breakdown the status dict doesn't expose yet).
+status line whenever dims exist. **Per-constraint badges landed:**
+`core.constraint_violations` (per-constraint max-|residual|, aligned
+with the constraint list; `fix` = 0, corrupt entries = 0, never
+raises) + `panel_logic.constraint_badges` (1e-4 threshold) paint
+violated dims light-red in the dim list AND tint the point-table rows
+of the points they touch (`_apply_constraint_badges`), live at the
+un-solved positions — drag a point off a dim and it goes red before
+accept (recompute clears it); the status line counts them
+("N off-target (red)"). Headless: `test_constraint_violations_per_constraint`,
+`test_constraint_badges`. Still open: true per-row under/over/fully
+badges, drag-to-diagnose, auto-repair (need the per-DOF Jacobian rank
+breakdown the status dict doesn't expose yet).
 
 ## 9. 3D spline handles with G2/G3 feedback — makes 3D splines actually editable
 
@@ -246,6 +314,15 @@ matched boundary edge is a subset of the surface's natural boundary.
 Gate: without this, any Class-A patch meeting a trimmed edge
 falls back to sampled approximation, losing exact G2 at the seam.
 
+**Status (implemented):** `_side_is_trimmed` compares against the
+surface's natural parameterization bounds (BSpline knots, analytic
+extents) instead of the possibly-reparameterized face range, and both
+exact-g1/_g2 additionally run `_matched_edges_compatible` (geometric
+edge-congruence check) — trimmed or mismatched inputs now refuse with
+ValueError and fall back to sampled, trim-aware matching instead of
+silently pretending. Pinned by `test_match_surface_exact_g1_rejects_
+trimmed_boundary` and the exact-g2 reject/fallback tests.
+
 ## 14. Convert entities / project to sketch — project 3D edges into active sketch
 
 Sketch3D panel has "Project selected edges" but it only samples
@@ -264,7 +341,7 @@ points and drops them on the construction plane. Missing:
 Gate: without constrained projection, projected geometry is
 "dumb" — it doesn't update when the source geometry changes.
 
-**Status (implemented, 3 of 4 bullets):**
+**Status (implemented, 4 of 4 bullets):**
 
 - **Project with constraints** — each projected point now stores an
   associative ref (`Sketch3DFP.ProjectedRefs`, `edge|obj|EdgeN|frac|
@@ -280,13 +357,19 @@ Gate: without constrained projection, projected geometry is
 - **Intersection curve projection** — new "Slice by sketch plane"
   button cuts the selected solids with the construction plane
   (`slice` refs, re-cut on recompute).
-- **Silhouette projection** — still open (needs outline extraction of
-  the projected solid; deferred).
+- **Silhouette projection** — "Silhouette" button: edge-level
+  silhouette (`_silhouette_edges` — edges whose adjacent faces disagree
+  in facing along the projection direction; front/back/grazing sign
+  test on face-center normals), stored as `sil` refs and re-derived on
+  recompute. Exact for polyhedral solids; on smooth surfaces the true
+  silhouette crosses face interiors, which BREP edges can't represent —
+  documented approximation, use Slice there.
 
 Verified: `test_panel_logic.py` (project-along + ref codec),
 `test_core.py` (assoc projection follows a moved source with the dim
-still solved; slice section follows a moved solid). Refs stay 1:1 with
-rows across add/remove/mirror/undo/template/merge.
+still solved; slice section follows a moved solid; box silhouette = 8
+rim edges and follows its source). Refs stay 1:1 with rows across
+add/remove/mirror/undo/template/merge.
 
 ## 15. Configuration-aware equation manager — design tables with suppression
 

@@ -163,6 +163,31 @@ def _constraint_residuals(pts, constraints):
     return res
 
 
+def constraint_point_indices(c):
+    """Public accessor for the point indices one constraint references
+    (issues.md #8 -- the panel tints the involved point-table rows)."""
+    return _constraint_point_indices(c)
+
+
+def constraint_violations(pts, constraints):
+    """Per-constraint violation at the current point positions, aligned
+    1:1 with `constraints`: max |residual| over each constraint's own
+    flat residual entries (mixed units -- mm for positions, radians for
+    angles; fine for badge thresholding). issues.md #8: satisfiable sets
+    converge to ~0, conflicting (over-defined) sets stay visibly
+    non-zero; 'fix' is always 0.0 (it pins, it doesn't solve). A
+    constraint that can't even be evaluated (corrupt indices) reports
+    0.0 rather than raising -- badges must never break the panel."""
+    out = []
+    for c in constraints:
+        try:
+            res = _constraint_residuals(pts, [c])
+        except Exception:
+            res = []
+        out.append(max((abs(x) for x in res), default=0.0))
+    return out
+
+
 
 def _relax_point_constraints(pts, constraints, pinned, max_iter):
     """Faithful port of the panel's original Jacobi relaxation, kept as a
@@ -585,6 +610,8 @@ __all__ = [
     '_constraint_point_indices',
     '_constraint_residuals',
     '_relax_point_constraints',
+    'constraint_point_indices',
+    'constraint_violations',
     'solve_point_constraints',
     'rolling_ball_fillet',
     'multi_rail_fillet',

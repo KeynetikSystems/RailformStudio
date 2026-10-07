@@ -353,6 +353,42 @@ def test_proj_ref_roundtrip():
     out("  proj ref codec  OK")
 
 
+def test_proj_ref_relation_kinds():
+    """Issues #7/#14: the relation kinds (pierce, onsurf, sil) share the
+    same codec; t/mode/dir stay deterministic (0 / 'n' / '') because
+    pierce and on-surface are computed against the persisted plane /
+    raw point, not against a captured camera direction."""
+    for kind, loc in (("pierce", "Edge5"), ("pierce", "Face2"),
+                      ("onsurf", "Face6"), ("sil", "3")):
+        ref = panel_logic.encode_proj_ref(kind, "Pad001", loc, 0.0, None)
+        info = panel_logic.parse_proj_ref(ref)
+        assert info is not None, ref
+        assert info["kind"] == kind and info["locator"] == loc, info
+        assert info["t"] == 0.0 and info["direction"] is None, info
+    # a sil ref MAY carry a captured view direction
+    info = panel_logic.parse_proj_ref(panel_logic.encode_proj_ref(
+        "sil", "Pad001", "3", 0.5, (0.0, 0.0, -1.0)))
+    assert info["direction"] == (0.0, 0.0, -1.0), info
+    out("  relation ref kinds OK")
+
+
+def test_constraint_badges():
+    """issues.md #8: badge thresholding -- satisfied sets (even with
+    solver-noise residuals) stay green; any human-scale violation turns
+    red; empty/None input degrades to no badges."""
+    assert panel_logic.constraint_badges([]) == []
+    assert panel_logic.constraint_badges(None) == []
+    # post-solve noise (1e-9) and borderline solver convergence stay OK
+    assert panel_logic.constraint_badges([0.0, 1e-9, 1e-6]) == \
+        [False, False, False]
+    # a dragged-off dim (mm) and a skewed angle (rad) go red
+    assert panel_logic.constraint_badges([0.0, 0.25, 1e-3]) == \
+        [False, True, True]
+    # custom tolerance respected
+    assert panel_logic.constraint_badges([0.01], tol=0.1) == [False]
+    out("  constraint badges OK")
+
+
 if __name__ == "__main__" or True:  # freecadcmd may not set __main__
     for t in (test_readiness_ok, test_readiness_no_inputs_yet,
               test_readiness_below_minimum, test_readiness_above_maximum,
@@ -378,7 +414,9 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_mirror_plane_params_and_reflect,
               test_project_point_to_plane,
               test_project_point_along,
-              test_proj_ref_roundtrip):
+              test_proj_ref_roundtrip,
+              test_proj_ref_relation_kinds,
+              test_constraint_badges):
         try:
             t()
         except Exception as e:

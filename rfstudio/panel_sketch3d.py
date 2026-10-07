@@ -167,15 +167,208 @@ def _plane_slice_edges(shape, origin, normal):
     return edges
 
 
+def _pierce_point(edge, origin, normal, samples=48):
+    """issues.md #7 (pierce): the point where the edge first crosses the
+    plane (origin, normal) -- sampled sign-change + bisection, so any
+    curve type works (line, arc, spline). None when the edge never
+    crosses (parallel / entirely on one side), which callers treat as
+    'point stays free' instead of an error."""
+    ox, oy, oz = origin
+    nx, ny, nz = normal
+
+    def s(u):
+        p = edge.valueAt(u)
+        return ((p.x - ox) * nx + (p.y - oy) * ny + (p.z - oz) * nz)
+
+    u0, u1 = edge.FirstParameter, edge.LastParameter
+    prev_u, prev_s = u0, s(u0)
+    if abs(prev_s) < 1e-12:
+        return edge.valueAt(u0)
+    for k in range(1, samples + 1):
+        u = u0 + (u1 - u0) * k / float(samples)
+        cur_s = s(u)
+        if abs(cur_s) < 1e-12:
+            return edge.valueAt(u)
+        if prev_s * cur_s < 0.0:
+            lo, hi, slo = prev_u, u, prev_s
+            for _ in range(60):
+                mid = 0.5 * (lo + hi)
+                sm = s(mid)
+                if sm == 0.0 or (hi - lo) < 1e-14:
+                    return edge.valueAt(mid)
+                if slo * sm < 0.0:
+                    hi = mid
+                else:
+                    lo, slo = mid, sm
+            return edge.valueAt(0.5 * (lo + hi))
+        prev_u, prev_s = u, cur_s
+    return None
+
+
+def _nearest_on_face(pt, face):
+    """issues.md #7 (On Surface): the closest point on `face` to pt,
+    or None when the query fails. Tracked against the CURRENT raw point
+    each recompute, so the point follows the face when the source body
+    moves."""
+    try:
+        import Part
+        from FreeCAD import Vector
+        v = Part.Vertex(Vector(pt[0], pt[1], pt[2]))
+        q = v.distToShape(face)[1][0][1]   # (vertex point, face point)
+        return (q.x, q.y, q.z)
+    except Exception:
+        return None
+
+
+def _nearest_on_edges(pt, edges):
+    """issues.md #7 (pierce to a FACE): closest point to pt among the
+    plane n face intersection edges (nearest branch of the intersection
+    curve), or None when there is no crossing."""
+    if not edges:
+        return None
+    try:
+        import Part
+        from FreeCAD import Vector
+        v = Part.Vertex(Vector(pt[0], pt[1], pt[2]))
+        best, bd = None, None
+        for e in edges:
+            res = v.distToShape(e)
+            d, q = res[0], res[1][0][1]
+            if bd is None or d < bd:
+                bd, best = d, (q.x, q.y, q.z)
+        return best
+    except Exception:
+        return None
+
+
+def _onsurf_point(pt, shape, locator):
+    """issues.md #7 (On Surface) resolution. Prefers the face's UV
+    anchor stored in the locator ('Face6@u,v'): parameter-space anchoring
+    makes the point travel WITH the face (translation AND rotation --
+    SolidWorks' on-surface semantics), instead of being re-snapped from
+    a stale world position (which clamps at the face boundary once the
+    face moves away). A bare 'FaceN' (first derive) or an out-of-range
+    UV (source rebuilt) falls back to the nearest point and returns the
+    refined locator so the anchor can be persisted into ProjectedRefs.
+
+    Returns (point or None, refined locator or None -- None = no
+    rewrite needed)."""
+    try:
+        base = locator.split("@", 1)[0]
+        face = shape.getElement(base)
+    except Exception:
+        return None, None
+    if "@" in locator:
+        try:
+            u_s, v_s = locator.split("@", 1)[1].split(",")
+            u, v = float(u_s), float(v_s)
+            u0, u1, v0, v1 = face.ParameterRange
+            eu = max(u1 - u0, 1e-9)
+            ev = max(v1 - v0, 1e-9)
+            if (u0 - 1e-6 * eu <= u <= u1 + 1e-6 * eu and
+                    v0 - 1e-6 * ev <= v <= v1 + 1e-6 * ev):
+                q = face.valueAt(min(max(u, u0), u1),
+                                 min(max(v, v0), v1))
+                return (q.x, q.y, q.z), None   # anchor valid: done
+        except Exception:
+            pass
+        # stale/rebuilt UV: fall through to a fresh nearest-point derive
+    target = _nearest_on_face(pt, face)
+    if target is None:
+        return None, None
+    refined = None
+    try:
+        u, v = face.Surface.parameter(FreeCAD.Vector(*target))
+        refined = "%s@%r,%r" % (base, u, v)
+    except Exception:
+        pass   # unparametrizable surface: keep nearest-point behavior
+    return target, refined
+
+
+def _update_ref_locator(obj, i, locator):
+    """Persist a refined locator (the face's learned @u,v anchor) back
+    into ProjectedRefs entry i -- compare first so an unchanged value
+    never re-touches the object on every recompute."""
+    try:
+        refs = list(obj.ProjectedRefs)
+        if i >= len(refs):
+            return
+        parts = refs[i].split("|")
+        if len(parts) != 6 or parts[2] == locator:
+            return
+        parts[2] = locator
+        refs[i] = "|".join(parts)
+        obj.ProjectedRefs = refs
+    except Exception:
+        pass
+
+
+def _silhouette_edges(shape, direction):
+    """issues.md #14 (silhouette projection): the edges separating faces
+    that face `direction` from faces that face away (adjacent facing
+    signs differ, 0 = grazing) -- the edge-level silhouette of the
+    shape. Exact for polyhedral solids; on smooth surfaces the true
+    silhouette crosses face interiors, which BREP edges can't represent
+    (use 'Slice by sketch plane' there instead).
+
+    Order follows shape.Edges filtered, so silhouette refs by index are
+    deterministic for a given shape+direction. Returns [] for shapes
+    without faces."""
+    dx, dy, dz = direction
+    ln = (dx * dx + dy * dy + dz * dz) ** 0.5
+    if ln < 1e-12:
+        return []
+    dx, dy, dz = dx / ln, dy / ln, dz / ln
+
+    def _sign(x, eps=1e-9):
+        return 1 if x > eps else (-1 if x < -eps else 0)
+
+    def _face_sign(f):
+        try:
+            u0, u1, v0, v1 = f.ParameterRange
+            n = f.normalAt((u0 + u1) / 2.0, (v0 + v1) / 2.0)
+            return _sign(n.x * dx + n.y * dy + n.z * dz)
+        except Exception:
+            return 0   # unmeasurable face counts as grazing
+    try:
+        faces = list(shape.Faces)
+    except Exception:
+        return []
+    if not faces:
+        return []
+    edge_faces = []   # (face edge, facing sign) flattened across faces
+    for f in faces:
+        s = _face_sign(f)
+        for fe in f.Edges:
+            edge_faces.append((fe, s))
+    out = []
+    try:
+        for e in shape.Edges:
+            signs = [s for (fe, s) in edge_faces if e.isSame(fe)]
+            if len(signs) >= 2 and any(s != signs[0] for s in signs[1:]):
+                out.append(e)
+    except Exception:
+        return []
+    return out
+
+
 def _reproject_points(obj, raw_pts, panel_logic):
-    """Issue #14 core: rewrite every point carrying a ProjectedRefs entry
-    from its CURRENT source geometry (edge point at the stored fraction,
-    or a plane slice edge) projected onto the persisted projection
-    plane. Returns the set of point indices actually re-projected --
-    those get solver-pinned (the source drives them). A deleted/missing
-    source or unresolvable ref leaves the point untouched and FREE, so
-    losing a reference degrades gracefully instead of failing the
-    recompute."""
+    """Issues #14/#7 core: rewrite every point carrying a ProjectedRefs
+    entry from its CURRENT source geometry:
+
+      edge  -- source edge at the stored parameter fraction, projected
+               onto the persisted plane (associative projection #14);
+      slice -- re-cut section edge of plane n shape (#14);
+      sil   -- silhouette edge along the stored direction (#14);
+      pierce-- plane n edge/face intersection point, tracked to the
+               nearest branch of the current raw point (#7);
+      onsurf-- nearest point on the face to the current raw point (#7).
+
+    Returns the set of point indices actually re-derived -- those get
+    solver-pinned (the source drives them, exactly like an on-curve
+    constraint). A deleted/missing source or unresolvable ref leaves the
+    point untouched and FREE, so losing a reference degrades gracefully
+    instead of failing the recompute."""
     refs = list(getattr(obj, "ProjectedRefs", []) or [])
     if not refs:
         return set()
@@ -184,6 +377,7 @@ def _reproject_points(obj, raw_pts, panel_logic):
         normal = (obj.PlaneNormal.x, obj.PlaneNormal.y, obj.PlaneNormal.z)
     except Exception:
         return set()
+    from FreeCAD import Vector
     doc = obj.Document
     ok = set()
     for i, ref in enumerate(refs):
@@ -197,21 +391,59 @@ def _reproject_points(obj, raw_pts, panel_logic):
             shape = getattr(src, "Shape", None)
             if shape is None or shape.isNull():
                 continue
-            if info["kind"] == "edge":
+            kind = info["kind"]
+            if kind in ("pierce", "onsurf"):
+                # Issue #7: computed against the CURRENT raw point
+                # (nearest-branch tracking), no plane projection step.
+                raw = (raw_pts[i].x, raw_pts[i].y, raw_pts[i].z)
+                refined = None
+                if kind == "pierce":
+                    loc = info["locator"]
+                    if loc.startswith("Edge"):
+                        target = _pierce_point(
+                            shape.getElement(loc), origin, normal)
+                    elif loc.startswith("Face"):
+                        target = _nearest_on_edges(
+                            raw, _plane_slice_edges(
+                                shape.getElement(loc), origin, normal))
+                    else:
+                        target = None
+                else:   # onsurf: UV-anchored (travels with the face)
+                    target, refined = _onsurf_point(
+                        raw, shape, info["locator"])
+                    if refined is not None:
+                        _update_ref_locator(obj, i, refined)
+                if target is None:
+                    continue   # no crossing / query failed -> stays free
+                raw_pts[i] = Vector(target[0], target[1], target[2])
+                ok.add(i)
+                continue
+            if kind == "edge":
                 edge = shape.getElement(info["locator"])
-            else:   # slice
+                proj_dir = info["direction"]
+            elif kind == "slice":
                 edges = _plane_slice_edges(shape, origin, normal)
                 k = int(info["locator"])
                 if not (0 <= k < len(edges)):
                     continue
                 edge = edges[k]
+                proj_dir = None
+            else:   # sil
+                d = info["direction"]
+                if d is None:
+                    d = normal
+                sil = _silhouette_edges(shape, d)
+                k = int(info["locator"])
+                if not (0 <= k < len(sil)):
+                    continue
+                edge = sil[k]
+                proj_dir = d
             u0, u1 = edge.FirstParameter, edge.LastParameter
             p = edge.valueAt(u0 + (u1 - u0) * info["t"])
             q = panel_logic.project_point_along(
-                (p.x, p.y, p.z), origin, normal, info["direction"])
+                (p.x, p.y, p.z), origin, normal, proj_dir)
             if q is None:
                 continue
-            from FreeCAD import Vector
             raw_pts[i] = Vector(q[0], q[1], q[2])
             ok.add(i)
         except Exception:
@@ -590,6 +822,15 @@ class Sketch3DPanel(object):
                              "on recompute")
         slice_btn.clicked.connect(self._slice_selection)
         tool_row.addWidget(slice_btn)
+        sil_btn = QtWidgets.QPushButton("Silhouette")
+        sil_btn.setToolTip("Add the selected solids' silhouette outline "
+                           "(edges where adjacent faces disagree in "
+                           "facing along the projection direction) as "
+                           "associative rows (issue #14). Exact for "
+                           "polyhedral solids; smooth surfaces only "
+                           "contribute their edge-level approximation")
+        sil_btn.clicked.connect(self._silhouette_selection)
+        tool_row.addWidget(sil_btn)
         self.handoff_profile_btn = QtWidgets.QPushButton("Use as Loft profile")
         self.handoff_profile_btn.setToolTip("Accept the sketch, then open "
                                             "the Loft panel with this wire "
@@ -607,6 +848,31 @@ class Sketch3DPanel(object):
 
         self.adv_tools = _CollapsibleGroup("Advanced: project / handoff / templates / section", collapsed=True)
         self.adv_tools.content_layout.addLayout(tool_row)
+
+        # --- in-context relations (issues.md #7: pierce / on surface) ---- #
+        rel_row = QtWidgets.QHBoxLayout()
+        self.rel_point = QtWidgets.QSpinBox()
+        self.rel_point.setPrefix("pt# ")
+        self.rel_point.setRange(0, 999)
+        self.rel_point.setToolTip("Point-table row that 'Pierce' / "
+                                  "'On face' will attach to the selected "
+                                  "geometry (issue #7)")
+        rel_row.addWidget(self.rel_point)
+        pierce_btn = QtWidgets.QPushButton("Pierce to selection")
+        pierce_btn.setToolTip("Constrain the chosen point to where the "
+                              "selected edge (or face) crosses the sketch "
+                              "plane -- re-derived on every rebuild, so it "
+                              "follows the source (issue #7)")
+        pierce_btn.clicked.connect(lambda: self._apply_relation("pierce"))
+        rel_row.addWidget(pierce_btn)
+        onsurf_btn = QtWidgets.QPushButton("On face to selection")
+        onsurf_btn.setToolTip("Constrain the chosen point to lie on the "
+                              "selected face: it tracks the face's closest "
+                              "point and follows the face when the source "
+                              "body moves (issue #7)")
+        onsurf_btn.clicked.connect(lambda: self._apply_relation("onsurf"))
+        rel_row.addWidget(onsurf_btn)
+        self.adv_tools.content_layout.addLayout(rel_row)
 
         # --- templates / break-apart/merge / section view ------------------- #
         tool_row2 = QtWidgets.QHBoxLayout()
@@ -1176,6 +1442,52 @@ class Sketch3DPanel(object):
         except Exception:
             return ""
 
+    def _apply_constraint_badges(self, pts):
+        """issues.md #8 (per-constraint badges): paint every constraint
+        currently violated at the REAL (un-solved) point positions red
+        in the dim list, and tint the point-table rows of the points it
+        touches -- the 'which constraint is fighting me' answer, live
+        while dragging (recompute re-solves and clears the badges).
+        Returns the violated count so the status line can say how many.
+        Any failure degrades to no coloring, never to a broken panel;
+        when everything is satisfied the previous tinting is cleared."""
+        badges = []
+        violated_pts = set()
+        try:
+            if self._constraints:
+                from rfstudio import core
+                vecs = []
+                for p in pts:
+                    try:
+                        vecs.append(FreeCAD.Vector(p.x, p.y, p.z))
+                    except AttributeError:
+                        vecs.append(FreeCAD.Vector(p[0], p[1], p[2]))
+                constraints = panel_logic.resolve_constraint_expressions(
+                    self._constraints, getattr(self, "_variables", {}) or {},
+                    [(v.x, v.y, v.z) for v in vecs])
+                viol = core.constraint_violations(vecs, constraints)
+                badges = panel_logic.constraint_badges(viol)
+                for i, bad in enumerate(badges):
+                    if not bad or i >= len(constraints):
+                        continue
+                    for j in core.constraint_point_indices(constraints[i]):
+                        if 0 <= j < len(self._rows):
+                            violated_pts.add(j)
+            for i in range(self.dim_list.count()):
+                item = self.dim_list.item(i)
+                if item is None:
+                    continue
+                bad = i < len(badges) and badges[i]
+                item.setBackground(QtGui.QBrush(
+                    QtGui.QColor(250, 195, 195) if bad
+                    else QtGui.QColor(0, 0, 0, 0)))
+            for j, r in enumerate(self._rows):
+                r.widget.setStyleSheet(
+                    "background:#fadadd;" if j in violated_pts else "")
+        except Exception:
+            return 0
+        return sum(1 for b in badges if b)
+
     def _update_status(self):
         if not getattr(self, "_ready", False):
             return
@@ -1194,6 +1506,9 @@ class Sketch3DPanel(object):
         if len(loops) > 1:
             msg += "  | %d closed loops detected" % len(loops)
         msg += self._solver_diag(pts)
+        n_bad = self._apply_constraint_badges(pts)
+        if n_bad:
+            msg += "  | %d off-target (red)" % n_bad
         self.status.setText(msg)
         try:
             for b in (self.handoff_profile_btn, self.handoff_rail_btn):
@@ -2570,6 +2885,19 @@ class Sketch3DPanel(object):
 
     # ------------------------------------------------------------------ #
     # project model edges onto the construction plane
+    def _projection_direction(self):
+        """Captured projection direction for the current 'Along ...'
+        combo: None = straight down the plane normal (deterministic),
+        else the 3D view direction NOW -- stored per ref at project
+        time, so rebuilds never follow the camera around."""
+        try:
+            if "view" in self.proj_along.currentText().lower():
+                return tuple(FreeCADGui.ActiveDocument.ActiveView
+                             .getViewDirection())
+        except Exception:
+            pass
+        return None
+
     def _project_selection(self):
         """Sample the selected model edges and drop the projected points
         onto the construction plane as new Line rows, EACH carrying an
@@ -2584,13 +2912,7 @@ class Sketch3DPanel(object):
         except Exception as exc:
             self.status.setText("Project: no construction plane (%s)" % exc)
             return
-        direction = None
-        try:
-            if "view" in self.proj_along.currentText().lower():
-                direction = tuple(FreeCADGui.ActiveDocument.ActiveView
-                                  .getViewDirection())
-        except Exception:
-            direction = None
+        direction = self._projection_direction()
         try:
             sel = FreeCADGui.Selection.getSelectionEx()
         except Exception:
@@ -2735,6 +3057,154 @@ class Sketch3DPanel(object):
             "Sliced %d cross-section point(s) from %d shape(s) -- "
             "associative, rebuild re-cuts the section"
             % (len(pts), len(shapes)))
+
+    def _silhouette_selection(self):
+        """issues.md #14 (silhouette projection): sample each selected
+        shape's edge-level silhouette along the current projection
+        direction and add it as associative 'sil' rows -- the outline
+        re-derives from the source on every recompute, like the other
+        projection kinds."""
+        try:
+            origin, normal, _u, _v = self._plane_geometry()
+        except Exception as exc:
+            self.status.setText(
+                "Silhouette: no construction plane (%s)" % exc)
+            return
+        direction = self._projection_direction()
+        eff = direction if direction is not None else normal
+        try:
+            sel = FreeCADGui.Selection.getSelectionEx()
+        except Exception:
+            sel = []
+        shapes = []
+        for so in sel:
+            obj = getattr(so, "Object", None)
+            shp = getattr(obj, "Shape", None)
+            if obj is not None and shp is not None and \
+                    not shp.isNull() and getattr(shp, "Faces", None):
+                shapes.append((obj.Name, shp))
+        if not shapes:
+            self.status.setText(
+                "Silhouette: select one or more shapes with faces first")
+            return
+        pts = []
+        refs = []
+        for src_name, shp in shapes:
+            sil = _silhouette_edges(shp, eff)
+            for k, e in enumerate(sil):
+                try:
+                    u0, u1 = e.FirstParameter, e.LastParameter
+                except Exception:
+                    continue
+                for m in range(12):
+                    frac = m / 11.0
+                    t = u0 + (u1 - u0) * frac
+                    try:
+                        p = e.valueAt(t)
+                    except Exception:
+                        continue
+                    q = panel_logic.project_point_along(
+                        (p.x, p.y, p.z), origin, normal, direction)
+                    if q is None:
+                        continue
+                    pts.append(q)
+                    refs.append(panel_logic.encode_proj_ref(
+                        "sil", src_name, str(k), frac, direction))
+                if len(pts) + len(self._rows) > 200:
+                    break
+            if len(pts) + len(self._rows) > 200:
+                break
+        if not pts:
+            self.status.setText(
+                "Silhouette: no edge-level silhouette found (smooth "
+                "surface? use 'Slice by sketch plane' instead)")
+            return
+        self._push_undo()
+        self._undo_guard = True
+        try:
+            for p, ref in zip(pts, refs):
+                r = _PointRow(self, *p)
+                r.set_seg("Line")
+                self._rows.append(r)
+                self._proj_refs.append(ref)
+                self.rows_lay.addWidget(r.widget)
+        finally:
+            self._undo_guard = False
+        self._proj_plane = (tuple(origin), tuple(normal))
+        self._update_status()
+        self.status.setText(
+            "Silhouette: %d point(s) from %d shape(s) -- associative, "
+            "outline follows the source"
+            % (len(pts), len(shapes)))
+
+    def _selected_sub(self):
+        """(object name, subelement name, sub object) of the first
+        3D-view selection carrying an Edge/Face sub-element, else
+        (None, None, None)."""
+        try:
+            sel = FreeCADGui.Selection.getSelectionEx()
+        except Exception:
+            sel = []
+        for so in sel:
+            obj = getattr(so, "Object", None)
+            subs = getattr(so, "SubObjects", None) or []
+            names = getattr(so, "SubElementNames", None) or []
+            for i, sub in enumerate(subs):
+                if getattr(sub, "ShapeType", "") not in ("Edge", "Face"):
+                    continue
+                if obj is None or i >= len(names) or not names[i]:
+                    continue
+                return obj.Name, names[i], sub
+        return None, None, None
+
+    def _apply_relation(self, kind):
+        """issues.md #7: attach the chosen point row (pt# spinbox) to
+        external geometry selected in the 3D view -- 'pierce' = the
+        sketch-plane crossing of the selected edge/face, 'onsurf' =
+        nearest point on the selected face. The ref lands in
+        ProjectedRefs and is re-derived every recompute through the
+        same machinery as #14, so the relation follows the source;
+        enforcement is the re-projection pin (no solver Jacobian
+        needed, contrary to what issues.md #7 originally assumed)."""
+        idx = self.rel_point.value()
+        while len(self._proj_refs) < len(self._rows):
+            self._proj_refs.append("")   # defensive realignment
+        if not (0 <= idx < len(self._rows)):
+            self.status.setText(
+                "Pierce/On face: pt# %d does not exist yet -- add the "
+                "point (or lower the spinbox) first" % idx)
+            return
+        name, sub, _obj = self._selected_sub()
+        if name is None:
+            self.status.setText(
+                "%s: select a specific edge or face in the 3D view first"
+                % ("Pierce" if kind == "pierce" else "On face"))
+            return
+        if kind == "onsurf" and not sub.startswith("Face"):
+            self.status.setText(
+                "On face: selection is %r -- pick a FACE" % sub)
+            return
+        try:
+            origin, normal, _u, _v = self._plane_geometry()
+            self._proj_plane = (tuple(origin), tuple(normal))
+        except Exception:
+            if kind == "pierce":
+                self.status.setText(
+                    "Pierce: no construction plane -- pick a plane "
+                    "(Tab cycles them) and retry")
+                return
+        self._push_undo()
+        self._proj_refs[idx] = panel_logic.encode_proj_ref(
+            kind, name, sub, 0.0, None)
+        self._update_status()
+        if kind == "pierce":
+            self.status.setText(
+                "P%d pierces %s.%s -- follows the source on rebuild "
+                "(issue #7)" % (idx, name, sub))
+        else:
+            self.status.setText(
+                "P%d lies on %s.%s -- follows the face on rebuild "
+                "(issue #7)" % (idx, name, sub))
 
     # ------------------------------------------------------------------ #
     # task-panel API
