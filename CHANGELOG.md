@@ -274,8 +274,48 @@ fresh `Unreleased` section above it.
    projected-only sketches through `Sketch3DFP`. Headless:
    `test_project_point_along`, `test_proj_ref_roundtrip`,
    `test_sketch3d_assoc_projection_follows_source`,
-   `test_sketch3d_slice_projection_follows_source`. Silhouette
-   projection still open (deferred, see issues.md #14).
+   `test_sketch3d_slice_projection_follows_source`.
+ - Silhouette projection (issues.md #14, last bullet): "Silhouette"
+   button samples the selected solids' edge-level silhouette along the
+   current projection direction (`panel_sketch3d._silhouette_edges` —
+   edges whose adjacent faces disagree in facing; front/back/grazing
+   sign test on face-center normals) as associative `sil` refs,
+   re-derived on recompute. Exact for polyhedral solids; smooth
+   surfaces only contribute their edge-level approximation (their true
+   silhouette crosses face interiors). Headless:
+   `test_sketch3d_silhouette_follows_source` (box = 8 rim edges,
+   follows a moved source).
+ - Pierce / On Surface relations (issues.md #7, 2 of 3 bullets): the
+   `pt#` spinbox + "Pierce to selection" / "On face to selection"
+   buttons attach an existing point to external geometry through the
+   same record/re-derive/pin machinery as #14 — no solver Jacobian
+   needed. Pierce = plane-edge crossing via sampled bisection
+   (`_pierce_point`), or for a face the nearest point of the plane n
+   face section (`_nearest_on_edges`); never-crossing sources leave the
+   point free. On Surface anchors in the face's parameter space (UV
+   learned on first derive, range-checked every recompute,
+   nearest-point fallback when the source rebuilds) so the point
+   travels with the face through translation AND rotation instead of
+   clamping at the face boundary. Ref kinds `pierce`/`onsurf` in
+   `panel_logic.parse_proj_ref`. Tangent-to-face remains open (needs a
+   direction constraint in the solver). Headless:
+   `test_sketch3d_pierce_and_onsurf_follow_source`,
+   `test_proj_ref_relation_kinds`.
+ - Per-constraint conflict badges (issues.md #8 slice):
+   `core.constraint_violations` (per-constraint max-|residual|,
+   aligned 1:1 with the constraint list; `fix` = 0, corrupt entries =
+   0, never raises) + `panel_logic.constraint_badges` (1e-4
+   threshold); `_apply_constraint_badges` paints violated dims
+   light-red in the dim list and tints the point-table rows of the
+   points they touch, live at the un-solved positions (drag a point
+   off a dim → red before accept; recompute clears it), with a count
+   on the status line ("N off-target (red)"). Headless:
+   `test_constraint_violations_per_constraint`, `test_constraint_badges`.
+ - `issues.md`: suggested priority map (annotation, no renumbering)
+   + closing-issue conventions — the record-on-object invariant
+   (index-aligned string lists rebuilt in `execute()`, graceful
+   degradation) and the platform-wrap split for #10/#15 (expression
+   evaluation wraps FreeCAD's engine; suppression state stays ours).
 
 ### Changed
  - Fillet panel dual-model clarity: the legacy (nothing-selected)
