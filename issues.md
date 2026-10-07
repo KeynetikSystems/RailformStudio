@@ -289,6 +289,14 @@ constraint solver respecting per-point planes.
 Gate: removes the "flatten to one plane" workaround that forces
 workarounds for non-planar 3D wireframes.
 
+**Status (UI/Storage implemented, solver integration pending):**
+- **Per-point plane selector**: `_PointRow` now has a "Π" combo with "Global" + dynamic "Local N" entries, stored in `_point_planes` list (index-aligned with rows).
+- **Local plane creation**: "Planes" UI row with modes "Through 3 points", "Offset from face", "Angle to plane" — builds local plane (origin, normal, u, v) stored in `_local_planes` list.
+- **Plane switching**: "Switch: Global/Local" toggle button for Tab-cycling planes used in the sketch.
+- **Storage**: `_point_planes` (list of plane indices per row) + `_local_planes` (list of (origin, normal, u, v)) — both 1:1 with rows.
+- **Headless**: no new tests yet (UI-only so far). Solver integration (projecting points to their local planes before constraint evaluation) is the next step.
+- **Still open**: Constraint solver respecting per-point planes (distance/angle measured in local plane coordinates), plane creation from 3 picked vertices during placement mode.
+
 ## 12. Assembly context / convert entities — in-context design
 
 No mechanism exists to reference geometry from other parts in the
@@ -404,6 +412,12 @@ variables (`_variables` dict), but no configuration table:
 
 Gate: without this, every variant requires a separate sketch file
 or manual parameter editing — no parametric families.
+
+**Status (implemented via #10 EquationManager):**
+- `EquationManager` already provides: configs with variable overrides + suppression per constraint/point/handle, active config switching, equations.txt round-trip.
+- Panel UI: "Equations / Configurations" group has config combo (+/- config), suppression table (kind: constraint/point/handle + idx toggle), Export/Import equations.txt.
+- Sketch3DFP.execute() filters suppressed constraints/points per active config.
+- **Still open**: Spreadsheet-like grid view for the design table (rows=configs, cols=variables+suppression), copy/paste from Excel/CSV, linked variables across multiple sketch objects (needs doc-level EquationManager sharing + UI).
 
 ## 16. Multi-body part support — single document, multiple solids
 
