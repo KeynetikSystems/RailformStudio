@@ -190,8 +190,21 @@ class Sketch3DFP(object):
                 # Only use point_planes if at least one point has a plane
                 if any(pp is not None for pp in pp_list):
                     point_planes = pp_list
+            # Issue #7: resolve tangent_to_face constraint faces from ExternalSources
+            ext_srcs = getattr(obj, "ExternalSources", [])
+            resolved_constraints = []
+            for c in constraints:
+                if c[0] == "tangent_to_face" and len(c) == 4:
+                    src_idx = c[3]
+                    if 0 <= src_idx < len(ext_srcs):
+                        face = ext_srcs[src_idx]
+                        resolved_constraints.append((c[0], c[1], c[2], face))
+                    else:
+                        resolved_constraints.append(c)
+                else:
+                    resolved_constraints.append(c)
             pts = core.solve_point_constraints(
-                raw_pts, constraints, pinned=pinned, point_planes=point_planes)
+                raw_pts, resolved_constraints, pinned=pinned, point_planes=point_planes)
             bulges = [float(b) for b in obj.Bulges] if obj.Bulges else None
             types = list(obj.SegmentTypes) if obj.SegmentTypes else None
             if obj.Kind in (None, "", "Mixed"):
@@ -568,6 +581,9 @@ def _parse_constraints(strings):
         elif kind == "mirror":
             out.append((kind, _ints(2)[0], _ints(2)[1], float(parts[3]),
                         float(parts[4]), float(parts[5]), float(parts[6])))
+        elif kind == "tangent_to_face":
+            # tangent_to_face,i,j,src_idx (src_idx is index into ExternalSources)
+            out.append((kind, int(float(parts[1])), int(float(parts[2])), int(float(parts[3]))))
         else:
             raise ValueError("Sketch3D: unknown constraint %r" % s)
     return out
@@ -723,6 +739,8 @@ class Sketch3DPanel(object):
         self._point_planes = []
         # Local planes: list of (origin, normal, u_dir, v_dir) for indices 1+
         self._local_planes = []
+        # Sources for tangent_to_face constraints (index-aligned with constraint src_idx)
+        self._constraint_sources = []
         self._undo_stack = []
         self._undo_guard = False
         self._handoff_target = None
@@ -3505,9 +3523,15 @@ class Sketch3DPanel(object):
         except Exception:
             self.status.setText("Tangent to face: could not get face geometry")
             return
+        # Add face to ExternalSources if not already present
+        ext_sources = getattr(self, "_constraint_sources", [])
+        if face_shape not in ext_sources:
+            ext_sources.append(face_shape)
+            self._constraint_sources = ext_sources
+        src_idx = ext_sources.index(face_shape)
         self._push_undo()
-        # Add constraint: ("tangent_to_face", i, j, face_shape)
-        c = ("tangent_to_face", idx, idx + 1, face)
+        # Add constraint: ("tangent_to_face", i, j, src_idx)
+        c = ("tangent_to_face", idx, idx + 1, src_idx)
         self._constraints.append(c)
         self.dim_list.addItem("tangent P%d->P%d to %s.%s (solver)"
                               % (idx, idx + 1, name, sub))
@@ -3667,6 +3691,11 @@ class Sketch3DPanel(object):
                 # link dependencies + the projection plane captured now.
                 obj.ProjectedRefs = proj_refs
                 obj.ExternalSources = _resolve_sources(doc, proj_refs)
+                # Add constraint sources (tangent_to_face faces) to ExternalSources
+                if getattr(self, "_constraint_sources", []):
+                    for src in self._constraint_sources:
+                        if src not in obj.ExternalSources:
+                            obj.ExternalSources.append(src)
                 if getattr(self, "_proj_plane", None) is not None:
                     o, n = self._proj_plane
                     obj.PlaneOrigin = Vector(*o)
