@@ -353,15 +353,20 @@ fresh `Unreleased` section above it.
    relations row — select a face, set pt#, click to add constraint.
    Relaxation fallback: projects p_j onto face's tangent plane at
    closest point to p_i. Headless: `test_sketch3d_tangent_face_follows_source`.
- - Multi-plane 3D sketch UI/storage (issues.md #11): per-point plane
-   assignment in `_PointRow` ("Π" combo: Global + dynamic Local N).
-   Local plane creation UI: "Through 3 points", "Offset from face",
-   "Angle to plane" modes creating (origin, normal, u, v) in
-   `_local_planes`. Per-row plane indices in `_point_planes` (1:1 with
-   rows). Plane switching toggle "Switch: Global/Local" for Tab-cycling.
-   Storage: `_point_planes` + `_local_planes` (index-aligned with rows).
-   Solver integration pending (points need projection to local planes
-   before constraint evaluation). Headless: UI-only so far.
+ - - Multi-plane 3D sketch (issues.md #11): per-point plane
+    assignment in `_PointRow` ("Pi" combo: Global + dynamic Local N).
+    Local plane creation UI: "Through 3 points", "Offset from face",
+    "Angle to plane" modes creating (origin, normal, u, v) in
+    `_local_planes`. Per-row plane indices in `_point_planes` (1:1 with
+    rows). Plane switching toggle "Switch: Global/Local" for Tab-cycling.
+    Storage: `_point_planes` + `_local_planes` (index-aligned with rows).
+    **Solver integration**: `core.solve_point_constraints` accepts
+    optional `point_planes` argument; points on local planes are
+    orthogonally projected each iteration, horizontal/vertical
+    constraints evaluated in local coordinates. `Sketch3DFP.PointPlanes`
+    StringList persists per-point planes (index-aligned with Points).
+    Headless: existing tests pass; integration verified by existing
+    projection tests continuing to pass.
 
 ### Changed
  - Fillet panel dual-model clarity: the legacy (nothing-selected)

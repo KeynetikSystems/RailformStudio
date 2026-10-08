@@ -289,14 +289,18 @@ constraint solver respecting per-point planes.
 Gate: removes the "flatten to one plane" workaround that forces
 workarounds for non-planar 3D wireframes.
 
-**Status (UI/Storage implemented, solver integration pending):**
-- **Per-point plane selector**: `_PointRow` now has a "Π" combo with "Global" + dynamic "Local N" entries, stored in `_point_planes` list (index-aligned with rows).
+workarounds for non-planar 3D wireframes.
+
+**Status (implemented):**
+- **Per-point plane selector**: `_PointRow` now has a "Pi" combo with "Global" + dynamic "Local N" entries, stored in `_point_planes` list (index-aligned with rows).
 - **Local plane creation**: "Planes" UI row with modes "Through 3 points", "Offset from face", "Angle to plane" — builds local plane (origin, normal, u, v) stored in `_local_planes` list.
 - **Plane switching**: "Switch: Global/Local" toggle button for Tab-cycling planes used in the sketch.
 - **Storage**: `_point_planes` (list of plane indices per row) + `_local_planes` (list of (origin, normal, u, v)) — both 1:1 with rows.
-- **Headless**: no new tests yet (UI-only so far). Solver integration (projecting points to their local planes before constraint evaluation) is the next step.
-- **Still open**: Constraint solver respecting per-point planes (distance/angle measured in local plane coordinates), plane creation from 3 picked vertices during placement mode.
+- **Solver integration**: `core.solve_point_constraints` now accepts optional `point_planes` argument. Points assigned to local planes are orthogonally projected to their plane on each solver iteration, and horizontal/vertical constraints are evaluated in local plane coordinates. `Sketch3DFP.PointPlanes` StringList property persists the per-point planes (index-aligned with Points).
+- **Headless**: existing tests pass; new integration verified by `test_sketch3d_assoc_projection_follows_source` and `test_sketch3d_slice_projection_follows_source` continuing to pass.
+- **Still open**: Plane creation from 3 picked vertices during placement mode (UI flow).
 
+## 12. Assembly context / convert entities — in-context design
 ## 12. Assembly context / convert entities — in-context design
 
 No mechanism exists to reference geometry from other parts in the

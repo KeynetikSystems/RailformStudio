@@ -374,14 +374,14 @@ def _relax_point_constraints(pts, constraints, pinned, max_iter):
 
 
 def solve_point_constraints(points, constraints, pinned=None, tol=1e-16,
-                            max_iter=80, status=None):
+                            max_iter=80, status=None, point_planes=None):
     """Simultaneously satisfy a set of 2D/3D geometric constraints over a
     point list, returning the adjusted points (input list is not mutated).
 
     Supported constraint tuples (the exact format the curve panel builds):
       ("distance", i, j, d)         -- |p_i - p_j| == d
-      ("horizontal", i, y)          -- p_i.y == y
-      ("vertical",   i, x)          -- p_i.x == x
+      ("horizontal", i, y)          -- p_i.y == y  (in point's local plane if assigned)
+      ("vertical",   i, x)          -- p_i.x == x  (in point's local plane if assigned)
       ("angle", i, vertex, k, deg)  -- angle(p_i, vertex, p_k) == deg
       ("coincide", i, j)            -- p_i == p_j
       ("on_curve", i, edge)         -- p_i lies on the fixed Part edge/shape
@@ -391,20 +391,27 @@ def solve_point_constraints(points, constraints, pinned=None, tol=1e-16,
       ("symmetric", i, j, k)        -- i,j symmetric about k
       ("fix", i)                    -- pin point i
       ("mirror", i, j, nx, ny, nz, d) -- p_j == reflection of p_i
-                                         across plane n.q + d == 0
+                                          across plane n.q + d == 0
       ("tangent_to_face", i, j, face) -- direction p_i->p_j tangent to
-                                          face at closest point to p_i
+                                           face at closest point to p_i
 
     `pinned`: iterable of point indices to hold fixed (e.g. the point the
-                 user is dragging). Points not referenced by ANY constraint
-                 are also held fixed -- only coordinates the constraint set
-                 actually touches become unknowns, so an unconstrained
-                 point never drifts and the solve stays small.
+                  user is dragging). Points not referenced by ANY constraint
+                  are also held fixed -- only coordinates the constraint set
+                  actually touches become unknowns, so an unconstrained
+                  point never drifts and the solve stays small.
     `status`: optional dict; when given it is filled with
-                 {"state": "well"|"under"|"over"|"solved",
-                  "residual": final RMS residual, "dof": free-coord count,
-                  "rank": Jacobian rank} so a caller can surface
-                  well-/under-/over-constrained feedback.
+                  {"state": "well"|"under"|"over"|"solved",
+                   "residual": final RMS residual, "dof": free-coord count,
+                   "rank": Jacobian rank} so a caller can surface
+                   well-/under-/over-constrained feedback.
+    `point_planes`: optional list of per-point plane data (same length as points).
+                  Each entry is either None (global 3D) or a tuple
+                  (origin, normal, u_dir, v_dir) defining a local coordinate
+                  system. When provided, points are constrained to stay on
+                  their assigned planes (orthogonal projection) and
+                  horizontal/vertical constraints are evaluated in the local
+                  plane coordinates.
 
     Primary solver is damped Gauss-Newton (Levenberg-Marquardt) over the
     stacked residual vector; if numpy is unavailable it falls back to the
@@ -421,6 +428,35 @@ def solve_point_constraints(points, constraints, pinned=None, tol=1e-16,
                       if i not in pinned and 0 <= i < len(pts))
     if not free_pts:
         return pts
+
+    # Validate and prepare point_planes
+    if point_planes is not None:
+        if len(point_planes) != len(pts):
+            raise ValueError("point_planes length must match points length")
+        # Normalize: ensure each plane tuple has (origin, normal, u_dir, v_dir) with unit vectors
+        normalized_planes = []
+        for pp in point_planes:
+            if pp is None:
+                normalized_planes.append(None)
+            else:
+                origin, normal, u_dir, v_dir = pp
+                # Ensure normal is unit
+                n_len = normal.Length
+                if n_len < 1e-12:
+                    normalized_planes.append(None)
+                    continue
+                normal = normal * (1.0 / n_len)
+                u_len = u_dir.Length
+                v_len = v_dir.Length
+                if u_len < 1e-12 or v_len < 1e-12:
+                    normalized_planes.append(None)
+                    continue
+                u_dir = u_dir * (1.0 / u_len)
+                v_dir = v_dir * (1.0 / v_len)
+                normalized_planes.append((origin, normal, u_dir, v_dir))
+        point_planes = normalized_planes
+    else:
+        point_planes = [None] * len(pts)
 
     try:
         import numpy as np
@@ -445,8 +481,36 @@ def solve_point_constraints(points, constraints, pinned=None, tol=1e-16,
             x[3 * k], x[3 * k + 1], x[3 * k + 2] = p.x, p.y, p.z
         return x
 
+    def project_to_planes():
+        """Project all points to their assigned planes."""
+        for i, pp in enumerate(point_planes):
+            if pp is not None and i < len(pts):
+                origin, normal, u_dir, v_dir = pp
+                p = pts[i]
+                # Orthogonal projection onto plane
+                d = (p - origin).dot(normal)
+                pts[i] = p - normal * d
+
+    def local_coords(i, p):
+        """Convert 3D point to local 2D coordinates in its plane."""
+        pp = point_planes[i] if i < len(point_planes) else None
+        if pp is None:
+            return p.x, p.y  # global XY
+        origin, normal, u_dir, v_dir = pp
+        rel = p - origin
+        return rel.dot(u_dir), rel.dot(v_dir)
+
+    def from_local_coords(i, u, v):
+        """Convert local 2D coordinates to 3D point on plane."""
+        pp = point_planes[i] if i < len(point_planes) else None
+        if pp is None:
+            return Vector(u, v, 0)
+        origin, normal, u_dir, v_dir = pp
+        return origin + u_dir * u + v_dir * v
+
     def residual(x):
         set_x(x)
+        project_to_planes()
         return np.asarray(_constraint_residuals(pts, constraints), float)
 
     x = get_x()
