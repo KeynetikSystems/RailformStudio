@@ -699,7 +699,14 @@ class _PointRow(object):
         # Plane selector (issues.md #11: multi-plane 3D sketch)
         lay.addWidget(QtWidgets.QLabel("Π"))
         self.plane = QtWidgets.QComboBox()
-        self.plane.addItems(["Global", "Local 1", "Local 2", "Local 3"])
+        # Items mirror the panel's _plane_data registry ([0] = None =
+        # Global, 1..n = Local n) so combo index == registry index, and a
+        # row created after planes exist offers exactly the real planes.
+        self.plane.addItem("Global")
+        for _i in range(1, len(getattr(panel, "_plane_data", None) or [None])):
+            self.plane.addItem("Local %d" % _i)
+        self.plane.setCurrentIndex(
+            plane_idx if 0 <= plane_idx < self.plane.count() else 0)
         self.plane.setToolTip("Construction plane for this point (issues.md #11)")
         self.plane.currentIndexChanged.connect(panel._table_changed)
         lay.addWidget(self.plane)
@@ -770,9 +777,13 @@ class Sketch3DPanel(object):
         # ('' = free point) + the plane they were projected onto.
         self._proj_refs = []
         self._proj_plane = None
-        # Issue #11: per-point construction planes (multi-plane 3D sketch)
-        # list of plane data per row: None = global 3D, or (origin, normal, u, v)
-        self._plane_data = []
+        # Issue #11: local-plane REGISTRY behind the Pi column (not a
+        # per-row list). Index 0 = None placeholder (Global), indices
+        # 1..n = (origin, normal, u, v) for "Local n". Each row's Pi
+        # combo stores its plane index directly, so there is no parallel
+        # per-row array to drift out of sync on row delete/undo/projection
+        # rebuilds -- accept() reads the combo via _serialize_point_planes.
+        self._plane_data = [None]
         # Sources for tangent_to_face constraints (index-aligned with constraint src_idx)
         self._constraint_sources = []
         self._undo_stack = []
@@ -1468,8 +1479,8 @@ class Sketch3DPanel(object):
         self._rows.append(r)
         if len(self._proj_refs) < len(self._rows):
             self._proj_refs.append("")   # new rows start free (issue #14)
-        if len(self._plane_data) < len(self._rows):
-            self._plane_data.append(None)
+        # Per-point plane selection lives in the row's Pi combo; the
+        # panel-level _plane_data is the local-plane registry, never rows.
         self.rows_lay.addWidget(r.widget)
         # Live mirror: auto-append the mirrored counterpart (but never
         # during undo restore, which rebuilds rows under _undo_guard).
@@ -1577,6 +1588,9 @@ class Sketch3DPanel(object):
                        for i in range(self.dim_list.count())],
             "variables": dict(getattr(self, "_variables", {})),
             "refs": list(getattr(self, "_proj_refs", [])),
+            "planes": [r.plane.currentIndex() for r in self._rows],
+            "local_planes": [p for p in getattr(self, "_plane_data", [None])[1:]
+                             if p is not None],
         }
 
     def _push_undo(self):
@@ -1600,6 +1614,10 @@ class Sketch3DPanel(object):
                 r.widget.setParent(None)
                 r.widget.deleteLater()
             self._rows = []
+            # Restore the local-plane registry BEFORE rebuilding rows:
+            # each row's Pi combo builds its items from it.
+            self._plane_data = [None] + [
+                tuple(p) for p in s.get("local_planes", [])]
             for p, seg, b in zip(s["points"], s["segs"], s["bulges"]):
                 r = _PointRow(self, *p)
                 r.set_seg(seg)
@@ -1616,6 +1634,15 @@ class Sketch3DPanel(object):
             refs = list(s.get("refs", []))
             refs = (refs + [""] * len(self._rows))[:len(self._rows)]
             self._proj_refs = refs
+            # restore per-point plane selection (combo = source of truth)
+            planes = list(s.get("planes", []))
+            for i, r in enumerate(self._rows):
+                idx = planes[i] if i < len(planes) else 0
+                if not (0 <= idx < r.plane.count()):
+                    idx = 0
+                r.plane.blockSignals(True)
+                r.plane.setCurrentIndex(idx)
+                r.plane.blockSignals(False)
         finally:
             self._undo_guard = False
         self._update_status()
@@ -1840,6 +1867,10 @@ class Sketch3DPanel(object):
                 b.setEnabled(ok)
         except Exception:
             pass
+        # Every row mutation (click, delete, undo, mirror, projection,
+        # template load) funnels through here -- the single place to
+        # repaint the live placement line.
+        self._refresh_place_preview()
 
     # --- dimension-driven sketch -------------------------------------- #
     def _add_dim(self):
@@ -2055,6 +2086,123 @@ class Sketch3DPanel(object):
         except Exception:
             pass
         self._plane_grid_root = None
+
+    # --- live placement preview (committed line + rubber band) ---------- #
+    def _ensure_place_preview(self):
+        """Lazily create the placement preview overlay. Returns True when
+        the overlay nodes are usable (an ActiveView is present)."""
+        if getattr(self, "_place_root", None) is not None:
+            return True
+        try:
+            from pivy import coin
+            view = FreeCADGui.ActiveDocument.ActiveView
+            if view is None:
+                return False
+            root = coin.SoSeparator()
+            # Committed polyline through every placed row (pale cyan)
+            com = coin.SoSeparator()
+            ccol = coin.SoBaseColor()
+            ccol.rgb = (0.3, 0.85, 1.0)
+            com.addChild(ccol)
+            self._place_coords = coin.SoCoordinate3()
+            com.addChild(self._place_coords)
+            com.addChild(coin.SoLineSet())
+            root.addChild(com)
+            # Rubber band: last placed point -> cursor (pale yellow)
+            sw = coin.SoSwitch()
+            sw.whichChild = -1
+            rb = coin.SoSeparator()
+            rcol = coin.SoBaseColor()
+            rcol.rgb = (1.0, 0.9, 0.3)
+            rb.addChild(rcol)
+            self._place_rubber_coords = coin.SoCoordinate3()
+            rb.addChild(self._place_rubber_coords)
+            rb.addChild(coin.SoLineSet())
+            sw.addChild(rb)
+            root.addChild(sw)
+            view.getSceneGraph().addChild(root)
+            self._place_root = root
+            self._place_rubber_sw = sw
+            return True
+        except Exception:
+            self._place_root = None
+            return False
+
+    def _refresh_place_preview(self):
+        """Repaint the committed polyline through all placed rows."""
+        if not self._ensure_place_preview():
+            return
+        try:
+            pts = self._points()
+            if len(pts) < 2:
+                # A lone vertex draws nothing; park the coordinates so
+                # stale segments from a previous sketch never linger.
+                pts = [(0.0, 0.0, 0.0)]
+            self._place_coords.point.setValues(0, len(pts), pts)
+        except Exception:
+            pass
+
+    def _update_place_rubber(self, view=None, pos=None):
+        """Rubber band from the last placed point to the cursor hit.
+        Self-hides outside placement mode or without an anchor."""
+        try:
+            if not self._ensure_place_preview():
+                return
+            sw = self._place_rubber_sw
+            if not self._drawing or not self._rows or pos is None:
+                sw.whichChild = -1
+                return
+            view = view or FreeCADGui.ActiveDocument.ActiveView
+            if self._snap_pt is not None:
+                end = (self._snap_pt.x, self._snap_pt.y, self._snap_pt.z)
+            else:
+                ray = snaputil.pick_ray(view, pos)
+                if ray is None:
+                    sw.whichChild = -1
+                    return
+                ro, rd = ray
+                origin, normal = panel_logic.construction_plane(
+                    self._plane_base, self._plane_normal,
+                    offset=self.offset.value())
+                hit = panel_logic.ray_plane_intersect(
+                    (ro.x, ro.y, ro.z), (rd.x, rd.y, rd.z), origin, normal)
+                if hit is None:
+                    sw.whichChild = -1
+                    return
+                end = hit
+                if self._axis_lock is not None:
+                    end = panel_logic.apply_axis_lock(
+                        end, self._rows[-1].values(), self._axis_lock)
+            self._place_rubber_coords.point.setValues(
+                0, 2, [self._rows[-1].values(), end])
+            sw.whichChild = 0
+        except Exception:
+            try:
+                self._place_rubber_sw.whichChild = -1
+            except Exception:
+                pass
+
+    def _hide_place_rubber(self):
+        try:
+            sw = getattr(self, "_place_rubber_sw", None)
+            if sw is not None:
+                sw.whichChild = -1
+        except Exception:
+            pass
+
+    def _remove_place_preview(self):
+        root = getattr(self, "_place_root", None)
+        if root is None:
+            return
+        try:
+            view = FreeCADGui.ActiveDocument.ActiveView
+            self._safe_remove_child(view, root)
+        except Exception:
+            pass
+        self._place_root = None
+        self._place_coords = None
+        self._place_rubber_sw = None
+        self._place_rubber_coords = None
 
     # --- dimension preview in 3D view ----------------------------------- #
     def _toggle_dim_preview(self, on):
@@ -2613,6 +2761,7 @@ class Sketch3DPanel(object):
             pass
         self._cb_click = self._cb_move = None
         self._drawing = False
+        self._hide_place_rubber()
         self._maybe_remove_key_cb(view)
 
     def _ensure_key_cb(self, view=None):
@@ -2757,6 +2906,11 @@ class Sketch3DPanel(object):
             self._snap_pt = None
         # Live snap feedback during drag
         self._update_snap_feedback()
+        # Live rubber band: last placed point -> cursor hit
+        try:
+            self._update_place_rubber(view, pos)
+        except Exception:
+            pass
 
     def _update_snap_feedback(self):
         """Show live snap marker and distance while dragging in placement mode."""
@@ -2909,6 +3063,8 @@ class Sketch3DPanel(object):
                                  snaputil.collect_snap_shapes(
                                      FreeCADGui.ActiveDocument.Document,
                                      exclude=None)]
+            # Re-anchor the rubber band onto the point just placed
+            self._update_place_rubber(view, pos)
         except Exception:
             pass
 
@@ -3661,6 +3817,30 @@ class Sketch3DPanel(object):
                 r.plane.setCurrentIndex(idx)
             r.plane.blockSignals(False)
 
+    def _serialize_point_planes(self):
+        """Issue #11: row-aligned PointPlanes payload for accept().
+
+        Each row's Pi combo index addresses the _plane_data registry
+        ([0] = None = Global); reading the combo keeps a single source
+        of truth, so row rebuilds (delete, undo, projection, mirror)
+        can never desync the payload from the visible selection."""
+        reg = getattr(self, "_plane_data", None) or [None]
+        out = []
+        for r in self._rows:
+            try:
+                idx = r.plane.currentIndex()
+            except Exception:
+                idx = 0
+            plane = reg[idx] if 0 <= idx < len(reg) else None
+            if plane is None:
+                out.append("")
+            else:
+                o, n, u, v = plane
+                out.append("%s,%s,%s|%s,%s,%s|%s,%s,%s|%s,%s,%s" % (
+                    o.x, o.y, o.z, n.x, n.y, n.z,
+                    u.x, u.y, u.z, v.x, v.y, v.z))
+        return out
+
     def _toggle_plane_switch(self, checked):
         """Toggle plane switching mode (Tab cycles through used planes)."""
         if checked:
@@ -3685,6 +3865,7 @@ class Sketch3DPanel(object):
             self._stop_drag_edit()
             self._remove_plane_grid()
             self._remove_dim_preview()
+            self._remove_place_preview()
             if getattr(self, "_section_plane", None) is not None:
                 try:
                     self._safe_remove_child(
@@ -3735,15 +3916,20 @@ class Sketch3DPanel(object):
                     o, n = self._proj_plane
                     obj.PlaneOrigin = Vector(*o)
                     obj.PlaneNormal = Vector(*n)
-                # Issue #11: serialize per-point planes
-                pp_list = []
-                for plane_data in getattr(self, "_plane_data", []):
-                    if plane_data is None:
-                        pp_list.append("")
-                    else:
-                        origin, normal, u_dir, v_dir = plane_data
-                        pp_list.append(f"{origin.x},{origin.y},{origin.z}|{normal.x},{normal.y},{normal.z}|{u_dir.x},{u_dir.y},{u_dir.z}|{v_dir.x},{v_dir.y},{v_dir.z}")
-                obj.PointPlanes = pp_list
+                # Issue #11: per-point planes, row-aligned with Points
+                # (each row's Pi combo indexes the _plane_data registry)
+                obj.PointPlanes = self._serialize_point_planes()
+            else:
+                # Simple unconstrained curve -> classic per-curve object.
+                # (This branch was lost in the 9b2d671 tech-debt pass,
+                # which left `obj` unbound here: NameError -> "create
+                # failed" and no curve ever created.)
+                obj = parametric.make_curve(kind, doc=doc)
+                obj.Points = [Vector(*p) for p in pts]
+                try:
+                    obj.PointPlanes = self._serialize_point_planes()
+                except AttributeError:
+                    pass   # classic objects may not declare PointPlanes
             self._handoff_obj = obj
             doc.recompute()
             # Contour recognition: detect ALL closed loops and offer actions for each
@@ -3813,6 +3999,7 @@ class Sketch3DPanel(object):
             self._stop_drag_edit()
             self._remove_plane_grid()
             self._remove_dim_preview()
+            self._remove_place_preview()
             if getattr(self, "_section_plane", None) is not None:
                 try:
                     self._safe_remove_child(
@@ -3842,6 +4029,11 @@ class Sketch3DPanel(object):
             "bulges": bulges,
             "variables": variables,
             "proj_refs": list(getattr(self, "_proj_refs", [])),
+            "planes": [r.plane.currentIndex() for r in self._rows],
+            "local_planes": [
+                [[v.x, v.y, v.z] for v in p]
+                for p in getattr(self, "_plane_data", [None])[1:]
+                if p is not None],
         }
         import json
         try:
@@ -3889,6 +4081,22 @@ class Sketch3DPanel(object):
                 r.widget.setParent(None)
                 r.widget.deleteLater()
             self._rows = []
+            # Restore the local-plane registry BEFORE rebuilding rows:
+            # each row's Pi combo builds its items from it. Malformed
+            # entries are skipped (a short registry just clamps the
+            # per-row selection to Global when it is restored below).
+            reg = [None]
+            for lp in data.get("local_planes", []):
+                try:
+                    o, n, u, v = lp
+                    reg.append((
+                        FreeCAD.Vector(o[0], o[1], o[2]),
+                        FreeCAD.Vector(n[0], n[1], n[2]),
+                        FreeCAD.Vector(u[0], u[1], u[2]),
+                        FreeCAD.Vector(v[0], v[1], v[2])))
+                except Exception:
+                    continue
+            self._plane_data = reg
             for p in data.get("points", []):
                 r = _PointRow(self, *p)
                 self._rows.append(r)
@@ -3912,6 +4120,15 @@ class Sketch3DPanel(object):
             # absent/shorter lists pad with '' = free points
             refs = list(data.get("proj_refs", []))
             self._proj_refs = (refs + [""] * len(self._rows))[:len(self._rows)]
+            # per-point plane indices; anything out of range clamps Global
+            planes = list(data.get("planes", []))
+            for i, r in enumerate(self._rows):
+                idx = planes[i] if i < len(planes) else 0
+                if not (0 <= idx < r.plane.count()):
+                    idx = 0
+                r.plane.blockSignals(True)
+                r.plane.setCurrentIndex(idx)
+                r.plane.blockSignals(False)
             self._update_status()
             if self.dim_preview_btn.isChecked():
                 self._build_dim_preview()

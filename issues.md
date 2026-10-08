@@ -292,10 +292,10 @@ workarounds for non-planar 3D wireframes.
 workarounds for non-planar 3D wireframes.
 
 **Status (implemented):**
-- **Per-point plane selector**: `_PointRow` now has a "Pi" combo with "Global" + dynamic "Local N" entries, stored in `_point_planes` list (index-aligned with rows).
-- **Local plane creation**: "Planes" UI row with modes "Through 3 points", "Offset from face", "Angle to plane" — builds local plane (origin, normal, u, v) stored in `_local_planes` list.
+- **Per-point plane selector**: `_PointRow` now has a "Pi" combo with "Global" + dynamic "Local N" entries, built from the `_plane_data` registry; the selection lives in the combo itself (combo index == registry index).
+- **Local plane creation**: "Planes" UI row with modes "Through 3 points", "Offset from face", "Angle to plane" — builds local plane (origin, normal, u, v) appended to the `_plane_data` registry (index 1..n; index 0 = None = Global).
 - **Plane switching**: "Switch: Global/Local" toggle button for Tab-cycling planes used in the sketch.
-- **Storage**: `_point_planes` (list of plane indices per row) + `_local_planes` (list of (origin, normal, u, v)) — both 1:1 with rows.
+- **Storage**: `_plane_data` local-plane registry `[None, (origin, normal, u, v), ...]` (combo index == registry index) + each row's combo selection as the per-point plane; accept() writes row-aligned `PointPlanes` via `_serialize_point_planes()`, with undo snapshots and JSON templates carrying both the registry and per-row indices.
 - **Solver integration**: `core.solve_point_constraints` now accepts optional `point_planes` argument. Points assigned to local planes are orthogonally projected to their plane on each solver iteration, and horizontal/vertical constraints are evaluated in local plane coordinates. `Sketch3DFP.PointPlanes` StringList property persists the per-point planes (index-aligned with Points).
 - **Headless**: existing tests pass; new integration verified by `test_sketch3d_assoc_projection_follows_source` and `test_sketch3d_slice_projection_follows_source` continuing to pass.
 - **Still open**: Plane creation from 3 picked vertices during placement mode (UI flow).
