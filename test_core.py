@@ -2290,6 +2290,62 @@ def test_sketch3d_silhouette_follows_source():
     out("  silhouette        OK  8 rim edges, outline follows source")
 
 
+def test_sketch3d_tangent_face_follows_source():
+    """Issue #7 (tangent to face): tangent_to_face solver constraint
+    enforces that direction p_i->p_j is tangent to a face. The constraint
+    uses the solver's numeric Jacobian and should hold when the face moves."""
+    from rfstudio import core
+    from rfstudio.panel_sketch3d import make_sketch3d_obj
+    doc = FreeCAD.newDocument("TangentFace7")
+    box = doc.addObject("Part::Box", "T7Box")
+    box.Length, box.Width, box.Height = 10.0, 6.0, 4.0
+    doc.recompute()
+    # Find top face (normal +Z)
+    top_name = None
+    for i, f in enumerate(box.Shape.Faces):
+        u0, u1, v0, v1 = f.ParameterRange
+        n = f.normalAt((u0 + u1) / 2.0, (v0 + v1) / 2.0)
+        if n.z > 0.9:
+            top_name = "Face%d" % (i + 1)
+            top_face = f
+            break
+    assert top_name is not None
+    # Build sketch: two points, distance dim, tangent_to_face constraint
+    # p0 on the face, p1 5 units away ALONG the face (tangent direction, e.g., +X)
+    obj = make_sketch3d_obj("Mixed", doc=doc)
+    obj.Points = [Vector(5.0, 3.0, 4.0), Vector(10.0, 3.0, 4.0)]  # p0 on face, p1 tangent along X
+    obj.SegmentTypes = ["Line"]
+    obj.Bulges = ["0.0"]
+    obj.Constraints = ["distance,0,1,5.0",
+                       "tangent_to_face,0,1,0"]  # index 0 = box in ExternalSources
+    obj.ExternalSources = [box]
+    obj.PlaneOrigin = Vector(0.0, 0.0, 0.0)  # not used by tangent_to_face
+    obj.PlaneNormal = Vector(0.0, 0.0, 1.0)
+    doc.recompute()
+    # p0 should be on the face (z=4), p1 should be 5 units along tangent direction
+    verts = [v.Point for v in obj.Shape.Vertexes]
+    p0, p1 = verts[0], verts[1]
+    assert abs(p0.z - 4.0) < 1e-3, "p0 not on face: %s" % p0
+    # vector p0->p1 should be tangent to face (dot with normal = 0)
+    u0, u1, v0, v1 = top_face.ParameterRange
+    n = top_face.normalAt((u0 + u1) / 2.0, (v0 + v1) / 2.0)
+    tangent = p1 - p0
+    assert abs(tangent.dot(n)) < 1e-3, "not tangent to face: dot=%f" % tangent.dot(n)
+    assert abs(tangent.Length - 5.0) < 1e-3, "distance not 5: %f" % tangent.Length
+    # move the box +7 in Y: the face moves, constraint should re-solve
+    box.Placement.Base = Vector(0.0, 7.0, 0.0)
+    doc.recompute()
+    verts = [v.Point for v in obj.Shape.Vertexes]
+    p0, p1 = verts[0], verts[1]
+    assert abs(p0.z - 4.0) < 1e-3, "p0 not on moved face: %s" % p0
+    tangent = p1 - p0
+    n2 = top_face.normalAt((u0 + u1) / 2.0, (v0 + v1) / 2.0)
+    assert abs(tangent.dot(n2)) < 1e-3, "not tangent after move: dot=%f" % tangent.dot(n2)
+    assert abs(tangent.Length - 5.0) < 1e-3, "distance not 5 after move: %f" % tangent.Length
+    FreeCAD.closeDocument(doc.Name)
+    out("  tangent_to_face   OK  constraint holds and follows source")
+
+
 def test_solve_point_constraints_tangent():
     """Tangent constraint: i-j-k must be collinear. With pinned j,
     moving k should bring i into alignment."""
@@ -2821,6 +2877,7 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_constraint_violations_per_constraint,
               test_sketch3d_pierce_and_onsurf_follow_source,
               test_sketch3d_silhouette_follows_source,
+              test_sketch3d_tangent_face_follows_source,
               test_solve_point_constraints_tangent,
               test_solve_point_constraints_concentric,
               test_solve_point_constraints_symmetric,
