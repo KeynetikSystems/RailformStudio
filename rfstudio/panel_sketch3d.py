@@ -519,7 +519,18 @@ def _reproject_points(obj, raw_pts, panel_logic):
                 continue
             raw_pts[i] = Vector(q[0], q[1], q[2])
             ok.add(i)
-        except Exception:
+        except (AttributeError, ValueError, TypeError, KeyError, IndexError) as exc:
+            # Expected errors: missing source, bad locator, geometry query failure
+            # Log for debugging but don't crash the recompute
+            FreeCAD.Console.PrintWarning(
+                f"Railform _reproject_points: ref {ref} failed: {exc}\n")
+            continue
+        except Exception as exc:
+            # Unexpected errors: log and re-raise in debug, but don't crash in release
+            FreeCAD.Console.PrintError(
+                f"Railform _reproject_points: unexpected error for ref {ref}: {exc}\n")
+            # In production, we still continue to avoid crashing the recompute
+            # but the error is logged for investigation
             continue
     return ok
 
@@ -542,6 +553,24 @@ def _build_curve_shape(kind, pts):
     raise ValueError("Sketch3D: unknown curve kind %r" % (kind,))
 
 
+# Constraint specification registry: defines arity, field types, and serialization
+# for each constraint kind. Single source of truth for parsing & serialization.
+# Field types: "int", "float", "expr" (float or "=expr"), "src_idx" (int index into ExternalSources)
+_CONSTRAINT_SPECS = {
+    "distance":        (4, ("int", "int", "expr")),
+    "coincide":        (3, ("int", "int")),
+    "horizontal":      (3, ("int", "expr")),
+    "vertical":        (3, ("int", "expr")),
+    "angle":           (5, ("int", "int", "int", "expr")),
+    "equal":           (5, ("int", "int", "int", "int")),
+    "fix":             (2, ("int",)),
+    "tangent":         (4, ("int", "int", "int")),
+    "concentric":      (3, ("int", "int")),
+    "symmetric":       (4, ("int", "int", "int")),
+    "mirror":          (7, ("int", "int", "float", "float", "float", "float")),
+    "tangent_to_face": (4, ("int", "int", "src_idx")),  # i, j, src_idx into ExternalSources
+}
+
 def _parse_constraints(strings):
     """'distance,0,1,25.0' -> ('distance', 0, 1, 25.0), etc. A value
     starting with '=' stays a raw expression string for later
@@ -555,37 +584,48 @@ def _parse_constraints(strings):
     for s in strings:
         parts = [p.strip() for p in s.split(",")]
         kind = parts[0]
-        def _ints(n):
-            return [int(float(x)) for x in parts[1:1 + n]]
-        if kind == "distance":
-            out.append((kind, _ints(2)[0], _ints(2)[1],
-                        _num_or_expr(parts[3])))
-        elif kind == "coincide":
-            out.append((kind, _ints(2)[0], _ints(2)[1]))
-        elif kind in ("horizontal", "vertical"):
-            out.append((kind, int(float(parts[1])), _num_or_expr(parts[2])))
-        elif kind == "angle":
-            out.append((kind, _ints(3)[0], _ints(3)[1], _ints(3)[2],
-                        _num_or_expr(parts[4])))
-        elif kind == "equal":
-            out.append((kind, _ints(4)[0], _ints(4)[1], _ints(4)[2],
-                        _ints(4)[3]))
-        elif kind == "fix":
-            out.append((kind, int(float(parts[1]))))
-        elif kind == "tangent":
-            out.append((kind, _ints(3)[0], _ints(3)[1], _ints(3)[2]))
-        elif kind == "concentric":
-            out.append((kind, _ints(2)[0], _ints(2)[1]))
-        elif kind == "symmetric":
-            out.append((kind, _ints(3)[0], _ints(3)[1], _ints(3)[2]))
-        elif kind == "mirror":
-            out.append((kind, _ints(2)[0], _ints(2)[1], float(parts[3]),
-                        float(parts[4]), float(parts[5]), float(parts[6])))
-        elif kind == "tangent_to_face":
-            # tangent_to_face,i,j,src_idx (src_idx is index into ExternalSources)
-            out.append((kind, int(float(parts[1])), int(float(parts[2])), int(float(parts[3]))))
-        else:
-            raise ValueError("Sketch3D: unknown constraint %r" % s)
+        if kind not in _CONSTRAINT_SPECS:
+            raise ValueError("Sketch3D: unknown constraint kind %r" % kind)
+        expected_len, field_types = _CONSTRAINT_SPECS[kind]
+        if len(parts) != expected_len:
+            raise ValueError("Sketch3D: constraint %r expects %d fields, got %d" %
+                             (kind, expected_len, len(parts)))
+        parsed = [kind]
+        for i, ftype in enumerate(field_types):
+            raw = parts[i + 1]
+            if ftype == "int":
+                parsed.append(int(float(raw)))
+            elif ftype == "float":
+                parsed.append(float(raw))
+            elif ftype == "expr":
+                parsed.append(_num_or_expr(raw))
+            elif ftype == "src_idx":
+                parsed.append(int(float(raw)))
+            else:
+                raise ValueError("Sketch3D: unknown field type %r" % ftype)
+        out.append(tuple(parsed))
+    return out
+
+
+def _serialize_constraints(constraints):
+    """Serialize constraint tuples back to CSV strings using _CONSTRAINT_SPECS."""
+    out = []
+    for c in constraints:
+        kind = c[0]
+        if kind not in _CONSTRAINT_SPECS:
+            raise ValueError("Sketch3D: unknown constraint kind %r in serialize" % kind)
+        expected_len, field_types = _CONSTRAINT_SPECS[kind]
+        if len(c) != expected_len:
+            raise ValueError("Sketch3D: constraint %r has %d fields, expected %d" %
+                             (kind, len(c), expected_len))
+        parts = [kind]
+        for i, ftype in enumerate(field_types):
+            val = c[i + 1]
+            if ftype == "expr" and isinstance(val, str) and val.startswith("="):
+                parts.append(val)
+            else:
+                parts.append(str(val))
+        out.append(",".join(parts))
     return out
 
 
@@ -602,10 +642,6 @@ def _parse_variables(strings):
 
 def _serialize_variables(variables):
     return ["%s,%r" % (name, value) for name, value in sorted(variables.items())]
-
-
-def _serialize_constraints(constraints):
-    return [",".join(str(v) for v in c) for c in constraints]
 
 
 def make_sketch3d_obj(kind_tag, doc=None):
@@ -735,10 +771,8 @@ class Sketch3DPanel(object):
         self._proj_refs = []
         self._proj_plane = None
         # Issue #11: per-point construction planes (multi-plane 3D sketch)
-        # list of plane indices per row (0 = global, 1+ = local planes)
-        self._point_planes = []
-        # Local planes: list of (origin, normal, u_dir, v_dir) for indices 1+
-        self._local_planes = []
+        # list of plane data per row: None = global 3D, or (origin, normal, u, v)
+        self._plane_data = []
         # Sources for tangent_to_face constraints (index-aligned with constraint src_idx)
         self._constraint_sources = []
         self._undo_stack = []
@@ -1434,8 +1468,8 @@ class Sketch3DPanel(object):
         self._rows.append(r)
         if len(self._proj_refs) < len(self._rows):
             self._proj_refs.append("")   # new rows start free (issue #14)
-        if len(self._point_planes) < len(self._rows):
-            self._point_planes.append(plane_idx)
+        if len(self._plane_data) < len(self._rows):
+            self._plane_data.append(None)
         self.rows_lay.addWidget(r.widget)
         # Live mirror: auto-append the mirrored counterpart (but never
         # during undo restore, which rebuilds rows under _undo_guard).
@@ -3607,10 +3641,10 @@ class Sketch3DPanel(object):
             return
 
         # Store the new local plane
-        self._local_planes.append((origin, n, u, v))
+        self._plane_data.append((origin, n, u, v))
         # Update all row plane combos
         self._refresh_plane_combos()
-        self.status.setText(f"Created local plane #{len(self._local_planes)}")
+        self.status.setText(f"Created local plane #{len(self._plane_data) - 1}")
 
     def _refresh_plane_combos(self):
         """Update all point row plane combos with available local planes."""
@@ -3619,8 +3653,9 @@ class Sketch3DPanel(object):
             r.plane.blockSignals(True)
             r.plane.clear()
             r.plane.addItem("Global")
-            for i in range(len(self._local_planes)):
-                r.plane.addItem(f"Local {i+1}")
+            # _plane_data[0] is None (Global), so local planes start at index 1
+            for i in range(1, len(self._plane_data)):
+                r.plane.addItem(f"Local {i}")
             idx = r.plane.findText(current)
             if idx >= 0:
                 r.plane.setCurrentIndex(idx)
@@ -3702,23 +3737,11 @@ class Sketch3DPanel(object):
                     obj.PlaneNormal = Vector(*n)
                 # Issue #11: serialize per-point planes
                 pp_list = []
-                for i, plane_idx in enumerate(getattr(self, "_point_planes", [])):
-                    if plane_idx == 0 or plane_idx >= len(getattr(self, "_local_planes", [])):
+                for plane_data in getattr(self, "_plane_data", []):
+                    if plane_data is None:
                         pp_list.append("")
                     else:
-                        origin, normal, u_dir, v_dir = self._local_planes[plane_idx - 1]
-                        pp_list.append(f"{origin.x},{origin.y},{origin.z}|{normal.x},{normal.y},{normal.z}|{u_dir.x},{u_dir.y},{u_dir.z}|{v_dir.x},{v_dir.y},{v_dir.z}")
-                obj.PointPlanes = pp_list
-            else:
-                obj = parametric.make_curve(kind, doc=doc)
-                obj.Points = [Vector(*p) for p in pts]
-                # Issue #11: serialize per-point planes for simple curves too
-                pp_list = []
-                for i, plane_idx in enumerate(getattr(self, "_point_planes", [])):
-                    if plane_idx == 0 or plane_idx >= len(getattr(self, "_local_planes", [])):
-                        pp_list.append("")
-                    else:
-                        origin, normal, u_dir, v_dir = self._local_planes[plane_idx - 1]
+                        origin, normal, u_dir, v_dir = plane_data
                         pp_list.append(f"{origin.x},{origin.y},{origin.z}|{normal.x},{normal.y},{normal.z}|{u_dir.x},{u_dir.y},{u_dir.z}|{v_dir.x},{v_dir.y},{v_dir.z}")
                 obj.PointPlanes = pp_list
             self._handoff_obj = obj

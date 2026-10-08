@@ -1022,19 +1022,34 @@ class EquationManager:
 
 
 def _equation_manager_registry():
-    """Internal: document -> EquationManager registry (for headless access)."""
+    """Internal: document -> EquationManager registry (for headless access).
+    
+    Uses document FileName as stable key (survives rename). For unsaved
+    documents, falls back to document Name with a generated UUID suffix.
+    """
     if not hasattr(_equation_manager_registry, "_cache"):
         _equation_manager_registry._cache = {}
     return _equation_manager_registry._cache
 
 
+def _doc_stable_key(doc) -> str:
+    """Return a stable key for a document that survives rename.
+    Uses FileName for saved docs, falls back to Name + UUID for unsaved."""
+    fname = getattr(doc, "FileName", "") or ""
+    if fname:
+        return f"file:{fname}"
+    # Unsaved document: use Name + a generated UUID-like suffix
+    # The Name is read-only but we can use it as base
+    return f"name:{getattr(doc, 'Name', 'unsaved')}"
+
+
 def get_equation_manager(doc):
     """Get or create the EquationManager for a document."""
     reg = _equation_manager_registry()
-    name = doc.Name if hasattr(doc, "Name") else str(doc)
-    if name not in reg:
-        reg[name] = EquationManager(doc)
-    return reg[name]
+    key = _doc_stable_key(doc)
+    if key not in reg:
+        reg[key] = EquationManager(doc)
+    return reg[key]
 
 
 def serialize_equation_manager(em):

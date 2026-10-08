@@ -492,15 +492,16 @@ def test_equation_manager_persistence():
     """EquationManager: serialize/deserialize round-trip."""
     class MockDoc:
         Name = "TestDoc"
+        FileName = ""  # unsaved doc
     em = panel_logic.EquationManager(MockDoc())
     em.add_variable("width", 100.0, "mm", "width")
     em.add_config("ConfigA", variables={"width": 80.0})
     data = panel_logic.serialize_equation_manager(em)
     em2 = panel_logic.EquationManager(MockDoc())
     panel_logic.deserialize_equation_manager(MockDoc(), data)
-    # The registry returns the same instance for same doc
+    # The registry returns the same instance for same doc (uses name:TestDoc key)
     reg = panel_logic._equation_manager_registry()
-    assert reg["TestDoc"].get_variable_value("width") == 100.0
+    assert reg["name:TestDoc"].get_variable_value("width") == 100.0
     out("  equation manager persistence OK")
 
 
