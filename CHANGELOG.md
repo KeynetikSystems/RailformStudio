@@ -359,7 +359,10 @@ fresh `Unreleased` section above it.
     "Angle to plane" modes creating (origin, normal, u, v) in
     `_local_planes`. Per-row plane indices in `_point_planes` (1:1 with
     rows). Plane switching toggle "Switch: Global/Local" for Tab-cycling.
-    Storage: `_point_planes` + `_local_planes` (index-aligned with rows).
+    Storage: `_plane_data` local-plane registry (index 0 = None =
+     Global, 1..n = local planes) + each row's Pi combo selection
+     (combo index == registry index), serialized row-aligned by
+     `_serialize_point_planes()`.
     **Solver integration**: `core.solve_point_constraints` accepts
     optional `point_planes` argument; points on local planes are
     orthogonally projected each iteration, horizontal/vertical
@@ -367,6 +370,15 @@ fresh `Unreleased` section above it.
     StringList persists per-point planes (index-aligned with Points).
     Headless: existing tests pass; integration verified by existing
     projection tests continuing to pass.
+ - Live placement preview in the Sketch3D panel: clicking points now
+   draws as you go. A pale-cyan polyline connects every placed row
+   (repainted from `_update_status()`, the funnel every row mutation
+   already goes through) and a pale-yellow rubber band runs from the
+   last placed point to the cursor (honors snap target, axis lock and
+   plane offset, hides when placement stops). Torn down with the other
+   overlays on accept/reject. Previously the viewport showed only the
+   plane grid/triad/snap crosshair, so a sketch looked blank until
+   Accept created the curve.
 
 ### Changed
  - Fillet panel dual-model clarity: the legacy (nothing-selected)
@@ -509,6 +521,29 @@ fresh `Unreleased` section above it.
   test's own 0.01 tolerance was geometrically unsatisfiable by *any*
   Gordon-surface algorithm. Curves are now sampled from one shared
   height function so every crossing is genuine.
+- `Sketch3DPanel.accept()` created no curve for simple sketches: the
+  9b2d671 tech-debt pass deleted the `else:` branch
+  (`obj = parametric.make_curve(...)`) while rewriting the PointPlanes
+  serialization, so an unconstrained spline sketch (no mixed segments,
+  no projections) hit `NameError: name 'obj' is not defined` at
+  `self._handoff_obj = obj` -> "create failed (name 'obj' is not
+  defined)", the dialog stayed open, and no object was ever created.
+  Branch restored; planes set best-effort via the new
+  `_serialize_point_planes()`.
+- Issue #11 plane storage (9b2d671 regression): the per-row
+  `_point_planes` list and the `_local_planes` registry were merged
+  into one `_plane_data` array, so `_add_row` appended one entry per
+  row WHILE `_create_local_plane` appended plane tuples to that same
+  list -- `_refresh_plane_combos` then offered one phantom "Local N"
+  item per placed row, accept() serialized registry entries misaligned
+  with Points, and the row's Pi selection was never serialized at all
+  (nothing ever read `currentIndex()`). `_plane_data` is now purely
+  the local-plane registry (`[None, local1, ...]`; combo index ==
+  registry index): rows build their combo items from it, the combo is
+  the single source of truth read by `_serialize_point_planes()` at
+  accept, and undo snapshots + JSON templates carry the registry and
+  per-row indices. Also fixes the pre-existing off-by-one that
+  rejected the LAST local plane (`plane_idx >= len(_local_planes)`).
 
 ### Added
 - BezierCurve type with handle editing (New Feature)

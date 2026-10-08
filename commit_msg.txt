@@ -1,1 +1,41 @@
-Technical debt fixes: constraint parsing unification, type hints, _reproject_points error handling, _plane_data consolidation, EquationManager registry fix, tangent_to_face cache optimization
+Fix accept() regression + plane registry; add live placement preview
+
+Investigating "no line drawn when clicking points" in the Sketch3D
+panel surfaced two regressions from the 9b2d671 tech-debt pass plus
+the missing feature itself:
+
+1) accept() lost its else-branch: the PointPlanes rewrite deleted
+   `obj = parametric.make_curve(kind, doc=doc)`, so a simple
+   unconstrained spline sketch (no mixed segments, no projections)
+   never assigned `obj` -> NameError at `self._handoff_obj = obj` ->
+   "create failed (name 'obj' is not defined)", dialog stayed open,
+   no curve ever created. Branch restored; planes set best-effort
+   through the new _serialize_point_planes().
+
+2) _point_planes/_local_planes merge corrupted plane storage: _add_row
+   appended one entry per row while _create_local_plane appended plane
+   tuples to the same _plane_data list, so _refresh_plane_combos
+   offered one phantom "Local N" item per placed row, accept()
+   serialized registry entries misaligned with Points, and the row's
+   Pi selection was never serialized at all (nothing ever read
+   currentIndex()). _plane_data is now purely the local-plane
+   registry ([None, local1, ...]; combo index == registry index):
+   rows build combo items from it, the combo is the single source of
+   truth read by _serialize_point_planes() at accept, undo snapshots
+   and JSON templates carry registry + per-row indices, and the
+   pre-existing off-by-one that rejected the last local plane
+   (plane_idx >= len(_local_planes)) is fixed.
+
+3) New: live placement preview -- pale-cyan polyline through every
+   placed row (repainted from _update_status(), the funnel all row
+   mutations already go through) plus a pale-yellow rubber band from
+   the last placed point to the cursor (snap/axis-lock/plane-offset
+   aware, hidden when placement stops, removed with the other
+   overlays on accept/reject). Before this the viewport showed only
+   the plane grid/triad/snap crosshair, so a sketch looked blank
+   until Accept created the curve.
+
+Verify: harness 25 modules (all 6 checks), selftest 10/10,
+panel_logic 23, panel_base 4/4, test_core "core tests done" 0 FAIL.
+CHANGELOG Unreleased updated; issues.md #11 storage description
+corrected to the final design.
