@@ -1,0 +1,1 @@
+Technical debt fixes: constraint parsing unification, type hints, _reproject_points error handling, _plane_data consolidation, EquationManager registry fix, tangent_to_face cache optimization

@@ -353,7 +353,7 @@ fresh `Unreleased` section above it.
    relations row — select a face, set pt#, click to add constraint.
    Relaxation fallback: projects p_j onto face's tangent plane at
    closest point to p_i. Headless: `test_sketch3d_tangent_face_follows_source`.
- - - Multi-plane 3D sketch (issues.md #11): per-point plane
+ - Multi-plane 3D sketch (issues.md #11): per-point plane
     assignment in `_PointRow` ("Pi" combo: Global + dynamic Local N).
     Local plane creation UI: "Through 3 points", "Offset from face",
     "Angle to plane" modes creating (origin, normal, u, v) in

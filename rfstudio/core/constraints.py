@@ -1,14 +1,28 @@
 # -*- coding: utf-8 -*-
 """Geometric constraint solving for the sketch/curve panel."""
 
+from __future__ import annotations
+
 import math
 import Part
 import FreeCAD                      # Console only -- not Gui, works headless
 from FreeCAD import Vector
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from .util import (_hermite3, _nearest_facing_sides, _side_uv_trimmed, grid_to_surface)
 from .patches import (_param_map)
 from .manufacturing import (_monotone_cubic_fn)
+
+
+# Type aliases
+VectorLike = Union[Vector, Tuple[float, float, float], Sequence[float]]
+ConstraintTuple = Tuple[Any, ...]
+ConstraintList = List[ConstraintTuple]
+PointList = List[Vector]
+PinnedSet = Set[int]
+StatusDict = Dict[str, Any]
+
+FloatExpr = Union[float, str]  # float or "=expr"
 
 
 
@@ -30,7 +44,7 @@ from .manufacturing import (_monotone_cubic_fn)
 # numeric system in one shot instead of relaxing each constraint alone,
 # and it reports whether the system came out well-/under-/over-constrained
 # from the Jacobian rank and the final residual.
-def _unit_normal(nx, ny, nz):
+def _unit_normal(nx: float, ny: float, nz: float) -> Optional[Vector]:
     """Unit plane normal or None when degenerate."""
     length = (nx * nx + ny * ny + nz * nz) ** 0.5
     if length < 1e-12:
@@ -38,10 +52,12 @@ def _unit_normal(nx, ny, nz):
     return Vector(nx / length, ny / length, nz / length)
 
 
-def _reflect(p, n, d):
+def _reflect(p: Vector, n: Vector, d: float) -> Vector:
     """Reflection of point p across the plane n.q + d == 0."""
     return p - n * (2.0 * (p.dot(n) + d))
-def _constraint_point_indices(c):
+
+
+def _constraint_point_indices(c: ConstraintTuple) -> Tuple[int, ...]:
     """The point indices a single constraint tuple references."""
     kind = c[0]
     if kind == "distance":
@@ -69,15 +85,18 @@ def _constraint_point_indices(c):
     return ()
 
 
-
-def _constraint_residuals(pts, constraints):
+def _constraint_residuals(pts: PointList, constraints: ConstraintList) -> List[float]:
     """Flat residual list for the whole constraint set at the current
     point positions -- each entry is zero exactly when its constraint is
     satisfied. Units are mixed (mm for positions/distances, radians for
     angles); that is fine for a least-squares drive as long as it stays
     consistent between the residual and its Jacobian, which it does since
     the Jacobian here is taken numerically from this same function."""
-    res = []
+    # Clear cache at start of each residual evaluation
+    if not hasattr(_constraint_residuals, "_face_normal_cache"):
+        _constraint_residuals._face_normal_cache = {}
+    _constraint_residuals._face_normal_cache.clear()
+    res: List[float] = []
     for c in constraints:
         kind = c[0]
         if kind == "distance":
@@ -126,11 +145,17 @@ def _constraint_residuals(pts, constraints):
                 v_len = v.Length
                 if v_len > 1e-9:
                     dir_vec = v * (1.0 / v_len)
-                    # Closest point on face to p_i
-                    d = Part.Vertex(p_i).distToShape(face)[0]
-                    closest_on_face = d[1][0][1]  # point on face
-                    # Face normal at closest point
-                    n = face.normalAt(*face.Surface.parameter(closest_on_face))
+                    # Closest point on face to p_i (cached)
+                    cache_key = (id(face), (p_i.x, p_i.y, p_i.z))
+                    if cache_key in _constraint_residuals._face_normal_cache:
+                        closest_on_face, n = _constraint_residuals._face_normal_cache[cache_key]
+                    else:
+                        # Closest point on face to p_i
+                        d = Part.Vertex(p_i).distToShape(face)[0]
+                        closest_on_face = d[1][0][1]  # point on face
+                        # Face normal at closest point
+                        n = face.normalAt(*face.Surface.parameter(closest_on_face))
+                        _constraint_residuals._face_normal_cache[cache_key] = (closest_on_face, n)
                     if n.Length > 1e-9:
                         n = n * (1.0 / n.Length)
                         res.append(dir_vec.dot(n))  # zero = tangent
@@ -511,6 +536,10 @@ def solve_point_constraints(points, constraints, pinned=None, tol=1e-16,
     def residual(x):
         set_x(x)
         project_to_planes()
+        # Clear face normal cache for this residual evaluation
+        if not hasattr(_constraint_residuals, "_face_normal_cache"):
+            _constraint_residuals._face_normal_cache = {}
+        _constraint_residuals._face_normal_cache.clear()
         return np.asarray(_constraint_residuals(pts, constraints), float)
 
     x = get_x()
