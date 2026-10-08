@@ -111,6 +111,13 @@ class Sketch3DFP(object):
         if not hasattr(obj, "PlaneNormal"):
             obj.addProperty("App::PropertyVector", "PlaneNormal",
                             "Sketch3D", "Projection plane normal")
+        # Issue #11: per-point construction planes (multi-plane 3D sketch)
+        # PointPlanes: per-point plane data aligned 1:1 with Points
+        # Format: '' = global 3D, or 'ox,oy,oz|nx,ny,nz|ux,uy,uz|vx,vy,vz'
+        if not hasattr(obj, "PointPlanes"):
+            obj.addProperty("App::PropertyStringList", "PointPlanes",
+                            "Sketch3D",
+                            "Per-point construction planes: 'ox,oy,oz|nx,ny,nz|ux,uy,uz|vx,vy,vz' ('' = global)")
 
     def execute(self, obj):
         from rfstudio import core
@@ -154,8 +161,37 @@ class Sketch3DFP(object):
             pinned = {c[1] for c in constraints if c[0] == "fix"} | projected
             # Filter out suppressed points from pinning (they stay free)
             pinned = {i for i in pinned if i not in suppressed_points}
+            # Issue #11: pass per-point planes to solver
+            point_planes = None
+            if hasattr(obj, "PointPlanes") and obj.PointPlanes:
+                pp_list = []
+                for pp_str in obj.PointPlanes:
+                    if pp_str:
+                        try:
+                            parts = pp_str.split("|")
+                            if len(parts) == 4:
+                                ox, oy, oz = map(float, parts[0].split(","))
+                                nx, ny, nz = map(float, parts[1].split(","))
+                                ux, uy, uz = map(float, parts[2].split(","))
+                                vx, vy, vz = map(float, parts[3].split(","))
+                                from FreeCAD import Vector
+                                pp_list.append((
+                                    Vector(ox, oy, oz),
+                                    Vector(nx, ny, nz),
+                                    Vector(ux, uy, uz),
+                                    Vector(vx, vy, vz)
+                                ))
+                            else:
+                                pp_list.append(None)
+                        except Exception:
+                            pp_list.append(None)
+                    else:
+                        pp_list.append(None)
+                # Only use point_planes if at least one point has a plane
+                if any(pp is not None for pp in pp_list):
+                    point_planes = pp_list
             pts = core.solve_point_constraints(
-                raw_pts, constraints, pinned=pinned)
+                raw_pts, constraints, pinned=pinned, point_planes=point_planes)
             bulges = [float(b) for b in obj.Bulges] if obj.Bulges else None
             types = list(obj.SegmentTypes) if obj.SegmentTypes else None
             if obj.Kind in (None, "", "Mixed"):
@@ -3635,9 +3671,27 @@ class Sketch3DPanel(object):
                     o, n = self._proj_plane
                     obj.PlaneOrigin = Vector(*o)
                     obj.PlaneNormal = Vector(*n)
+                # Issue #11: serialize per-point planes
+                pp_list = []
+                for i, plane_idx in enumerate(getattr(self, "_point_planes", [])):
+                    if plane_idx == 0 or plane_idx >= len(getattr(self, "_local_planes", [])):
+                        pp_list.append("")
+                    else:
+                        origin, normal, u_dir, v_dir = self._local_planes[plane_idx - 1]
+                        pp_list.append(f"{origin.x},{origin.y},{origin.z}|{normal.x},{normal.y},{normal.z}|{u_dir.x},{u_dir.y},{u_dir.z}|{v_dir.x},{v_dir.y},{v_dir.z}")
+                obj.PointPlanes = pp_list
             else:
                 obj = parametric.make_curve(kind, doc=doc)
                 obj.Points = [Vector(*p) for p in pts]
+                # Issue #11: serialize per-point planes for simple curves too
+                pp_list = []
+                for i, plane_idx in enumerate(getattr(self, "_point_planes", [])):
+                    if plane_idx == 0 or plane_idx >= len(getattr(self, "_local_planes", [])):
+                        pp_list.append("")
+                    else:
+                        origin, normal, u_dir, v_dir = self._local_planes[plane_idx - 1]
+                        pp_list.append(f"{origin.x},{origin.y},{origin.z}|{normal.x},{normal.y},{normal.z}|{u_dir.x},{u_dir.y},{u_dir.z}|{v_dir.x},{v_dir.y},{v_dir.z}")
+                obj.PointPlanes = pp_list
             self._handoff_obj = obj
             doc.recompute()
             # Contour recognition: detect ALL closed loops and offer actions for each
