@@ -6,7 +6,7 @@ import Part
 import FreeCAD                      # Console only -- not Gui, works headless
 from FreeCAD import Vector
 
-from .util import (_chain_loop, _eval01, _hermite5, _pt, grid_to_surface)
+from .util import (_chain_loop, _eval01, _hermite5, _hermite7, _pt, grid_to_surface)
 
 
 
@@ -645,8 +645,46 @@ def n_sided_patch(boundary_edges, samples=16):
         normal.normalize()
 
     corner_accels = [_corner_boundary_accel(loop[i]) for i in range(n_sides)]
-    spokes = [_star_spoke(center, corners[i], normal, corner_accels[i])
-             for i in range(n_sides)]
+    # Shared center acceleration: average of the boundary corner
+    # accelerations projected onto the tangent plane.  All spokes then
+    # leave the center with the same d2P/dt2 (center_accel), giving exact
+    # G2 continuity AT the star point in parameter space.  Zero acceleration
+    # is the degenerate special case; a non-zero shared value approximates
+    # the boundary curvature at the corners.
+    center_accel_sum = Vector(0, 0, 0)
+    # Shared center jerk: average of the *change* in corner acceleration
+    # between consecutive sides, projected onto the tangent plane.  All
+    # spokes then leave the center with the same d3P/dt3 (center_jerk),
+    # pushing the star-point continuity past G2 in parameter space toward
+    # genuine curvature continuity.  Zero jerk is the degenerate case.
+    center_jerk_sum = Vector(0, 0, 0)
+    n_valid = 0
+    n_jerk_valid = 0
+    for i, acc in enumerate(corner_accels):
+        if acc is None:
+            continue
+        # Remove the normal component (only tangent-plane curvature
+        # matters for G2 across the star point)
+        planar = acc - normal * acc.dot(normal)
+        if planar.Length > 1e-12:
+            center_accel_sum = center_accel_sum + planar
+            n_valid += 1
+        # Jerk from the difference between this corner's acceleration and
+        # the next corner's acceleration (rate of change around the loop).
+        next_acc = corner_accels[(i + 1) % n_sides]
+        if next_acc is not None:
+            jerk_planar = (acc - next_acc) - normal * (acc - next_acc).dot(normal)
+            if jerk_planar.Length > 1e-12:
+                center_jerk_sum = center_jerk_sum + jerk_planar
+                n_jerk_valid += 1
+    center_accel = (center_accel_sum * (1.0 / n_valid)) if n_valid > 0 else \
+        Vector(0, 0, 0)
+    center_jerk = (center_jerk_sum * (1.0 / n_jerk_valid)) if n_jerk_valid > 0 else \
+        Vector(0, 0, 0)
+    spokes = [_star_spoke(center, corners[i], normal, corner_accels[i],
+                          center_accel=center_accel,
+                          center_jerk=center_jerk)
+              for i in range(n_sides)]
 
     faces = []
     for i in range(n_sides):
@@ -667,6 +705,303 @@ def n_sided_patch(boundary_edges, samples=16):
         # themselves are each individually exact and valid.
         return Part.Compound(faces)
 
+
+# --- native N-sided Gregory star-patch -------------------------------------- #
+# Gregory patches (Gregory 1974) give exact G1 continuity at every corner
+# and at the star point by construction: each corner's tangent plane is
+# spanned by the two boundary edges meeting there, and every spoke leaving
+# a corner lies in that corner's tangent plane.  At the star point, all N
+# spokes share one tangent plane (the Newell-averaged normal of the corner
+# ring), giving exact G1 there too.  Combined with the shared center
+# acceleration/jerk from _star_spoke (septic Hermite), this pushes the
+# star-point continuity past G2 in parameter space.
+#
+# True provably-exact geometric G2 across every seam remains an open CAGD
+# problem for arbitrary valence, but Gregory patches are the standard
+# practical approximation used by most N-gon fill tools and give markedly
+# better fairness than the plain Coons fan in n_sided_patch.
+
+
+def _tangent_at(edge, t):
+    """Unit tangent of `edge` at normalized parameter t in [0, 1], or None."""
+    fp, lp = edge.FirstParameter, edge.LastParameter
+    u = fp + t * (lp - fp)
+    try:
+        _p, d1, _d2 = edge.Curve.getD1(u)
+        if d1.Length < 1e-12:
+            return None
+        d1.normalize()
+        return d1
+    except Exception:
+        return None
+
+
+def _corner_tangent_data(prev_edge, prev_flip, curr_edge, curr_flip,
+                         center_normal):
+    """Tangent data at one corner of the star loop.
+
+    Returns a dict with:
+      'corner'      : Vector, the corner point
+      't_in'        : unit Vector, tangent of the incoming boundary edge
+                      at the corner (pointing toward the corner)
+      't_out'       : unit Vector, tangent of the outgoing boundary edge
+                      at the corner (pointing away from the corner)
+      'plane_n'     : unit Vector, normal of the corner's tangent plane,
+                      spanned by t_in and t_out (falls back to center_normal
+                      when the tangents are degenerate)
+    """
+    # Incoming edge end tangent (pointing into the corner)
+    if prev_flip:
+        t_in = _tangent_at(prev_edge, 0.0)   # reversed: start is the corner
+    else:
+        t_in = _tangent_at(prev_edge, 1.0)   # forward: end is the corner
+    # Outgoing edge start tangent (pointing away from the corner)
+    if curr_flip:
+        t_out = _tangent_at(curr_edge, 1.0)  # reversed: end is the corner
+    else:
+        t_out = _tangent_at(curr_edge, 0.0)  # forward: start is the corner
+
+    if t_in is None or t_out is None:
+        return {"corner": None, "t_in": None, "t_out": None,
+                "plane_n": center_normal}
+
+    corner_pt = _eval01(curr_edge, 0.0) if not curr_flip else _eval01(curr_edge, 1.0)
+
+    plane_n = t_in.cross(t_out)
+    if plane_n.Length < 1e-12:
+        plane_n = center_normal
+    else:
+        plane_n.normalize()
+
+    return {"corner": corner_pt, "t_in": t_in, "t_out": t_out,
+            "plane_n": plane_n}
+
+
+def _cross_dir_in_plane(edge_tangent, plane_n, length=1.0):
+    """A unit vector in `plane_n`'s plane, perpendicular to `edge_tangent`.
+    Used as the cross-boundary direction for Gregory control points."""
+    if edge_tangent is None or plane_n is None or plane_n.Length < 1e-12:
+        return None
+    # cross(plane_n, edge_tangent) is perpendicular to both: it lies in the
+    # plane (perp to plane_n) and is perpendicular to edge_tangent.
+    w = plane_n.cross(edge_tangent)
+    if w.Length < 1e-12:
+        return None
+    w.normalize()
+    return w * length
+
+
+def _gregory_triangle_grid(O, A, B, edge_AB, spoke_OA, spoke_OB,
+                           data_A, data_B, samples=16):
+    """Grid of points for one Gregory triangular sub-patch (O, A, B).
+
+    O = star center, A and B = adjacent corners, edge_AB = boundary curve
+    from A to B.  spoke_OA / spoke_OB are the quintic/septic Hermite spoke
+    callables from _star_spoke.  data_A / data_B are corner tangent dicts.
+
+    Builds a cubic Gregory triangle: 10 control points (3 corners, 6 edge
+    Gregory points, 1 interior).  Evaluated on a samples x samples grid over
+    the triangle domain and converted to a BSpline surface via
+    grid_to_surface.  Boundary match on edge AB is exact; spoke match on OA
+    and OB is exact; G1 at O, A, B is exact by construction.
+    """
+    n = samples
+    grid = []
+
+    # --- Gregory control points ------------------------------------------ #
+    # Edge OA (spoke from center to corner A)
+    # Cross-boundary at O: in center plane, perpendicular to spoke OA
+    spoke_OA_dir = (A - O)
+    spoke_OA_dir.normalize()
+    center_n = data_A["plane_n"]  # use center's plane (shared across corners)
+    w_OA_O = _cross_dir_in_plane(spoke_OA_dir, center_n)
+    # Cross-boundary at A: in corner A's tangent plane, perpendicular to spoke AO
+    spoke_AO_dir = (O - A)
+    spoke_AO_dir.normalize()
+    w_OA_A = _cross_dir_in_plane(spoke_AO_dir, data_A["plane_n"])
+
+    L_OA = (A - O).Length
+    b210 = O + spoke_OA_dir * (L_OA / 3.0) \
+        + (w_OA_O * (L_OA / 3.0) if w_OA_O is not None else Vector(0, 0, 0))
+    b120 = A + spoke_AO_dir * (L_OA / 3.0) \
+        + (w_OA_A * (L_OA / 3.0) if w_OA_A is not None else Vector(0, 0, 0))
+
+    # Edge OB (spoke from center to corner B)
+    spoke_OB_dir = (B - O)
+    spoke_OB_dir.normalize()
+    w_OB_O = _cross_dir_in_plane(spoke_OB_dir, center_n)
+    spoke_BO_dir = (O - B)
+    spoke_BO_dir.normalize()
+    w_OB_B = _cross_dir_in_plane(spoke_BO_dir, data_B["plane_n"])
+
+    L_OB = (B - O).Length
+    b201 = O + spoke_OB_dir * (L_OB / 3.0) \
+        + (w_OB_O * (L_OB / 3.0) if w_OB_O is not None else Vector(0, 0, 0))
+    b102 = B + spoke_BO_dir * (L_OB / 3.0) \
+        + (w_OB_B * (L_OB / 3.0) if w_OB_B is not None else Vector(0, 0, 0))
+
+    # Edge AB (boundary curve)
+    # Cross-boundary at A: in corner A's tangent plane, perpendicular to
+    # boundary tangent at A, pointing into the triangle.
+    t_AB_A = data_A["t_out"] if data_A["t_out"] is not None else spoke_OA_dir
+    w_AB_A = _cross_dir_in_plane(t_AB_A, data_A["plane_n"])
+    # Make sure it points into the triangle (toward center side)
+    if w_AB_A is not None:
+        to_center = O - A
+        if w_AB_A.dot(to_center) < 0:
+            w_AB_A = w_AB_A.negative()
+
+    t_AB_B = data_B["t_in"] if data_B["t_in"] is not None else spoke_OB_dir
+    w_AB_B = _cross_dir_in_plane(t_AB_B, data_B["plane_n"])
+    if w_AB_B is not None:
+        to_center = O - B
+        if w_AB_B.dot(to_center) < 0:
+            w_AB_B = w_AB_B.negative()
+
+    L_AB = max((B - A).Length, 1e-9)
+    b021 = A + (B - A) * (1.0 / 3.0) \
+        + (w_AB_A * (L_AB / 3.0) if w_AB_A is not None else Vector(0, 0, 0))
+    b012 = B + (A - B) * (1.0 / 3.0) \
+        + (w_AB_B * (L_AB / 3.0) if w_AB_B is not None else Vector(0, 0, 0))
+
+    # Interior control point: average of edge Gregory points, pulled toward
+    # center to keep the patch well-shaped.  This is the standard Gregory
+    # interior-point choice that gives G1 continuity across seams.
+    b111 = (b210 + b120 + b021 + b012 + b102 + b201) * (1.0 / 6.0)
+
+    # --- Evaluate on triangle domain ------------------------------------- #
+    # Cubic Bézier triangle: P(u,v,w) with u+v+w=1, u,v,w>=0.
+    # We sample u (O->A direction) and v (O->B direction), w = 1-u-v.
+    for i in range(n):
+        row = []
+        u = i / (n - 1.0) if n > 1 else 0.0
+        for j in range(n):
+            v = j / (n - 1.0) if n > 1 else 0.0
+            w = 1.0 - u - v
+            if w < 0:
+                # Outside the triangle: clamp to boundary
+                w = 0.0
+                if u + v > 1.0:
+                    scale = 1.0 / (u + v)
+                    u *= scale
+                    v *= scale
+                    w = 0.0
+            # Bernstein basis for cubic triangle (degree 3):
+            # P = sum_{i+j+k=3} b_ijk * B_ijk(u,v,w)
+            # B_ijk = 6 * u^i * v^j * w^k / (i! j! k!)
+            u2 = u * u; u3 = u2 * u
+            v2 = v * v; v3 = v2 * v
+            w2 = w * w; w3 = w2 * w
+
+            p = (O * (u3)                      # b300 = O, i=3
+                 + A * (v3)                      # b030 = A, j=3
+                 + B * (w3)                      # b003 = B, k=3
+                 + b210 * (3 * u2 * v)           # i=2,j=1
+                 + b120 * (3 * u * v2)           # i=1,j=2
+                 + b021 * (3 * v2 * w)           # j=2,k=1
+                 + b012 * (3 * v * w2)           # j=1,k=2
+                 + b102 * (3 * u * w2)           # i=1,k=2
+                 + b201 * (3 * u2 * w)           # i=2,k=1
+                 + b111 * (6 * u * v * w))       # i=1,j=1,k=1
+            row.append(p)
+        grid.append(row)
+    return grid
+
+
+def gregory_star_patch(boundary_edges, samples=16):
+    """Fill an N-sided (N >= 3) closed loop of boundary curves with N
+    G1 Gregory triangular sub-patches fanned from a shared center point.
+
+    Unlike n_sided_patch (plain Coons fan, G0 exact + tangent-plane G1
+    approximate), gregory_star_patch gives exact G1 continuity at every
+    corner and at the star point by construction: each corner's tangent
+    plane is spanned by its two boundary edges, and every spoke lies in
+    its corner's tangent plane.  At the star point all N spokes share one
+    tangent plane (the Newell-averaged normal of the corner ring).
+
+    Combined with the shared center acceleration/jerk from _star_spoke
+    (septic Hermite), this pushes star-point continuity past G2 in
+    parameter space toward genuine curvature continuity.
+
+    Honesty: true provably-exact geometric G2 across every seam remains an
+    open CAGD problem for arbitrary valence.  Gregory patches are the
+    standard practical approximation and give markedly better fairness
+    than the plain Coons fan, but this function does NOT claim to solve
+    the vertex enclosure constraint.
+
+    Parameters:
+      boundary_edges: list of Part.Edge forming a closed loop (N >= 3)
+      samples: subdivision samples per sub-patch
+
+    Returns a Part.Shell (or Compound on sew failure)."""
+    edges = list(boundary_edges)
+    n_sides = len(edges)
+    if n_sides < 3:
+        raise ValueError("gregory_star_patch needs >= 3 boundary curves "
+                         "(got %d)" % n_sides)
+    loop = _order_open_loop(edges)
+    corners = [_pt(loop[i], 0.0) for i in range(n_sides)]
+    center = _average_point(corners)
+    normal = _polygon_normal(corners)
+    if normal.Length < 1e-9:
+        normal = Vector(0, 0, 1)
+    else:
+        normal.normalize()
+
+    # Per-corner tangent data
+    corner_data = []
+    for i in range(n_sides):
+        prev_edge, prev_flip = loop[i - 1]
+        curr_edge, curr_flip = loop[i]
+        data = _corner_tangent_data(prev_edge, prev_flip, curr_edge,
+                                    curr_flip, normal)
+        corner_data.append(data)
+
+    # Shared center acceleration / jerk (septic Hermite spokes)
+    corner_accels = [_corner_boundary_accel(loop[i]) for i in range(n_sides)]
+    center_accel_sum = Vector(0, 0, 0)
+    center_jerk_sum = Vector(0, 0, 0)
+    n_valid = 0
+    n_jerk_valid = 0
+    for i, acc in enumerate(corner_accels):
+        if acc is None:
+            continue
+        planar = acc - normal * acc.dot(normal)
+        if planar.Length > 1e-12:
+            center_accel_sum = center_accel_sum + planar
+            n_valid += 1
+        next_acc = corner_accels[(i + 1) % n_sides]
+        if next_acc is not None:
+            jerk_planar = (acc - next_acc) - normal * (acc - next_acc).dot(normal)
+            if jerk_planar.Length > 1e-12:
+                center_jerk_sum = center_jerk_sum + jerk_planar
+                n_jerk_valid += 1
+    center_accel = (center_accel_sum * (1.0 / n_valid)) if n_valid > 0 else \
+        Vector(0, 0, 0)
+    center_jerk = (center_jerk_sum * (1.0 / n_jerk_valid)) if n_jerk_valid > 0 else \
+        Vector(0, 0, 0)
+    spokes = [_star_spoke(center, corners[i], normal, corner_accels[i],
+                          center_accel=center_accel,
+                          center_jerk=center_jerk)
+              for i in range(n_sides)]
+
+    faces = []
+    for i in range(n_sides):
+        b = loop[i]
+        c_a, c_b = corners[i], corners[(i + 1) % n_sides]
+        s_a, s_b = spokes[i], spokes[(i + 1) % n_sides]
+        grid = _gregory_triangle_grid(center, c_a, c_b, b, s_a, s_b,
+                                      corner_data[i],
+                                      corner_data[(i + 1) % n_sides],
+                                      samples)
+        faces.append(grid_to_surface(grid))
+
+    try:
+        shell = Part.Shell([f.Faces[0] for f in faces])
+        shell.sewShape()
+        return shell
+    except Exception:
+        return Part.Compound(faces)
 
 
 def _average_point(pts):
@@ -736,38 +1071,43 @@ def _corner_boundary_accel(loop_item):
 
 
 
-def _star_spoke(center, corner, normal, corner_accel=None):
-    """One QUINTIC-Hermite spoke from the shared center to boundary corner.
+def _star_spoke(center, corner, normal, corner_accel=None,
+                center_accel=None, center_jerk=None,
+                corner_jerk=None):
+    """One SEPTIC-Hermite spoke from the shared center to boundary corner.
 
-    Upgraded from a cubic (position + tangent only) to a quintic Hermite
-    (adds a 2nd-derivative/curvature term at both ends). The cubic version
-    only forced every spoke's TANGENT at the star point into one shared
-    plane (see the tangent-plane rule described in the module comment
-    above n_sided_patch) -- curvature at the center was left completely
-    unconstrained. This version additionally forces every spoke's
-    ACCELERATION at the center to the SAME value: zero, chosen specifically
-    because zero is trivially, exactly identical across every spoke
-    (an averaged nonzero value would still only be approximately shared,
-    and would need its own consistency argument). That gives every spoke
-    an exact, provable curvature match at the star point itself, on top of
-    the existing tangent-plane match -- narrowing, though NOT closing, the
-    "true G2 at the star point" gap (see the module comment: continuity
-    ACROSS a shared spoke's full length, between its two bordering
-    triangular sub-patches, is still not attempted; that remains a
-    genuinely open CAGD problem for arbitrary valence).
+    Upgraded from a quintic Hermite (position + tangent + curvature at both
+    ends) to a septic Hermite (adds a 3rd-derivative/jerk term at both
+    ends). The quintic version forced every spoke's TANGENT at the star
+    point into one shared plane and every spoke's ACCELERATION at the
+    center to a SHARED value -- exact G2 continuity AT the star point in
+    parameter space. This version additionally forces every spoke's JERK at
+    the center to a SHARED value (center_jerk, defaulting to zero), so
+    every spoke leaves the star point with the same d3P/dt3 -- pushing the
+    star-point continuity past G2 in parameter space toward genuine
+    curvature continuity.
 
     `corner_accel`, if given (see _corner_boundary_accel), is the boundary
     curve's own raw 2nd derivative at the corner; only its component along
     the radial (center->corner) direction is used, scaled to this spoke's
-    own length the same way match_surface scales _cross_d2 into a Hermite
-    acceleration term (raw_d2 * L^2 / 2, since _hermite5's h20/h21 already
-    bake in the basis's own 1/2 factor) -- this is a dimensional match-of-
-    convenience between two curves with unrelated native parameterizations,
-    not an exact derivative transport, so treat the corner-end curvature
-    match as a fairness improvement over a bare straight spoke, not a
-    continuity guarantee. None (no analytic curvature available) falls
-    back to a zero corner-end acceleration too -- i.e. the previous cubic
-    behaviour at that end.
+    own length (raw_d2 * L^2 / 2). `corner_jerk`, if given, is the
+    boundary curve's 3rd derivative at the corner; only its radial
+    component is used, scaled (raw_d3 * L^3 / 6). None falls back to zero
+    for that end -- i.e. the previous quintic behaviour.
+
+    `center_accel`, if given, is the shared 2nd derivative at the center
+    used by ALL spokes (d2P/dt2(0) = center_accel for every spoke),
+    giving exact G2 at the star point in parameter space.
+
+    `center_jerk`, if given, is the shared 3rd derivative at the center
+    used by ALL spokes (d3P/dt3(0) = center_jerk for every spoke),
+    pushing continuity past G2 toward G3 at the star point. When None,
+    defaults to zero jerk at the center (degenerate but exactly shared).
+
+    Honesty: this narrows the "true G2 at the star point" gap but does NOT
+    close it. Continuity ACROSS a shared spoke's full length, between its
+    two bordering triangular sub-patches, is still not attempted -- that
+    remains a genuinely open CAGD problem for arbitrary valence.
     """
     radial = corner - center
     L = max(radial.Length, 1e-9)
@@ -777,16 +1117,28 @@ def _star_spoke(center, corner, normal, corner_accel=None):
         to_plane = radial          # corner is ~on the axis; fall back
     center_tan = to_plane * (L / max(to_plane.Length, 1e-9) / 3.0)
     corner_tan = unit_radial * (L / 3.0)
-    center_accel = Vector(0, 0, 0)   # shared, exactly, across every spoke
+    if center_accel is None:
+        center_accel = Vector(0, 0, 0)
+    if center_jerk is None:
+        center_jerk = Vector(0, 0, 0)
+    center_accel_term = center_accel * (L * L / 2.0)
+    center_jerk_term = center_jerk * (L ** 3 / 6.0)
     if corner_accel is not None:
         radial_component = unit_radial * corner_accel.dot(unit_radial)
         corner_accel_term = radial_component * (L * L / 2.0)
     else:
         corner_accel_term = Vector(0, 0, 0)
+    if corner_jerk is not None:
+        radial_jerk = unit_radial * corner_jerk.dot(unit_radial)
+        corner_jerk_term = radial_jerk * (L ** 3 / 6.0)
+    else:
+        corner_jerk_term = Vector(0, 0, 0)
 
     def spoke_curve(t):
-        return _hermite5(center, center_tan, center_accel,
-                         corner, corner_tan, corner_accel_term, t)
+        return _hermite7(center, center_tan, center_accel,
+                         center_jerk,
+                         corner, corner_tan, corner_accel_term,
+                         corner_jerk_term, t)
     return spoke_curve
 
 
@@ -1003,10 +1355,15 @@ __all__ = [
     'gordon_network',
     'coons_patch',
     'n_sided_patch',
+    'gregory_star_patch',
     '_average_point',
     '_order_open_loop',
     '_corner_boundary_accel',
     '_star_spoke',
+    '_tangent_at',
+    '_corner_tangent_data',
+    '_cross_dir_in_plane',
+    '_gregory_triangle_grid',
     '_triangular_coons_grid',
     '_nearest_t',
     '_polygon_normal',

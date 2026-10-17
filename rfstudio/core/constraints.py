@@ -82,6 +82,10 @@ def _constraint_point_indices(c: ConstraintTuple) -> Tuple[int, ...]:
         return (c[1], c[2])
     if kind == "mirror":
         return (c[1], c[2])
+    if kind == "g2":
+        return (c[1], c[2], c[3])
+    if kind == "g3":
+        return (c[1], c[2], c[3], c[4])
     return ()
 
 
@@ -180,6 +184,64 @@ def _constraint_residuals(pts: PointList, constraints: ConstraintList) -> List[f
             res.append(cross.x)
             res.append(cross.y)
             res.append(cross.z)
+        elif kind == "g2":
+            # G2 curvature continuity at joint j between segments i-j and j-k.
+            # Residual = curvature_left - curvature_right (3 components).
+            # curvature_left  = T1 / h1  (curvature entering joint from i)
+            # curvature_right = T2 / h2  (curvature leaving joint toward k)
+            # where T1 = normalize(P_j - P_i), h1 = |P_j - P_i|, etc.
+            # When G1 holds (T1 parallel T2), this reduces to requiring
+            # equal segment lengths h1 == h2 -- a usable, well-behaved
+            # approximation of curvature continuity.
+            p_i = pts[c[1]]
+            p_j = pts[c[2]]
+            p_k = pts[c[3]]
+            v1 = p_j - p_i
+            v2 = p_k - p_j
+            h1 = v1.Length
+            h2 = v2.Length
+            if h1 > 1e-9 and h2 > 1e-9:
+                t1 = v1 * (1.0 / h1)
+                t2 = v2 * (1.0 / h2)
+                k_left = t1 * (1.0 / h1)
+                k_right = t2 * (1.0 / h2)
+                diff = k_left - k_right
+                res.append(diff.x)
+                res.append(diff.y)
+                res.append(diff.z)
+            else:
+                res.extend([0.0, 0.0, 0.0])
+        elif kind == "g3":
+            # G3 jerk/torsion continuity at joint between segments i-j-k
+            # and j-k-l. Residual = jerk_left - jerk_right (3 components).
+            # jerk_left  = (K2 - K1) / h2  (rate of curvature change from left)
+            # jerk_right = (K3 - K2) / h2  (rate of curvature change to right)
+            # where K1 = T1/h1, K2 = T2/h2, K3 = T3/h3 are segment curvatures.
+            p_i = pts[c[1]]
+            p_j = pts[c[2]]
+            p_k = pts[c[3]]
+            p_l = pts[c[4]]
+            v1 = p_j - p_i
+            v2 = p_k - p_j
+            v3 = p_l - p_k
+            h1 = v1.Length
+            h2 = v2.Length
+            h3 = v3.Length
+            if h1 > 1e-9 and h2 > 1e-9 and h3 > 1e-9:
+                t1 = v1 * (1.0 / h1)
+                t2 = v2 * (1.0 / h2)
+                t3 = v3 * (1.0 / h3)
+                k1 = t1 * (1.0 / h1)
+                k2 = t2 * (1.0 / h2)
+                k3 = t3 * (1.0 / h3)
+                jerk_left = (k2 - k1) * (1.0 / h2)
+                jerk_right = (k3 - k2) * (1.0 / h2)
+                diff = jerk_left - jerk_right
+                res.append(diff.x)
+                res.append(diff.y)
+                res.append(diff.z)
+            else:
+                res.extend([0.0, 0.0, 0.0])
         elif kind == "concentric":
             # Concentric: two arcs/circles defined by (center_i, point_on_arc_j)
             # and (center_k, point_on_arc_l) must share the same center.
@@ -223,6 +285,235 @@ def constraint_point_indices(c):
     """Public accessor for the point indices one constraint references
     (issues.md #8 -- the panel tints the involved point-table rows)."""
     return _constraint_point_indices(c)
+
+
+def tangent_to_face_jacobian(p_i, p_j, face, n):
+    """Analytic Jacobian of the tangent_to_face residual
+    r = normalize(p_j - p_i) . n  (n = face normal at closest point to p_i).
+
+    Treats n as locally constant (frozen-normal approximation -- the normal
+    changes only to second order as p_i slides along the tangent plane), which
+    is exactly the regime the solver lives in (small LM steps). Returns
+    (dr_dp_i, dr_dp_j) as 3-vectors:
+
+        dr/dp_j =  n^T (I - dir dir^T) / |p_j - p_i|
+        dr/dp_i = -n^T (I - dir dir^T) / |p_j - p_i|
+
+    where dir = normalize(p_j - p_i).  Caller is responsible for having
+    already normalized n.  Returns (None, None) when the direction is
+    degenerate (zero-length p_i->p_j) so the caller falls back to numeric.
+    """
+    v = p_j - p_i
+    v_len = v.Length
+    if v_len < 1e-9 or n.Length < 1e-9:
+        return None, None
+    dir_vec = v * (1.0 / v_len)
+    n_unit = n * (1.0 / n.Length)
+    # (I - dir dir^T) . n = n - dir (dir . n)
+    proj = n_unit - dir_vec * dir_vec.dot(n_unit)
+    scale = 1.0 / v_len
+    dr_dp_j = proj * scale
+    dr_dp_i = proj * (-scale)
+    return dr_dp_i, dr_dp_j
+
+
+def g2_jacobian(p_i, p_j, p_k):
+    """Analytic Jacobian of the G2 curvature continuity residual.
+
+    R = T1/h1 - T2/h2  (3-component vector)
+    where T1 = normalize(P_j - P_i), h1 = |P_j - P_i|,
+          T2 = normalize(P_k - P_j), h2 = |P_k - P_j|.
+
+    Returns (dR_dP_i, dR_dP_j, dR_dP_k) as 3x3 matrices (lists of lists of
+    floats).  Returns (None, None, None) for degenerate inputs so the
+    solver falls back to numeric differentiation.
+
+    Derivation:
+      d(T/h)/dP_source  = (-I + 2*t*t^T) / h^2   (source = where the segment starts)
+      d(T/h)/dP_target  = (I - 2*t*t^T) / h^2    (target = where the segment ends)
+      R = T1/h1 - T2/h2
+      dR/dP_i = (-I + 2*t1*t1^T) / h1^2
+      dR/dP_j = (I - 2*t1*t1^T)/h1^2 + (I - 2*t2*t2^T)/h2^2
+      dR/dP_k = (-I + 2*t2*t2^T) / h2^2
+    """
+    v1 = p_j - p_i
+    v2 = p_k - p_j
+    h1 = v1.Length
+    h2 = v2.Length
+    if h1 < 1e-9 or h2 < 1e-9:
+        return None, None, None
+    t1 = v1 * (1.0 / h1)
+    t2 = v2 * (1.0 / h2)
+    h1_sq = h1 * h1
+    h2_sq = h2 * h2
+
+    def _comp(t, idx):
+        return (t.x, t.y, t.z)[idx]
+
+    def _dTdh_source(t, h_sq):
+        """(-I + 2*t*t^T) / h^2 -- derivative w.r.t. segment start point."""
+        rows = []
+        for a in range(3):
+            row = []
+            ta = _comp(t, a)
+            for b in range(3):
+                val = (-1.0 if a == b else 0.0) + 2.0 * ta * _comp(t, b)
+                row.append(val / h_sq)
+            rows.append(row)
+        return rows
+
+    def _dTdh_target(t, h_sq):
+        """(I - 2*t*t^T) / h^2 -- derivative w.r.t. segment end point."""
+        rows = []
+        for a in range(3):
+            row = []
+            ta = _comp(t, a)
+            for b in range(3):
+                val = (1.0 if a == b else 0.0) - 2.0 * ta * _comp(t, b)
+                row.append(val / h_sq)
+            rows.append(row)
+        return rows
+
+    dRi = _dTdh_source(t1, h1_sq)
+    dRj = [
+        [_dTdh_target(t1, h1_sq)[a][b] + _dTdh_target(t2, h2_sq)[a][b] for b in range(3)]
+        for a in range(3)
+    ]
+    dRk = _dTdh_source(t2, h2_sq)
+    return dRi, dRj, dRk
+
+
+def g3_jacobian(p_i, p_j, p_k, p_l):
+    """Analytic Jacobian of the G3 jerk continuity residual.
+
+    R = (K3 - 2*K2 + K1) / h2  (3-component vector)
+    where K1 = T1/h1, K2 = T2/h2, K3 = T3/h3 are segment curvatures,
+    T1 = normalize(P_j - P_i), etc., and h2 = |P_k - P_j|.
+
+    Returns (dR_dP_i, dR_dP_j, dR_dP_k, dR_dP_l) as 3x3 matrices.
+    Returns (None, None, None, None) for degenerate inputs.
+
+    R includes a 1/h2 scaling factor that depends on P_j and P_k, so the
+    Jacobian has an extra term: R * d(1/h2)/dP.
+    """
+    v1 = p_j - p_i
+    v2 = p_k - p_j
+    v3 = p_l - p_k
+    h1 = v1.Length
+    h2 = v2.Length
+    h3 = v3.Length
+    if h1 < 1e-9 or h2 < 1e-9 or h3 < 1e-9:
+        return None, None, None, None
+    t1 = v1 * (1.0 / h1)
+    t2 = v2 * (1.0 / h2)
+    t3 = v3 * (1.0 / h3)
+    h1_sq = h1 * h1
+    h2_sq = h2 * h2
+    h3_sq = h3 * h3
+
+    def _comp(t, idx):
+        return (t.x, t.y, t.z)[idx]
+
+    def _dTdh_source(t, h_sq):
+        rows = []
+        for a in range(3):
+            row = []
+            ta = _comp(t, a)
+            for b in range(3):
+                val = (-1.0 if a == b else 0.0) + 2.0 * ta * _comp(t, b)
+                row.append(val / h_sq)
+            rows.append(row)
+        return rows
+
+    def _dTdh_target(t, h_sq):
+        rows = []
+        for a in range(3):
+            row = []
+            ta = _comp(t, a)
+            for b in range(3):
+                val = (1.0 if a == b else 0.0) - 2.0 * ta * _comp(t, b)
+                row.append(val / h_sq)
+            rows.append(row)
+        return rows
+
+    # K1 = T1/h1, K2 = T2/h2, K3 = T3/h3
+    # dK1/dP_i = _dTdh_source(t1, h1_sq)
+    # dK1/dP_j = _dTdh_target(t1, h1_sq)
+    # dK2/dP_j = _dTdh_source(t2, h2_sq)
+    # dK2/dP_k = _dTdh_target(t2, h2_sq)
+    # dK3/dP_k = _dTdh_source(t3, h3_sq)
+    # dK3/dP_l = _dTdh_target(t3, h3_sq)
+
+    dK1_dPi = _dTdh_source(t1, h1_sq)
+    dK1_dPj = _dTdh_target(t1, h1_sq)
+    dK2_dPj = _dTdh_source(t2, h2_sq)
+    dK2_dPk = _dTdh_target(t2, h2_sq)
+    dK3_dPk = _dTdh_source(t3, h3_sq)
+    dK3_dPl = _dTdh_target(t3, h3_sq)
+
+    # R = (K3 - 2*K2 + K1) / h2
+    # dR/dP = (d(K3 - 2*K2 + K1)/dP) / h2 + (K3 - 2*K2 + K1) * d(1/h2)/dP
+    # d(1/h2)/dP_j = T2 / h2^2   (since h2 = |P_k - P_j|, d|..|/dP_j = -T2, d(1/h2)/dP_j = T2/h2^2)
+    # d(1/h2)/dP_k = -T2 / h2^2
+    inv_h2 = 1.0 / h2
+    t2_over_h2_sq = t2 * (1.0 / h2_sq)
+
+    def _mat_scale(m, s):
+        return [[m[a][b] * s for b in range(3)] for a in range(3)]
+
+    def _mat_add(*mats):
+        rows = []
+        for a in range(3):
+            row = []
+            for b in range(3):
+                row.append(sum(m[a][b] for m in mats))
+            rows.append(row)
+        return rows
+
+    def _mat_sub(a, b):
+        return [[a[x][y] - b[x][y] for y in range(3)] for x in range(3)]
+
+    # Numerator N = K3 - 2*K2 + K1
+    # dN/dP_i = dK1/dP_i
+    # dN/dP_j = dK1/dP_j - 2*dK2/dP_j
+    # dN/dP_k = -2*dK2/dP_k + dK3/dP_k
+    # dN/dP_l = dK3/dP_l
+    dN_dPi = dK1_dPi
+    dN_dPj = _mat_sub(dK1_dPj, _mat_scale(dK2_dPj, 2.0))
+    dN_dPk = _mat_sub(_mat_scale(dK3_dPk, 1.0), _mat_scale(dK2_dPk, 2.0))
+    dN_dPl = dK3_dPl
+
+    # R = N / h2, so dR/dP = dN/dP / h2 + N * d(1/h2)/dP
+    # N vector = K3 - 2*K2 + K1
+    k1 = t1 * (1.0 / h1)
+    k2 = t2 * (1.0 / h2)
+    k3 = t3 * (1.0 / h3)
+    N = k3 - k2 * 2.0 + k1
+
+    # Outer product N (3-vector) times d(1/h2)/dP (3-vector) = 3x3 matrix
+    def _outer_vec_scale(vec, scale_vec):
+        """Outer product: vec[i] * scale_vec[j] -> 3x3 matrix."""
+        rows = []
+        for a in range(3):
+            row = []
+            va = (vec.x, vec.y, vec.z)[a]
+            for b in range(3):
+                row.append(va * (scale_vec.x, scale_vec.y, scale_vec.z)[b])
+            rows.append(row)
+        return rows
+
+    dR_dPi = _mat_scale(dN_dPi, inv_h2)
+    dR_dPj = _mat_add(
+        _mat_scale(dN_dPj, inv_h2),
+        _outer_vec_scale(N, t2_over_h2_sq)
+    )
+    dR_dPk = _mat_add(
+        _mat_scale(dN_dPk, inv_h2),
+        _mat_scale(_outer_vec_scale(N, t2_over_h2_sq), -1.0)
+    )
+    dR_dPl = _mat_scale(dN_dPl, inv_h2)
+
+    return dR_dPi, dR_dPj, dR_dPk, dR_dPl
 
 
 def constraint_violations(pts, constraints):
@@ -549,6 +840,92 @@ def solve_point_constraints(points, constraints, pinned=None, tol=1e-16,
     cost = float(r @ r)
     lam = 1e-3
     J = np.zeros((r.size, U))
+
+    def _fill_analytic_rows():
+        """Overlay exact Jacobian rows for tangent_to_face, g2, and g3
+        constraints onto J, at the current pts."""
+        nonlocal J
+        off = 0
+        for c in constraints:
+            n_res = 0
+            try:
+                n_res = len(_constraint_residuals(pts, [c]))
+            except Exception:
+                n_res = 0
+            if c[0] == "tangent_to_face":
+                i, j, face = c[1], c[2], c[3]
+                if i not in idx_of or j not in idx_of:
+                    off += n_res
+                    continue
+                p_i = pts[i]
+                p_j = pts[j]
+                cache_key = (id(face), (p_i.x, p_i.y, p_i.z))
+                if cache_key in _constraint_residuals._face_normal_cache:
+                    _closest_on_face, n = _constraint_residuals._face_normal_cache[cache_key]
+                else:
+                    try:
+                        _d = Part.Vertex(p_i).distToShape(face)[0]
+                        _closest_on_face = _d[1][0][1]
+                        n = face.normalAt(*face.Surface.parameter(_closest_on_face))
+                        _constraint_residuals._face_normal_cache[cache_key] = (_closest_on_face, n)
+                    except Exception:
+                        n = None
+                if n is None or n.Length < 1e-9:
+                    off += n_res
+                    continue
+                dr_dp_i, dr_dp_j = tangent_to_face_jacobian(p_i, p_j, face, n)
+                if dr_dp_i is None:
+                    off += n_res
+                    continue
+                row = off
+                ci_i = idx_of[i]
+                ci_j = idx_of[j]
+                J[row, 3 * ci_i:3 * ci_i + 3] = (dr_dp_i.x, dr_dp_i.y, dr_dp_i.z)
+                J[row, 3 * ci_j:3 * ci_j + 3] = (dr_dp_j.x, dr_dp_j.y, dr_dp_j.z)
+                off += n_res
+            elif c[0] == "g2":
+                i, j, k = c[1], c[2], c[3]
+                if i not in idx_of or j not in idx_of or k not in idx_of:
+                    off += n_res
+                    continue
+                p_i = pts[i]
+                p_j = pts[j]
+                p_k = pts[k]
+                dRi, dRj, dRk = g2_jacobian(p_i, p_j, p_k)
+                if dRi is None:
+                    off += n_res
+                    continue
+                ci_i, ci_j, ci_k = idx_of[i], idx_of[j], idx_of[k]
+                for r in range(3):
+                    row = off + r
+                    J[row, 3 * ci_i:3 * ci_i + 3] = (dRi[r][0], dRi[r][1], dRi[r][2])
+                    J[row, 3 * ci_j:3 * ci_j + 3] = (dRj[r][0], dRj[r][1], dRj[r][2])
+                    J[row, 3 * ci_k:3 * ci_k + 3] = (dRk[r][0], dRk[r][1], dRk[r][2])
+                off += n_res
+            elif c[0] == "g3":
+                i, j, k, l = c[1], c[2], c[3], c[4]
+                if i not in idx_of or j not in idx_of or k not in idx_of or l not in idx_of:
+                    off += n_res
+                    continue
+                p_i = pts[i]
+                p_j = pts[j]
+                p_k = pts[k]
+                p_l = pts[l]
+                dRi, dRj, dRk, dRl = g3_jacobian(p_i, p_j, p_k, p_l)
+                if dRi is None:
+                    off += n_res
+                    continue
+                ci_i, ci_j, ci_k, ci_l = idx_of[i], idx_of[j], idx_of[k], idx_of[l]
+                for r in range(3):
+                    row = off + r
+                    J[row, 3 * ci_i:3 * ci_i + 3] = (dRi[r][0], dRi[r][1], dRi[r][2])
+                    J[row, 3 * ci_j:3 * ci_j + 3] = (dRj[r][0], dRj[r][1], dRj[r][2])
+                    J[row, 3 * ci_k:3 * ci_k + 3] = (dRk[r][0], dRk[r][1], dRk[r][2])
+                    J[row, 3 * ci_l:3 * ci_l + 3] = (dRl[r][0], dRl[r][1], dRl[r][2])
+                off += n_res
+            else:
+                off += n_res
+
     for _ in range(max_iter):
         if cost < tol:
             break
@@ -558,6 +935,8 @@ def solve_point_constraints(points, constraints, pinned=None, tol=1e-16,
             x[k] = xk + step
             J[:, k] = (residual(x) - r) / step
             x[k] = xk
+        # Overlay analytic rows (exact derivatives) on the numeric columns:
+        _fill_analytic_rows()
         JtJ = J.T @ J
         Jtr = J.T @ r
         eye = np.eye(U)
@@ -765,6 +1144,9 @@ __all__ = [
     'constraint_point_indices',
     'constraint_violations',
     'solve_point_constraints',
+    'tangent_to_face_jacobian',
+    'g2_jacobian',
+    'g3_jacobian',
     'rolling_ball_fillet',
     'multi_rail_fillet',
 ]

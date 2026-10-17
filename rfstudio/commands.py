@@ -39,6 +39,178 @@ def _icon(name):
     return p if os.path.exists(p) else os.path.join(_ICON_DIR, "rfstudio.svg")
 
 
+# --- engine health tracking ------------------------------------------------ #
+# Tracks per-command native-provider failures so a button whose native
+# implementation keeps crashing is auto-disabled instead of failing at
+# every click.  Engine commands (Curves/Silk delegations) are not tracked
+# here -- their availability is governed by deps.installed() instead.
+FAILURE_THRESHOLD = 3
+_ENGINE_HEALTH = {}   # cmd_id -> {"failures": int, "disabled": bool}
+
+
+def engine_health(cmd_id):
+    """Return the health dict for a command id (creating it if needed)."""
+    return _ENGINE_HEALTH.setdefault(
+        cmd_id, {"failures": 0, "disabled": False})
+
+
+def engine_health_record_failure(cmd_id, exc):
+    """Increment the failure count for a command; disable it once the
+    threshold is exceeded.  Returns True when the command was just
+    disabled."""
+    h = engine_health(cmd_id)
+    h["failures"] += 1
+    if h["failures"] >= FAILURE_THRESHOLD and not h["disabled"]:
+        h["disabled"] = True
+        FreeCAD.Console.PrintWarning(
+            "Railform Studio: %s auto-disabled after %d native-provider "
+            "failures (last: %s).  Use 'Reset Engine Health' to re-enable.\n"
+            % (cmd_id, h["failures"], exc))
+        return True
+    return False
+
+
+def engine_health_record_success(cmd_id):
+    """Reset the failure count for a command (called on successful run)."""
+    h = engine_health(cmd_id)
+    h["failures"] = 0
+
+
+def engine_health_disabled():
+    """List of command ids currently disabled by the health tracker."""
+    return sorted(
+        c for c, h in _ENGINE_HEALTH.items() if h["disabled"])
+
+
+def engine_health_reset():
+    """Reset all engine-health failure counts and re-enable commands."""
+    _ENGINE_HEALTH.clear()
+    FreeCAD.Console.PrintMessage(
+        "Railform Studio: engine health reset -- all providers re-enabled.\n")
+
+
+# --- selection helpers ------------------------------------------------------- #
+def _selection():
+    """Current Gui selection as a list of (object, sub-element-names) pairs."""
+    try:
+        return FreeCADGui.Selection.getSelectionEx() or []
+    except Exception:
+        return []
+
+
+def _selection_count():
+    return len(_selection())
+
+
+def _selection_has_face():
+    """True when at least one selected sub-element is a Face."""
+    for so in _selection():
+        for sub in (so.SubObjects or []):
+            if getattr(sub, "ShapeType", "") == "Face":
+                return True
+    return False
+
+
+def _selection_has_edge():
+    """True when at least one selected sub-element is an Edge."""
+    for so in _selection():
+        for sub in (so.SubObjects or []):
+            if getattr(sub, "ShapeType", "") == "Edge":
+                return True
+    return False
+
+
+def _selection_has_solid():
+    """True when at least one selected object is a Solid."""
+    for so in _selection():
+        shp = getattr(so.Object, "Shape", None)
+        if shp is not None and getattr(shp, "ShapeType", "") == "Solid":
+            return True
+    return False
+
+
+def _selection_has_external_sources():
+    """True when any selected object carries ExternalSources (linked projections,
+    i.e. associative references from issues #14/#7 -- editing it directly would
+    break those references)."""
+    for so in _selection():
+        obj = so.Object
+        if obj is not None and hasattr(obj, "ExternalSources") and \
+                obj.ExternalSources:
+            return True
+    return False
+
+
+def _selection_ok_for(cmd_id):
+    """Selection-validity pre-check for provider commands that need specific
+    geometry.  Returns (ok, reason)."""
+    sel = _selection()
+    if not sel:
+        return False, "select geometry first"
+
+    if cmd_id == "RFS_Trim":
+        # needs a face + an edge/curve
+        return (_selection_has_face() and _selection_has_edge()), \
+            "select one face and one boundary curve"
+    if cmd_id == "RFS_SketchOnSurf":
+        return (_selection_has_face() and _selection_has_edge()), \
+            "select one face and one curve"
+    if cmd_id == "RFS_BlendSurf":
+        return _selection_has_face() and _selection_count() >= 2, \
+            "select two surfaces"
+    if cmd_id == "RFS_BlendSurfClosed":
+        return _selection_count() >= 3, "select >= 3 faces"
+    if cmd_id in ("RFS_Combs", "RFS_Zebra", "RFS_Reflect",
+                  "RFS_DraftAnalysis", "RFS_Analysis"):
+        return _selection_has_face(), "select one face/surface"
+    if cmd_id == "RFS_ContinuityCheck":
+        return _selection_count() >= 2, "select two adjacent faces"
+    if cmd_id == "RFS_NetworkAudit":
+        return _selection_has_face(), "select a patch network"
+    if cmd_id == "RFS_GaussianCurvature":
+        return _selection_has_face(), "select faces"
+    return True, ""
+
+
+# --- command sets for behaviour gating -------------------------------------- #
+# Panel commands that need at least one object selected before they can run.
+_PANEL_NEEDS_SELECTION = {
+    "RFS_Fillet", "RFS_Chamfer", "RFS_Shell", "RFS_Offset", "RFS_Thicken",
+    "RFS_MirrorGroup", "RFS_Combs", "RFS_Zebra", "RFS_Reflect",
+    "RFS_Analysis", "RFS_DraftAnalysis", "RFS_ContinuityCheck",
+    "RFS_NetworkAudit", "RFS_SurfaceReview", "RFS_GaussianCurvature",
+    "RFS_BlendSurf", "RFS_BlendSurfClosed", "RFS_TrimByIntersection",
+    "RFS_MeshToSurface", "RFS_HiddenLineExport", "RFS_Mirror",
+    "RFS_Sweep2Rail", "RFS_Fill",
+}
+
+# Commands that modify/destroy geometry -- require explicit confirmation.
+_DESTRUCTIVE = {
+    "RFS_BooleanSubtract", "RFS_BooleanUnion", "RFS_BooleanIntersect",
+    "RFS_Trim", "RFS_TrimByIntersection", "RFS_Shell", "RFS_Fillet",
+    "RFS_Chamfer",
+}
+
+# Commands that must not run while another object is being edited.
+_EDITING_OBJ = None  # name of the object currently in edit mode
+
+
+def _confirm_destructive(cmd_id, menu_text):
+    """Show a confirmation dialog before running a destructive command.
+    Returns True when the user confirms, False to abort."""
+    try:
+        reply = QtWidgets.QMessageBox.question(
+            FreeCADGui.getMainWindow(), "Railform Studio",
+            "“%s” will modify the selected geometry.\n"
+            "This cannot be undone with Ctrl+Z unless the operation is "
+            "wrapped in a transaction.  Continue?" % menu_text,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        return reply == QtWidgets.QMessageBox.Yes
+    except Exception:
+        return True
+
+
 # --------------------------------------------------------------------------- #
 class ProviderCommand:
     """Re-exposes a curated action under one identity, backed by an ORDERED
@@ -70,9 +242,28 @@ class ProviderCommand:
     def IsActive(self):
         if FreeCAD.ActiveDocument is None:
             return False
-        return any(self._provider_ready(p) for p in self._chain)
+        if engine_health(self._id)["disabled"]:
+            return False
+        if not any(self._provider_ready(p) for p in self._chain):
+            return False
+        ok, _reason = _selection_ok_for(self._id)
+        return ok
 
     def Activated(self):
+        ok, reason = _selection_ok_for(self._id)
+        if not ok:
+            FreeCAD.Console.PrintWarning(
+                "Railform Studio: %s -- %s\n" % (self._id, reason))
+            try:
+                QtWidgets.QMessageBox.warning(
+                    FreeCADGui.getMainWindow(), "Railform Studio",
+                    "%s" % reason)
+            except Exception:
+                pass
+            return
+        if self._id in _DESTRUCTIVE and not _confirm_destructive(
+                self._id, self._res.get("MenuText", self._id)):
+            return
         for provider in self._chain:
             if provider[0] == "native":
                 fn = getattr(engines, provider[1], None)
@@ -80,15 +271,15 @@ class ProviderCommand:
                     continue
                 try:
                     fn()
+                    engine_health_record_success(self._id)
                     return
                 except Exception as exc:
-                    FreeCAD.Console.PrintWarning(
-                        "Railform Studio: native provider for %s failed "
-                        "(%s) -- trying next provider.\n" % (self._id, exc))
+                    engine_health_record_failure(self._id, exc)
                     continue
             else:
                 _, mod, target = provider
                 if engines.run_engine_command(mod, target):
+                    engine_health_record_success(self._id)
                     return
         FreeCAD.Console.PrintError(
             "Railform Studio: no working provider for %s (tried: %s).\n"
@@ -107,6 +298,34 @@ class ProviderCommand:
             pass
 
 
+class HealthResetCommand:
+    """Resets the engine-health failure counts and re-enables any
+    auto-disabled commands."""
+
+    def __init__(self):
+        self._res = {
+            "MenuText": "Reset Engine Health",
+            "ToolTip": "Re-enable any Railform Studio commands auto-disabled "
+                       "after repeated native-provider failures.",
+            "Pixmap": _icon("rfstudio.svg"),
+        }
+
+    def GetResources(self):
+        return self._res
+
+    def IsActive(self):
+        return FreeCAD.ActiveDocument is not None
+
+    def Activated(self):
+        engine_health_reset()
+        try:
+            QtWidgets.QMessageBox.information(
+                FreeCADGui.getMainWindow(), "Railform Studio",
+                "Engine health reset -- all providers re-enabled.")
+        except Exception:
+            pass
+
+
 class PanelCommand:
     """Opens one of our curated task panels."""
 
@@ -118,11 +337,34 @@ class PanelCommand:
         return self._res
 
     def IsActive(self):
-        return FreeCAD.ActiveDocument is not None
+        if FreeCAD.ActiveDocument is None:
+            return False
+        if self._id in _PANEL_NEEDS_SELECTION and not _selection():
+            return False
+        if _selection_has_external_sources():
+            # referenced objects are read-only -- editing breaks associations
+            return False
+        return True
 
     def Activated(self):
+        global _EDITING_OBJ
         if FreeCAD.ActiveDocument is None:
             FreeCAD.newDocument()
+        # single-edit-mode: refuse to open a second edit panel while one
+        # object is already being edited
+        if _EDITING_OBJ is not None:
+            try:
+                QtWidgets.QMessageBox.information(
+                    FreeCADGui.getMainWindow(), "Railform Studio",
+                    "Finish editing “%s” before opening another tool."
+                    % _EDITING_OBJ)
+            except Exception:
+                pass
+            return
+        # destructive confirmation
+        if self._id in _DESTRUCTIVE and not _confirm_destructive(
+                self._id, self._res.get("MenuText", self._id)):
+            return
         # auto-clear any (possibly stale) open dialog instead of blocking --
         # a stranded dialog used to wedge the workbench so no new tool worked
         if FreeCADGui.Control.activeDialog():
@@ -130,7 +372,29 @@ class PanelCommand:
                 FreeCADGui.Control.closeDialog()
             except Exception:
                 pass
-        FreeCADGui.Control.showDialog(self._factory())
+        # mark the object being edited (best-effort: first selected object)
+        sel = _selection()
+        if sel:
+            _EDITING_OBJ = getattr(sel[0].Object, "Name", None)
+        try:
+            panel = self._factory()
+            FreeCADGui.Control.showDialog(panel)
+        except Exception:
+            _EDITING_OBJ = None
+            raise
+        finally:
+            # clear edit-mode marker when the panel closes
+            def _clear():
+                global _EDITING_OBJ
+                _EDITING_OBJ = None
+            try:
+                FreeCADGui.Control.closeDialog
+            except Exception:
+                pass
+            FreeCADGui.Control.activeDialog
+            # use a timer so the marker clears after the dialog is dismissed
+            from PySide import QtCore
+            QtCore.QTimer.singleShot(500, _clear)
 
 
 def _surface_panel(kind):
@@ -330,10 +594,13 @@ _PANEL_COMMANDS = {
                            "Iteratively rebuild the worst seam's worse face to drive the network toward a target continuity.",
                            "rfs_balance.svg"),
     # NURBS push/pull direct manipulation
-    "RFS_NURBSPushPull": (lambda: panel_nurbspull.createPanel(),
-                                                           "NURBS Push/Pull",
-                                                           "Push/pull NURBS control points with interactive draggers",
-                                                           "rfs_nurbs_pushpull.svg"),
+    # Removed from curated toolbar -- only accessible via double-click in the
+    # tree browser (SurfaceVP.doubleClicked), so direct manipulation is
+    # never started accidentally from a toolbar button.
+    # "RFS_NURBSPushPull": (lambda: panel_nurbspull.createPanel(),
+    #                        "NURBS Push/Pull",
+    #                        "Push/pull NURBS control points with interactive draggers",
+    #                        "rfs_nurbs_pushpull.svg"),
 }
 
 # Delegating commands -- curated label + tooltip + icon per engine command.
@@ -345,7 +612,9 @@ _DELEGATE_META = {
     "RFS_CleanPatch44": ("Clean patch 4x4", "Low-CP bicubic patch from a control grid (native; falls back to Silk).", "rfs_patch44.svg"),
     "RFS_CleanPatch66": ("Clean patch 6x6", "Low-CP bi-quintic patch (native; falls back to Silk).", "rfs_patch66.svg"),
     "RFS_ControlPoly4": ("Control poly (cubic)", "Cubic control polygon from 4 points (native; falls back to Silk).", "rfs_poly.svg"),
-    "RFS_StarPatch":    ("Star-point patch", "N-sided patch (Silk G2 when available; native G0/G1 fallback).", "rfs_star.svg"),
+    "RFS_StarPatch":    ("Star-point patch", "N-sided patch (native; exact "
+                       "G0 / tangent-plane G1 continuity).",
+                       "rfs_star.svg"),
     "RFS_Combs":        ("Curvature combs", "Parametric curvature comb (Curves).", "rfs_comb.svg"),
     "RFS_Zebra":        ("Zebra", "Zebra stripe analysis (Curves).", "rfs_zebra.svg"),
     "RFS_Reflect":      ("Reflect lines", "Reflection line analysis (Curves).", "rfs_reflect.svg"),
@@ -387,6 +656,11 @@ _DELEGATE_META = {
                             "Project solids/surfaces to a 2D hidden-line "
                             "drawing and export as SVG (native).",
                             "rfs_hidden_line.svg"),
+    # --- engine health ------------------------------------------------------- #
+    "RFS_ResetHealth": ("Reset Engine Health",
+                       "Re-enable any Railform Studio commands auto-disabled "
+                       "after repeated native-provider failures.",
+                       "rfstudio.svg"),
 }
 
 # Curated toolbars/menus -- workflow-ordered, deliberately small.
@@ -401,7 +675,7 @@ TOOLBARS = [
                           "RFS_BlendSurfClosed", "RFS_Trim",
                           "RFS_TrimByIntersection", "RFS_SketchOnSurf",
                           "RFS_Offset", "RFS_Thicken", "RFS_Shell",
-                          "RFS_StitchShell", "RFS_NURBSPushPull"]),
+                          "RFS_StitchShell"]),
     ("Railform Clean",   ["RFS_ControlPoly4", "RFS_CleanPatch44",
                           "RFS_CleanPatch66", "RFS_StarPatch",
                           "RFS_Fillet", "RFS_Chamfer",
@@ -414,7 +688,8 @@ TOOLBARS = [
                           "RFS_GaussianCurvature",
                           "RFS_ContinuityCheck", "RFS_NetworkAudit",
                           "RFS_BalanceNetwork", "RFS_GlobalFair",
-                          "RFS_SurfaceReview", "RFS_WorkflowGuide"]),
+                          "RFS_SurfaceReview", "RFS_WorkflowGuide",
+                          "RFS_ResetHealth"]),
     ("Railform Exchange",["RFS_ImportRails", "RFS_HiddenLineExport"]),
 ]
 
@@ -436,4 +711,7 @@ def register():
     for cmd_id, (panel, menu, tip, icon) in _PANEL_COMMANDS.items():
         FreeCADGui.addCommand(cmd_id, PanelCommand(panel, menu, tip, icon))
     for cmd_id, (menu, tip, icon) in _DELEGATE_META.items():
+        if cmd_id == "RFS_ResetHealth":
+            continue   # registered below as a plain command, not a provider
         FreeCADGui.addCommand(cmd_id, ProviderCommand(cmd_id, menu, tip, icon))
+    FreeCADGui.addCommand("RFS_ResetHealth", HealthResetCommand())

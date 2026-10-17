@@ -569,6 +569,8 @@ _CONSTRAINT_SPECS = {
     "symmetric":       (4, ("int", "int", "int")),
     "mirror":          (7, ("int", "int", "float", "float", "float", "float")),
     "tangent_to_face": (4, ("int", "int", "src_idx")),  # i, j, src_idx into ExternalSources
+    "g2":              (4, ("int", "int", "int")),      # i, j, k — curvature continuity at joint j
+    "g3":              (5, ("int", "int", "int", "int")),  # i, j, k, l — jerk continuity at joint j-k
 }
 
 def _parse_constraints(strings):
@@ -828,6 +830,10 @@ class Sketch3DPanel(object):
         self._dim_preview_root = None
         self._dim_preview_sep = {}   # label -> coin separator for each constraint
         self._section_plane = None
+        # issues.md #11: interactive "create plane from 3 viewport picks" mode
+        self._plane_pick_mode = False
+        self._plane_pick_pts = []
+        self._cb_plane_pick = None
 
         self.form = QtWidgets.QWidget()
         self.form.setWindowTitle("Railform -- 3D Sketch")
@@ -1026,6 +1032,13 @@ class Sketch3DPanel(object):
         create_plane_btn = QtWidgets.QPushButton("Create plane")
         create_plane_btn.clicked.connect(self._create_local_plane)
         plane_row.addWidget(create_plane_btn)
+        pick3_btn = QtWidgets.QPushButton("Plane from 3 picks")
+        pick3_btn.setCheckable(True)
+        pick3_btn.setToolTip("Click 3 points in the 3D view to define a new "
+                             "local construction plane, then keep placing on it")
+        pick3_btn.toggled.connect(self._toggle_plane_pick3)
+        plane_row.addWidget(pick3_btn)
+        self.plane_pick3_btn = pick3_btn
         self.plane_switch = QtWidgets.QPushButton("Switch: Global")
         self.plane_switch.setCheckable(True)
         self.plane_switch.setToolTip("Tab: cycle through planes used in this sketch")
@@ -1130,7 +1143,7 @@ class Sketch3DPanel(object):
         self.dim_type = QtWidgets.QComboBox()
         for t in ("distance", "coincide", "horizontal", "vertical",
                   "angle", "equal", "fix", "tangent", "concentric",
-                  "symmetric", "mirror"):
+                  "symmetric", "mirror", "g2", "g3"):
             self.dim_type.addItem(t)
         self.dim_type.currentIndexChanged.connect(self._on_dim_type_changed)
         dim_row.addWidget(self.dim_type)
@@ -1146,6 +1159,11 @@ class Sketch3DPanel(object):
         self.dim_k = QtWidgets.QSpinBox()
         self.dim_k.setRange(0, 999)
         dim_row.addWidget(self.dim_k)
+        dim_row.addWidget(QtWidgets.QLabel("→ P"))
+        self.dim_l = QtWidgets.QSpinBox()
+        self.dim_l.setRange(0, 999)
+        self.dim_l.setToolTip("4th point for G3 jerk continuity constraint")
+        dim_row.addWidget(self.dim_l)
         dim_row.addWidget(QtWidgets.QLabel("="))
         self.dim_len = QtWidgets.QDoubleSpinBox()
         self.dim_len.setRange(0, 1e6)
@@ -1950,6 +1968,19 @@ class Sketch3DPanel(object):
             c = ("mirror", i, j) + params
             label = "mirror P%d<->P%d (%s)" % (
                 i, j, self.mirror_plane.currentText())
+        elif kind == "g2":
+            # G2 curvature continuity at joint j between segments i-j and j-k
+            if len({i, j, k}) < 3 or _oob(i) or _oob(j) or _oob(k):
+                return self._bad()
+            c = ("g2", i, j, k)
+            label = "G2 P%d-P%d-P%d" % (i, j, k)
+        elif kind == "g3":
+            # G3 jerk continuity at joint between segments i-j-k and j-k-l
+            l = self.dim_l.value()
+            if len({i, j, k, l}) < 4 or _oob(i) or _oob(j) or _oob(k) or _oob(l):
+                return self._bad()
+            c = ("g3", i, j, k, l)
+            label = "G3 P%d-P%d-P%d-P%d" % (i, j, k, l)
         else:  # angle
             if len({i, j, k}) < 3 or _oob(i) or _oob(j) or _oob(k):
                 return self._bad()
@@ -1976,13 +2007,15 @@ class Sketch3DPanel(object):
         """Update UI when constraint type changes in the manual entry row."""
         kind = self.dim_type.currentText()
         # Enable/disable spinboxes based on constraint type
-        need_i = kind in ("distance", "coincide", "horizontal", "vertical", "angle", "equal", "fix", "tangent", "concentric", "symmetric", "mirror")
-        need_j = kind in ("distance", "coincide", "angle", "equal", "tangent", "concentric", "symmetric", "mirror")
-        need_k = kind in ("angle", "equal", "tangent", "concentric", "symmetric")
+        need_i = kind in ("distance", "coincide", "horizontal", "vertical", "angle", "equal", "fix", "tangent", "concentric", "symmetric", "mirror", "g2", "g3")
+        need_j = kind in ("distance", "coincide", "angle", "equal", "tangent", "concentric", "symmetric", "mirror", "g2", "g3")
+        need_k = kind in ("angle", "equal", "tangent", "concentric", "symmetric", "g2", "g3")
+        need_l = kind == "g3"
         need_len = kind in ("distance", "horizontal", "vertical", "angle")
         self.dim_i.setEnabled(need_i)
         self.dim_j.setEnabled(need_j)
         self.dim_k.setEnabled(need_k)
+        self.dim_l.setEnabled(need_l)
         self.dim_len.setEnabled(need_len)
 
     def _bad(self):
@@ -2821,12 +2854,15 @@ class Sketch3DPanel(object):
                 self.plane_combo.setCurrentIndex(self.plane_combo.findText(nxt))
                 # _on_plane_changed rebuilds grid/triad + status line already
                 self.status.setText("Plane: %s (Tab)" % nxt)
-            elif key == 27:           # Esc: drop the active drag gesture
+            elif key == 27:           # Esc: drop the active drag gesture / cancel pick3
                 if self._dragging:
                     self._dragging = False
                     self._drag_idx = None
                     self._drag_anchor = None
                     self._remove_snap_feedback()
+                if self._plane_pick_mode:
+                    self._stop_plane_pick3()
+                    self._update_status()
                     self._update_status()
             elif key == 13:           # Enter: edit hovered constraint
                 self._edit_hovered_constraint()
@@ -3802,6 +3838,111 @@ class Sketch3DPanel(object):
         self._refresh_plane_combos()
         self.status.setText(f"Created local plane #{len(self._plane_data) - 1}")
 
+    # --- interactive "create plane from 3 viewport picks" (issues.md #11) -- #
+    def _toggle_plane_pick3(self, checked):
+        """Enter/exit pick-3 mode: 3 viewport clicks define a local plane."""
+        if checked:
+            if self.place_btn.isChecked():
+                self.place_btn.setChecked(False)
+            if self.drag_btn.isChecked():
+                self.drag_btn.setChecked(False)
+            self._plane_pick_mode = True
+            self._plane_pick_pts = []
+            self.status.setText("Plane from 3 picks: click point 1 of 3")
+            try:
+                view = FreeCADGui.ActiveDocument.ActiveView
+                if view is not None:
+                    self._cb_plane_pick = view.addEventCallback(
+                        "SoMouseButtonEvent", self._on_plane_pick_click)
+            except Exception:
+                self._cb_plane_pick = None
+        else:
+            self._stop_plane_pick3()
+
+    def _stop_plane_pick3(self):
+        self._plane_pick_mode = False
+        self._plane_pick_pts = []
+        try:
+            self.plane_pick3_btn.setChecked(False)
+        except Exception:
+            pass
+        try:
+            view = FreeCADGui.ActiveDocument.ActiveView
+            if view is not None and self._cb_plane_pick is not None:
+                drop_callbacks(view, (("SoMouseButtonEvent", self, "_cb_plane_pick"),))
+        except Exception:
+            pass
+        self._cb_plane_pick = None
+        self.status.setText("Plane pick3 cancelled")
+
+    def _on_plane_pick_click(self, ev):
+        if ev.get("Type") != "SoMouseButtonEvent" or ev.get("State") != "DOWN":
+            return
+        if ev.get("Button") != "BUTTON1":
+            return
+        if not self._plane_pick_mode:
+            return
+        try:
+            view = FreeCADGui.ActiveDocument.ActiveView
+            pos = ev["Position"]
+            ray = snaputil.pick_ray(view, pos)
+            if ray is None:
+                return
+            ro, rd = ray
+            origin, normal = panel_logic.construction_plane(
+                self._plane_base, self._plane_normal,
+                offset=self.offset.value())
+            hit = panel_logic.ray_plane_intersect(
+                (ro.x, ro.y, ro.z), (rd.x, rd.y, rd.z), origin, normal)
+            if hit is None:
+                return
+            self._plane_pick_pts.append(hit)
+            n = len(self._plane_pick_pts)
+            self.status.setText(
+                "Plane from 3 picks: click point %d of 3" % (n + 1))
+            if n == 3:
+                p0, p1, p2 = self._plane_pick_pts
+                u = (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2])
+                ul = (u[0]**2 + u[1]**2 + u[2]**2) ** 0.5
+                if ul < 1e-9:
+                    self.status.setText("Plane pick3: first two points coincide")
+                    self._plane_pick_pts = self._plane_pick_pts[1:]
+                    return
+                u = (u[0] / ul, u[1] / ul, u[2] / ul)
+                w = (p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2])
+                v = (u[1] * w[2] - u[2] * w[1],
+                     u[2] * w[0] - u[0] * w[2],
+                     u[0] * w[1] - u[1] * w[0])
+                vl = (v[0]**2 + v[1]**2 + v[2]**2) ** 0.5
+                if vl < 1e-9:
+                    self.status.setText("Plane pick3: points are collinear")
+                    self._plane_pick_pts = self._plane_pick_pts[1:]
+                    return
+                v = (v[0] / vl, v[1] / vl, v[2] / vl)
+                nrm = (u[1] * v[2] - u[2] * v[1],
+                       u[2] * v[0] - u[0] * v[2],
+                       u[0] * v[1] - u[1] * v[0])
+                o = ((p0[0] + p1[0] + p2[0]) / 3.0,
+                     (p0[1] + p1[1] + p2[1]) / 3.0,
+                     (p0[2] + p1[2] + p2[2]) / 3.0)
+                from FreeCAD import Vector
+                plane = (Vector(*o), Vector(*nrm), Vector(*u), Vector(*v))
+                self._plane_data.append(plane)
+                self._refresh_plane_combos()
+                # Make the new plane active on all rows
+                for r in self._rows:
+                    try:
+                        r.plane.setCurrentIndex(len(self._plane_data) - 1)
+                    except Exception:
+                        pass
+                self._stop_plane_pick3()
+                self._update_status()
+                self.status.setText(
+                    "Created local plane #%d from 3 picks -- active on all rows"
+                    % (len(self._plane_data) - 1))
+        except Exception as exc:
+            self.status.setText("Plane pick3 failed: %s" % exc)
+
     def _refresh_plane_combos(self):
         """Update all point row plane combos with available local planes."""
         for r in self._rows:
@@ -3997,6 +4138,7 @@ class Sketch3DPanel(object):
         try:
             self._stop_placing()
             self._stop_drag_edit()
+            self._stop_plane_pick3()
             self._remove_plane_grid()
             self._remove_dim_preview()
             self._remove_place_preview()

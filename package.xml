@@ -14,7 +14,8 @@
       <description>Curated surfacing over Curves + Silk</description>
     </workbench>
   </content>
-  <!-- depend-and-wrap: these must be installed for full functionality -->
-  <depend type="addon">Curves</depend>
-  <depend type="addon">Silk</depend>
+  <!-- depend-and-wrap: Curves + Silk are OPTIONAL runtime fallbacks.
+       Railform Studio ships native OCCT implementations of every curated
+       action, so it operates fully standalone. Install Curves/Silk only for
+       the engine-first path on RFS_StarPatch (true G2 vs native near-G2). -->
 </package>

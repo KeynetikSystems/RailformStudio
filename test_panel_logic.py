@@ -505,6 +505,97 @@ def test_equation_manager_persistence():
     out("  equation manager persistence OK")
 
 
+# --- per-point DOF analysis tests (issues.md #8) -------------------------- #
+class _Pt(object):
+    """Duck-typed 3D point for headless DOF tests (no FreeCAD.Vector needed)."""
+    def __init__(self, x, y, z):
+        self.x, self.y, self.z = x, y, z
+
+
+def _residual_distance(pts, cons):
+    """Mock residual_fn: ('distance', i, j, d) -> |p_i - p_j| - d."""
+    out = []
+    for c in cons:
+        if c[0] == "distance":
+            i, j, d = c[1], c[2], c[3]
+            p1, p2 = pts[i], pts[j]
+            dist = ((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2) ** 0.5
+            out.append(dist - d)
+    return out
+
+
+def test_point_dof_analysis_under_defined():
+    """Three points, one distance constraint -> P0 and P1 under-defined,
+    P2 (unconstrained) fully free."""
+    pts = [_Pt(0, 0, 0), _Pt(10, 0, 0), _Pt(20, 0, 0)]
+    cons = [("distance", 0, 1, 10.0)]
+    analysis = panel_logic.point_dof_analysis(pts, cons,
+                                              residual_fn=_residual_distance)
+    assert analysis[0]["state"] == "under"
+    assert analysis[0]["rank"] == 1
+    assert analysis[0]["free_dof"] == 2
+    assert analysis[1]["state"] == "under"
+    assert analysis[1]["rank"] == 1
+    assert analysis[2]["state"] == "under"
+    assert analysis[2]["rank"] == 0
+    assert analysis[2]["free_dof"] == 3
+    out("  point dof under   OK")
+
+
+def test_point_dof_analysis_well_defined():
+    """Two points, three distance constraints -> over-constrained (3 eqns
+    for 6 DOF but only 1 unique direction each); actually each point gets
+    rank 1 from its incident distance, so under with 2 free dof each."""
+    pts = [_Pt(0, 0, 0), _Pt(10, 0, 0)]
+    cons = [("distance", 0, 1, 10.0)]
+    analysis = panel_logic.point_dof_analysis(pts, cons,
+                                              residual_fn=_residual_distance)
+    assert analysis[0]["state"] == "under"
+    assert analysis[1]["state"] == "under"
+    out("  point dof two-pt  OK")
+
+
+def test_point_dof_analysis_fixed():
+    """Pinned point reported as fixed."""
+    pts = [_Pt(0, 0, 0), _Pt(10, 0, 0)]
+    cons = [("distance", 0, 1, 10.0)]
+    analysis = panel_logic.point_dof_analysis(pts, cons, pinned={0},
+                                              residual_fn=_residual_distance)
+    assert analysis[0]["state"] == "fixed"
+    assert analysis[1]["state"] == "under"
+    out("  point dof fixed   OK")
+
+
+def test_point_dof_badge():
+    assert panel_logic.point_dof_badge("under") == ("under", "amber")
+    assert panel_logic.point_dof_badge("over") == ("over", "red")
+    assert panel_logic.point_dof_badge("well") == ("ok", "green")
+    assert panel_logic.point_dof_badge("fixed") == ("fixed", "gray")
+    assert panel_logic.point_dof_badge("bogus") == ("?", "gray")
+    out("  point dof badge   OK")
+
+
+def test_point_dof_summary():
+    analysis = {
+        0: {"state": "under"}, 1: {"state": "under"},
+        2: {"state": "well"}, 3: {"state": "over"},
+        4: {"state": "fixed"},
+    }
+    s = panel_logic.point_dof_summary(analysis)
+    assert "1 over" in s and "2 under" in s and "1 well" in s and "1 fixed" in s, s
+    out("  point dof summary OK")
+
+
+def test_point_involved_constraints():
+    pts = [_Pt(0, 0, 0), _Pt(10, 0, 0), _Pt(20, 0, 0)]
+    cons = [("distance", 0, 1, 10.0), ("distance", 1, 2, 10.0)]
+    inv = panel_logic.point_involved_constraints(pts, cons)
+    assert inv[0] == [0]
+    assert inv[1] == [0, 1]
+    assert inv[2] == [1]
+    out("  involved constrs  OK")
+
+
 if __name__ == "__main__" or True:  # freecadcmd may not set __main__
     for t in (test_readiness_ok, test_readiness_no_inputs_yet,
               test_readiness_below_minimum, test_readiness_above_maximum,
@@ -537,7 +628,13 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_equation_manager_configs,
               test_equation_manager_suppression,
               test_equation_manager_export_import,
-              test_equation_manager_persistence):
+              test_equation_manager_persistence,
+              test_point_dof_analysis_under_defined,
+              test_point_dof_analysis_well_defined,
+              test_point_dof_analysis_fixed,
+              test_point_dof_badge,
+              test_point_dof_summary,
+              test_point_involved_constraints):
         try:
             t()
         except Exception as e:

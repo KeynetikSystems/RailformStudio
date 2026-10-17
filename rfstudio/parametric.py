@@ -1318,9 +1318,11 @@ class CurveVP(object):
             return False
 
     def setEdit(self, vobj, mode=0):
-        from .editmode import PointEditor
-        self.edit_mode = PointEditor(vobj)
-        return True
+        # Editing is only allowed via double-click in the tree browser
+        # (CurveVP.doubleClicked).  Returning False here blocks all other
+        # entry points (Edit menu, toolbar edit buttons, etc.) so curves
+        # are not editable except through the browser double-click.
+        return False
 
     def unsetEdit(self, vobj, mode=0):
         if hasattr(self, 'edit_mode'):
@@ -1367,18 +1369,33 @@ class SurfaceVP(object):
         return
 
     def setEdit(self, vobj, mode=0):
-        try:
-            from .editmode import SurfaceEditor
-            self.edit_mode = SurfaceEditor(vobj)
-            # The editor handles the UI interaction
-            return True
-        except ImportError:
-            # Fallback if SurfaceEditor is not implemented
-            FreeCAD.Console.PrintMessage("Surface editing not implemented for this object type.\n")
-            return False
+        # Editing is only allowed via double-click in the tree browser
+        # (SurfaceVP.doubleClicked).  Returning False here blocks all other
+        # entry points so surfaces are not editable except through the
+        # browser double-click.
+        return False
 
     def unsetEdit(self, vobj, mode=0):
         if hasattr(self, 'edit_mode'):
             self.edit_mode.finish()
             del self.edit_mode
         return
+
+    def doubleClicked(self, vobj):
+        """Open NURBS Push/Pull panel for direct surface control-point
+        editing.  This is the only entry point for NURBS Push/Pull -- it
+        was removed from the curated toolbar so it cannot be launched
+        accidentally from a button."""
+        try:
+            from rfstudio import panel_nurbspull
+            if FreeCADGui.Control.activeDialog():
+                return True
+            FreeCADGui.Selection.clearSelection()
+            FreeCADGui.Selection.addSelection(vobj.Object)
+            panel = panel_nurbspull.createPanel()
+            FreeCADGui.Control.showDialog(panel)
+            return True
+        except Exception as exc:
+            FreeCAD.Console.PrintError(
+                "Railform: NURBS Push/Pull open failed (%s)\n" % exc)
+            return False

@@ -385,6 +385,8 @@ def constraint_anchor(constr, pts):
         return _safe_pt(pts, constr[1])
     if kind in ("angle", "tangent"):
         return _safe_pt(pts, constr[2])   # vertex / pivot
+    if kind in ("g2", "g3"):
+        return _safe_pt(pts, constr[2])   # joint point
     if kind == "equal":
         a, b = _safe_pt(pts, constr[1]), _safe_pt(pts, constr[2])
         if a is None or b is None:
@@ -406,6 +408,7 @@ def constraint_glyph(kind):
         "distance": "D", "coincide": "C", "horizontal": "H",
         "vertical": "V", "angle": "A", "equal": "E", "tangent": "T",
         "concentric": "O", "symmetric": "S", "fix": "X", "mirror": "M",
+        "g2": "2", "g3": "3",
     }.get(kind, "?")
 
 
@@ -473,6 +476,12 @@ def constraint_tooltip(constr, pts):
             return ("mirror P%d <-> P%d across plane n=(%.2f,%.2f,%.2f) d=%.2f"
                     % (constr[1], constr[2], constr[3], constr[4],
                        constr[5], constr[6]))
+        if kind == "g2":
+            return ("G2 curvature P%d-P%d-P%d continuous"
+                    % (constr[1], constr[2], constr[3]))
+        if kind == "g3":
+            return ("G3 jerk P%d-P%d-P%d-P%d continuous"
+                    % (constr[1], constr[2], constr[3], constr[4]))
     except (IndexError, TypeError):
         pass
     return "%s ? (bad indices)" % kind
@@ -1070,3 +1079,218 @@ def deserialize_equation_manager(doc, data):
     em.active_config = data.get("active_config", 0)
     em.linked_objects = data.get("linked_objects", [])
     return em
+
+
+# --- per-point under/over-defined diagnostics (issues.md #8) -------------- #
+# Constraint-level badges (constraint_badges) tell the user WHICH dim is
+# violated.  Per-row DOF analysis goes one level deeper: for each sketch
+# point, how many coordinate degrees of freedom does it have, how many are
+# actually constrained by the incident constraint set, and is the point
+# under-defined (free to move), over-defined (conflicting dims), or
+# fully-defined?  Pure math -- headless-testable, no FreeCAD/numpy needed.
+
+def _gauss_rank(matrix, tol=1e-9):
+    """Rank of a real matrix via Gaussian elimination with partial pivoting.
+    Pure Python (no numpy) so panel_logic stays dependency-free for
+    headless test_panel_logic.py runs under a stock interpreter."""
+    if not matrix or not matrix[0]:
+        return 0
+    m = [list(row) for row in matrix]
+    n_rows = len(m)
+    n_cols = len(m[0])
+    rank = 0
+    pivot_col = 0
+    for col in range(n_cols):
+        # find pivot row at or below `rank`
+        best = None
+        best_val = 0.0
+        for r in range(rank, n_rows):
+            v = abs(m[r][col])
+            if v > best_val:
+                best_val = v
+                best = r
+        if best is None or best_val < tol:
+            continue
+        m[rank], m[best] = m[best], m[rank]
+        piv = m[rank][col]
+        for r in range(n_rows):
+            if r != rank and abs(m[r][col]) > tol:
+                factor = m[r][col] / piv
+                for c in range(col, n_cols):
+                    m[r][c] -= factor * m[rank][c]
+        rank += 1
+        if rank >= n_rows:
+            break
+    return rank
+
+
+def _constraint_jacobian_row(c, pts, residual_fn=None):
+    """Numeric Jacobian rows for one constraint w.r.t. all point coords.
+    Returns a list of row-vectors (one per residual entry), each of length
+    3 * len(pts), with zeros everywhere except the columns of the points
+    the constraint touches.  Finite-difference step is scaled to the
+    coordinate magnitude.  `pts` is a list of objects with .x/.y/.z
+    (e.g. FreeCAD.Vector or any duck-typed triple).  `residual_fn` is an
+    optional callable (pts, [c]) -> list[float]; defaults to
+    core.constraints._constraint_residuals when available, injected by
+    tests so panel_logic stays importable without FreeCAD."""
+    if residual_fn is None:
+        try:
+            from rfstudio.core.constraints import _constraint_residuals as _cr
+        except Exception:
+            return [[0.0] * (3 * len(pts))]
+        residual_fn = _cr
+    eps = 1e-6
+    n_pts = len(pts)
+    base = residual_fn(pts, [c])
+    n_res = len(base)
+    rows = [[0.0] * (3 * n_pts) for _ in range(n_res)]
+    for pi in range(n_pts):
+        p0 = pts[pi]
+        for coord in range(3):
+            orig = (p0.x, p0.y, p0.z)[coord]
+            step = eps * (1.0 + abs(orig))
+            new_vals = [p0.x, p0.y, p0.z]
+            new_vals[coord] = orig + step
+            pts[pi] = _Point3(*new_vals)
+            try:
+                pert = residual_fn(pts, [c])
+            except Exception:
+                pert = base
+            pts[pi] = p0
+            for k in range(n_res):
+                rows[k][3 * pi + coord] = (pert[k] - base[k]) / step
+    return rows
+
+
+class _Point3(object):
+    """Duck-typed 3D point with .x/.y/.z for use inside _constraint_jacobian_row."""
+    __slots__ = ("x", "y", "z")
+    def __init__(self, x, y, z):
+        self.x, self.y, self.z = x, y, z
+
+
+def point_involved_constraints(pts, constraints, indices_fn=None):
+    """Map point index -> list of constraint indices that reference it.
+    Pure dict[int, list[int]]; the panel uses this to list, for a clicked
+    point, exactly which dims are fighting it (drag-to-diagnose).  `indices_fn`
+    is an optional callable (c) -> tuple of point indices; defaults to
+    core.constraints._constraint_point_indices when available, injected by
+    tests so panel_logic stays importable without FreeCAD."""
+    if indices_fn is None:
+        try:
+            from rfstudio.core.constraints import \
+                _constraint_point_indices as _cpi
+        except Exception:
+            return {}
+        indices_fn = _cpi
+    out = {}
+    for ci, c in enumerate(constraints):
+        for pi in indices_fn(c):
+            if 0 <= pi < len(pts):
+                out.setdefault(pi, []).append(ci)
+    return out
+
+
+def point_dof_analysis(pts, constraints, pinned=None, residual_fn=None):
+    """Per-point degrees-of-freedom analysis for a 3D sketch.
+
+    Returns a dict mapping point index -> {
+        "dof": int,            # coordinate DOF (3 in global 3D)
+        "rank": int,           # rank of incident constraint Jacobian
+        "state": "under"|"over"|"well"|"fixed",
+        "n_constraints": int,  # how many constraints touch this point
+        "constraints": [ci, ...],  # constraint indices involving this point
+        "free_dof": int,       # dof - rank when under, 0 otherwise
+        "redundant": int,      # rank - dof when over, 0 otherwise
+    }
+
+    pinned points are reported as "fixed" (they are held by the user or a
+    fix constraint and do not participate in the solve as unknowns).
+    Points not referenced by any constraint are "under" with dof=3, rank=0
+    (completely free) -- unless pinned.
+
+    Pure math (Gaussian-elimination rank, no numpy), so this runs
+    headlessly under `python test_panel_logic.py`.  The panel colors each
+    row from the returned state: red = over, amber = under, green = well,
+    gray = fixed.
+    """
+    pinned = set(pinned or ())
+    n_pts = len(pts)
+    involved = point_involved_constraints(pts, constraints)
+    out = {}
+    for pi in range(n_pts):
+        if pi in pinned:
+            out[pi] = {
+                "dof": 0, "rank": 0, "state": "fixed",
+                "n_constraints": len(involved.get(pi, [])),
+                "constraints": list(involved.get(pi, [])),
+                "free_dof": 0, "redundant": 0,
+            }
+            continue
+        dof = 3
+        con_indices = involved.get(pi, [])
+        n_con = len(con_indices)
+        if n_con == 0:
+            out[pi] = {
+                "dof": dof, "rank": 0, "state": "under",
+                "n_constraints": 0, "constraints": [],
+                "free_dof": dof, "redundant": 0,
+            }
+            continue
+        # Build the sub-Jacobian: only rows of constraints touching pi,
+        # only columns for pi's own 3 coords (rank w.r.t. this point alone
+        # tells us whether this point's motion is constrained).  Using only
+        # pi's columns is the right granularity for per-row badges: it
+        # answers "if I grab this point, can I move it?"
+        jac_rows = []
+        for ci in con_indices:
+            c = constraints[ci]
+            try:
+                rows = _constraint_jacobian_row(c, pts, residual_fn=residual_fn)
+            except Exception:
+                rows = []
+            for row in rows:
+                # keep only pi's 3 columns
+                jac_rows.append([row[3 * pi], row[3 * pi + 1], row[3 * pi + 2]])
+        rank = _gauss_rank(jac_rows) if jac_rows else 0
+        rank = min(rank, dof)
+        if rank < dof:
+            state = "under"
+        elif rank > dof:
+            state = "over"
+        else:
+            state = "well"
+        out[pi] = {
+            "dof": dof, "rank": rank, "state": state,
+            "n_constraints": n_con,
+            "constraints": list(con_indices),
+            "free_dof": dof - rank if state == "under" else 0,
+            "redundant": rank - dof if state == "over" else 0,
+        }
+    return out
+
+
+def point_dof_badge(state):
+    """Short label + color hint for a per-point DOF state."""
+    return {
+        "under": ("under", "amber"),
+        "over": ("over", "red"),
+        "well": ("ok", "green"),
+        "fixed": ("fixed", "gray"),
+    }.get(state, ("?", "gray"))
+
+
+def point_dof_summary(analysis):
+    """One-line verdict from point_dof_analysis: counts per state."""
+    counts = {}
+    for pi, info in analysis.items():
+        st = info["state"]
+        counts[st] = counts.get(st, 0) + 1
+    parts = []
+    for st in ("over", "under", "well", "fixed"):
+        if counts.get(st):
+            parts.append("%d %s" % (counts[st], st))
+    if not parts:
+        return "no points"
+    return "; ".join(parts)

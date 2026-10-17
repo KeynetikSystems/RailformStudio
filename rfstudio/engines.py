@@ -108,13 +108,10 @@ DELEGATIONS = {
 #     same quintic-Hermite technique match_surface already uses) --
 #     Curves_BlendSurf2 is kept only as the fallback for selections the
 #     native nearest-facing-side search can't resolve.
-#   - RFS_StarPatch (true G2 N-sided star-point patching) is the one
-#     action NOT planned for a native reimplementation -- it's CAGD
-#     research-level work. It is NOT, however, a single point of
-#     failure any more: native_star_patch (core.n_sided_patch, exact
-#     G0 + tangent-plane G1 by design) is chained as a last-resort
-#     provider, and vendoring a frozen snapshot of Silk's command is
-#     still the escape hatch for real G2 work.
+#   - RFS_StarPatch is now native only (core.n_sided_patch, exact G0 /
+#     tangent-plane G1). Silk's ControlGridNStar66 offered true G2 but is
+#     no longer a dependency; the curated button degrades gracefully to a
+#     working native tool instead of a dead button.
 #
 # RFS_CleanPatch44/66 and RFS_Trim/RFS_SketchOnSurf are chained NATIVE
 # FIRST, then the original engine command as fallback -- unlike MultiLoft
@@ -151,10 +148,11 @@ NATIVE_OVERRIDES = {
                           ("engine", "Curves", "Curves_SurfaceAnalysis")],
     "RFS_ControlPoly4": [("native", "native_control_poly4"),
                           ("engine", "Silk", "ControlPoly4")],
-    # Star patch: engine FIRST (true G2 beats the degraded native path);
-    # native only runs when Silk is missing/broken.
-    "RFS_StarPatch":    [("engine", "Silk", "ControlGridNStar66"),
-                          ("native", "native_star_patch")],
+    # Star patch: native only (exact G0 / tangent-plane G1). Silk's
+    # ControlGridNStar66 offered true G2 but is no longer a dependency;
+    # the curated button degrades gracefully to a working native tool
+    # instead of a dead button when Silk is absent.
+    "RFS_StarPatch":    [("native", "native_star_patch")],
     # Native visual-QA tools (fix for "no native fallback" gap #3) --
     # curvature comb / zebra stripes / reflection lines / draft-angle
     # analysis are all pure OCCT curvature/normal evaluation (see the
@@ -204,6 +202,41 @@ def _build_providers():
 
 
 PROVIDERS = _build_providers()
+
+
+def _add_feature_with_undo(doc, label, shape):
+    """Add a Part::Feature carrying `shape`, wrapped in an undo transaction
+    so Ctrl+Z reverts the creation. Raises on failure (transaction aborted)."""
+    doc.openTransaction("Railform Studio: " + label)
+    try:
+        obj = doc.addObject("Part::Feature", label)
+        obj.Shape = shape
+        doc.recompute()
+        doc.commitTransaction()
+    except Exception:
+        try:
+            doc.abortTransaction()
+        except Exception:
+            pass
+        raise
+    return obj
+
+
+def _with_undo(doc, label, fn):
+    """Run `fn` inside an undo transaction so Ctrl+Z reverts its document
+    mutations (object creation, Shape changes, group membership, etc.).
+    Raises on failure (transaction aborted)."""
+    doc.openTransaction("Railform Studio: " + label)
+    try:
+        result = fn()
+        doc.commitTransaction()
+        return result
+    except Exception:
+        try:
+            doc.abortTransaction()
+        except Exception:
+            pass
+        raise
 
 
 # --- native providers ------------------------------------------------------ #
@@ -294,9 +327,7 @@ def _run_clean_patch(n, label):
             if flat_w is not None else None)
     fn = core.clean_patch_44 if n == 4 else core.clean_patch_66
     doc = FreeCAD.ActiveDocument or FreeCAD.newDocument()
-    obj = doc.addObject("Part::Feature", label)
-    obj.Shape = fn(grid, weights=wgrid)
-    doc.recompute()
+    _add_feature_with_undo(doc, label, fn(grid, weights=wgrid))
 
 
 def _face_and_wire_from_selection(need_label):
@@ -337,9 +368,7 @@ def native_trim():
     face, wire = _face_and_wire_from_selection("Trim")
     trimmed = core.trim_face(face, wire)
     doc = FreeCAD.ActiveDocument
-    obj = doc.addObject("Part::Feature", "Trim")
-    obj.Shape = trimmed
-    doc.recompute()
+    _add_feature_with_undo(doc, "Trim", trimmed)
 
 
 def native_blend_surface():
@@ -372,9 +401,7 @@ def native_sketch_on_surf():
     face, wire = _face_and_wire_from_selection("Sketch on surface")
     projected = core.project_wire_onto_face(face, wire)
     doc = FreeCAD.ActiveDocument
-    obj = doc.addObject("Part::Feature", "SketchOnSurf")
-    obj.Shape = projected
-    doc.recompute()
+    _add_feature_with_undo(doc, "SketchOnSurf", projected)
 
 
 # --- variable-radius / rolling-ball fillets + global fairing -------------- #
@@ -579,10 +606,12 @@ def native_combs():
     edge, label = _selected_edge()          # raises on bad selection
     comb = core.curvature_comb(edge)
     doc = FreeCAD.ActiveDocument
-    obj, _created = groups.find_or_create(doc, "%s_Comb" % label)
-    obj.Shape = comb
-    groups.add_to_group(obj, "QA")
-    doc.recompute()
+    def _do():
+        obj, _created = groups.find_or_create(doc, "%s_Comb" % label)
+        obj.Shape = comb
+        groups.add_to_group(obj, "QA")
+        doc.recompute()
+    _with_undo(doc, "Curvature Comb", _do)
 
 
 def native_zebra():
@@ -600,10 +629,12 @@ def native_zebra():
     face, label = _selected_face()
     stripes = core.zebra_stripes(face, view_dir=_current_view_dir())
     doc = FreeCAD.ActiveDocument
-    obj, _created = groups.find_or_create(doc, "%s_Zebra" % label)
-    obj.Shape = stripes
-    groups.add_to_group(obj, "QA")
-    doc.recompute()
+    def _do():
+        obj, _created = groups.find_or_create(doc, "%s_Zebra" % label)
+        obj.Shape = stripes
+        groups.add_to_group(obj, "QA")
+        doc.recompute()
+    _with_undo(doc, "Zebra", _do)
 
 
 def native_reflect():
@@ -624,10 +655,12 @@ def native_reflect():
     lines = core.reflection_lines(face, core.standard_light_rig(),
                                   view_dir=_current_view_dir())
     doc = FreeCAD.ActiveDocument
-    obj, _created = groups.find_or_create(doc, "%s_Reflect" % label)
-    obj.Shape = lines
-    groups.add_to_group(obj, "QA")
-    doc.recompute()
+    def _do():
+        obj, _created = groups.find_or_create(doc, "%s_Reflect" % label)
+        obj.Shape = lines
+        groups.add_to_group(obj, "QA")
+        doc.recompute()
+    _with_undo(doc, "Reflection Lines", _do)
 
 
 def native_draft_analysis():
@@ -655,22 +688,24 @@ def native_draft_analysis():
     face, label = _selected_face()
     result = core.draft_angle_analysis(face, FreeCAD.Vector(0, 0, 1))
     doc = FreeCAD.ActiveDocument
-    made = 0
-    for threshold, band in zip(result["thresholds"], result["bands"]):
-        if not band.Edges:
-            continue
-        obj, _created = groups.find_or_create(
-            doc, "%s_Draft_%gdeg" % (label, threshold))
-        obj.Shape = band
-        groups.add_to_group(obj, "QA")
-        made += 1
-    if made == 0:
-        FreeCAD.Console.PrintWarning(
-            "Railform Studio: draft analysis found no threshold "
-            "crossings on the selected face at bands %s -- the face may "
-            "be entirely above or below every band.\n"
-            % (result["thresholds"],))
-    doc.recompute()
+    def _do():
+        made = 0
+        for threshold, band in zip(result["thresholds"], result["bands"]):
+            if not band.Edges:
+                continue
+            obj, _created = groups.find_or_create(
+                doc, "%s_Draft_%gdeg" % (label, threshold))
+            obj.Shape = band
+            groups.add_to_group(obj, "QA")
+            made += 1
+        if made == 0:
+            FreeCAD.Console.PrintWarning(
+                "Railform Studio: draft analysis found no threshold "
+                "crossings on the selected face at bands %s -- the face may "
+                "be entirely above or below every band.\n"
+                % (result["thresholds"],))
+        doc.recompute()
+    _with_undo(doc, "Draft Analysis", _do)
 
 
 # --- native analysis / control-polygon curve / star-patch fallback -------- #
@@ -733,18 +768,19 @@ def native_control_poly4():
     pts = _grid_points_from_selection(2)   # raises on bad selection
     edge = core.control_poly_curve(pts, degree=3)
     doc = FreeCAD.ActiveDocument or FreeCAD.newDocument()
-    obj = doc.addObject("Part::Feature", "ControlPoly4")
-    obj.Shape = edge
-    doc.recompute()
+    _add_feature_with_undo(doc, "ControlPoly4", edge)
 
 
 def native_star_patch():
-    """Native last-resort provider for RFS_StarPatch -- NOT a G2
-    replacement for Silk's ControlGridNStar66. core.n_sided_patch gives
-    exact G0 + tangent-plane G1 only (see its docstring); this provider
-    exists so the curated button degrades to a working tool instead of a
-    dead button when Silk is missing/broken. If you need true G2 star
-    points, install Silk or vendor its ControlGridNStar66.
+    """Native provider for RFS_StarPatch. Builds an N-sided star patch via
+    core.gregory_star_patch: exact G1 continuity at every corner and at the
+    star point by construction (Gregory tangent-plane rule), with shared
+    center acceleration/jerk from _star_spoke (septic Hermite) pushing
+    continuity past G2 in parameter space.
+
+    True provably-exact geometric G2 across every seam remains an open CAGD
+    problem for arbitrary valence; Gregory patches are the standard
+    practical approximation. No Silk or Curves dependency.
 
     Selection: the >= 3 boundary edges of one closed loop, picked as
     edge sub-objects (or one object whose shape is the loop itself).
@@ -752,7 +788,6 @@ def native_star_patch():
     failure chain clearly."""
     import FreeCAD
     import FreeCADGui
-    import Part
     from rfstudio import core
     sel = FreeCADGui.Selection.getSelectionEx()
     edges = []
@@ -769,15 +804,9 @@ def native_star_patch():
         raise ValueError(
             "star patch needs >= 3 boundary edges selected (got %d)"
             % len(edges))
-    FreeCAD.Console.PrintWarning(
-        "Railform Studio: Silk not available -- using native n-sided "
-        "patch (exact G0/G1, NOT G2-continuous like Silk's star "
-        "patch).\n")
-    patch = core.n_sided_patch(edges)
+    patch = core.gregory_star_patch(edges)
     doc = FreeCAD.ActiveDocument or FreeCAD.newDocument()
-    obj = doc.addObject("Part::Feature", "StarPatch_Native")
-    obj.Shape = patch
-    doc.recompute()
+    _add_feature_with_undo(doc, "StarPatch_Native", patch)
 
 
 def validate_providers(providers=None, engines_module=None):

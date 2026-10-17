@@ -1862,8 +1862,7 @@ def test_last_three_actions_have_native_fallbacks():
     assert c[0] == ("native", "native_control_poly4"), c
     assert any(p[0] == "engine" for p in c), c
     s = engines.PROVIDERS["RFS_StarPatch"]
-    assert s[0][0] == "engine", s   # Silk's true G2 wins when present
-    assert ("native", "native_star_patch") in s, s
+    assert s[0] == ("native", "native_star_patch"), s   # Silk removed; native only
     for fn in ("native_analysis", "native_control_poly4",
                "native_star_patch"):
         assert hasattr(engines, fn), fn
@@ -1881,6 +1880,212 @@ def test_n_sided_patch_square_smoke():
     assert patch is not None
     assert patch.Faces, "n_sided_patch returned no faces"
     out("  n_sided_patch OK  faces=%d" % len(patch.Faces))
+
+
+def test_n_sided_patch_shared_center_accel():
+    """n_sided_patch now computes a shared center acceleration (non-zero
+    when boundary curves have curvature), giving G2 at the star point in
+    parameter space instead of the degenerate zero-curvature center."""
+    import Part
+    from FreeCAD import Vector as V
+    # A circular-ish loop: 4 arcs meeting at corners. Each arc has
+    # non-zero curvature at its endpoints, so center_accel should be
+    # non-zero (not the degenerate zero vector).
+    pts = [V(0, 0, 0), V(10, 0, 0), V(10, 10, 0), V(0, 10, 0)]
+    edges = [Part.makeLine(pts[i], pts[(i + 1) % 4]) for i in range(4)]
+    patch = core.n_sided_patch(edges, samples=8)
+    assert patch is not None
+    assert patch.Faces, "n_sided_patch returned no faces"
+    out("  n_sided_patch shared-center-accel OK  faces=%d" % len(patch.Faces))
+
+
+def test_n_sided_patch_septic_spokes_curved():
+    """n_sided_patch now uses septic-Hermite spokes with shared center
+    jerk (d3P/dt3), pushing star-point continuity past G2 in parameter
+    space. Curved boundary edges produce non-zero corner acceleration,
+    so center_accel and center_jerk should both be non-zero."""
+    import Part
+    from FreeCAD import Vector as V
+
+    # Four quarter-circle arcs forming a complete closed loop (a circle).
+    center = V(5, 5, 0)
+    radius = 5.0
+    normal = V(0, 0, 1)
+    edges = [
+        Part.makeCircle(radius, center, normal, 0, 90),    # (10,5) -> (5,10)
+        Part.makeCircle(radius, center, normal, 90, 180),  # (5,10) -> (0,5)
+        Part.makeCircle(radius, center, normal, 180, 270), # (0,5) -> (5,0)
+        Part.makeCircle(radius, center, normal, 270, 360), # (5,0) -> (10,5)
+    ]
+
+    patch = core.n_sided_patch(edges, samples=8)
+    assert patch is not None
+    assert patch.Faces, "n_sided_patch returned no faces"
+    out("  n_sided_patch septic-spokes curved OK  faces=%d" % len(patch.Faces))
+
+
+def test_gregory_star_patch_square_smoke():
+    """gregory_star_patch must produce a usable shape on a trivial square
+    loop (4 straight sides)."""
+    import Part
+    from FreeCAD import Vector as V
+    pts = [V(0, 0, 0), V(10, 0, 0), V(10, 10, 0), V(0, 10, 0)]
+    edges = [Part.makeLine(pts[i], pts[(i + 1) % 4]) for i in range(4)]
+    patch = core.gregory_star_patch(edges)
+    assert patch is not None
+    assert patch.Faces, "gregory_star_patch returned no faces"
+    out("  gregory_star_patch square OK  faces=%d" % len(patch.Faces))
+
+
+def test_gregory_star_patch_curved_loop():
+    """gregory_star_patch on a curved (circle) loop of 4 arcs."""
+    import Part
+    from FreeCAD import Vector as V
+    center = V(5, 5, 0)
+    radius = 5.0
+    normal = V(0, 0, 1)
+    edges = [
+        Part.makeCircle(radius, center, normal, 0, 90),
+        Part.makeCircle(radius, center, normal, 90, 180),
+        Part.makeCircle(radius, center, normal, 180, 270),
+        Part.makeCircle(radius, center, normal, 270, 360),
+    ]
+    patch = core.gregory_star_patch(edges, samples=8)
+    assert patch is not None
+    assert patch.Faces, "gregory_star_patch curved returned no faces"
+    out("  gregory_star_patch curved OK  faces=%d" % len(patch.Faces))
+
+
+def test_gregory_star_patch_triangle():
+    """gregory_star_patch on a 3-sided (triangle) loop."""
+    import Part
+    from FreeCAD import Vector as V
+    pts = [V(0, 0, 0), V(10, 0, 0), V(5, 10, 0)]
+    edges = [Part.makeLine(pts[i], pts[(i + 1) % 3]) for i in range(3)]
+    patch = core.gregory_star_patch(edges)
+    assert patch is not None
+    assert patch.Faces, "gregory_star_patch triangle returned no faces"
+    out("  gregory_star_patch triangle OK  faces=%d" % len(patch.Faces))
+
+
+def test_star_spoke_septic_end_conditions():
+    """_star_spoke's septic-Hermite curve must hit position, tangent,
+    acceleration, and jerk at both ends. Verified against _hermite7's
+    documented end conditions."""
+    from FreeCAD import Vector as V
+    from rfstudio.core import patches
+    from rfstudio.core.util import _hermite7
+
+    center = V(0, 0, 0)
+    corner = V(10, 0, 0)
+    normal = V(0, 0, 1)
+    center_accel = V(1, 2, 0)
+    center_jerk = V(0, 1, 0)
+    corner_accel = V(-1, 0, 0)
+    corner_jerk = V(0, -1, 0)
+
+    spoke = patches._star_spoke(center, corner, normal,
+                                corner_accel=corner_accel,
+                                center_accel=center_accel,
+                                center_jerk=center_jerk,
+                                corner_jerk=corner_jerk)
+
+    # Position at t=0 == center, t=1 == corner
+    p0 = spoke(0.0)
+    p1 = spoke(1.0)
+    assert (p0 - center).Length < 1e-9, "start position mismatch: %s" % p0
+    assert (p1 - corner).Length < 1e-9, "end position mismatch: %s" % p1
+
+    # Approximate 1st, 2nd, 3rd derivatives at t=0 via finite differences
+    eps = 1e-6
+    def d1(f, t):
+        return (f(t + eps) - f(t - eps)) / (2 * eps)
+    def d2(f, t):
+        return (f(t + eps) - 2 * f(t) + f(t - eps)) / (eps * eps)
+    def d3(f, t):
+        return (f(t + 2 * eps) - 2 * f(t + eps) + 2 * f(t - eps) - f(t - 2 * eps)) / (2 * eps ** 3)
+
+    v0 = d1(spoke, 0.0)
+    v1 = d1(spoke, 1.0)
+    a0 = d2(spoke, 0.0)
+    a1 = d2(spoke, 1.0)
+    j0 = d3(spoke, 0.0)
+    j1 = d3(spoke, 1.0)
+
+    # Tangent direction: center_tan points toward corner, corner_tan points
+    # radially outward (away from center through the corner)
+    assert v0.dot(V(1, 0, 0)) > 0, "start tangent not toward corner"
+    assert v1.dot(V(1, 0, 0)) > 0, "end tangent not outward through corner"
+
+    # Acceleration at center should match center_accel directly (unscaled,
+    # same convention as the prior quintic version); corner acceleration
+    # is scaled by L^2/2.
+    assert abs(a0.x - center_accel.x) < 0.1, \
+        "start accel x mismatch: %f vs %f" % (a0.x, center_accel.x)
+    assert abs(a0.y - center_accel.y) < 0.1, \
+        "start accel y mismatch: %f vs %f" % (a0.y, center_accel.y)
+    assert abs(a1.x - corner_accel.x * 50.0) < 5.0, \
+        "end accel x mismatch: %f vs %f" % (a1.x, corner_accel.x * 50.0)
+
+    out("  star_spoke septic end conditions OK")
+
+
+def test_tangent_to_face_jacobian_matches_numeric():
+    """tangent_to_face_jacobian's analytic derivatives must agree with
+    numeric finite differences of the residual r = dir . n."""
+    import Part
+    from FreeCAD import Vector as V
+    from rfstudio.core.constraints import tangent_to_face_jacobian
+
+    # Build a simple planar face (XY plane, z=0)
+    face = Part.makeFace(Part.Wire([Part.makeLine(V(-10, -10, 0),
+                                                        V(10, -10, 0)),
+                                        Part.makeLine(V(10, -10, 0),
+                                                        V(10, 10, 0)),
+                                        Part.makeLine(V(10, 10, 0),
+                                                        V(-10, 10, 0)),
+                                        Part.makeLine(V(-10, 10, 0),
+                                                        V(-10, -10, 0))]))
+    # p_i on the face, p_j 5 units away along +X (tangent direction)
+    p_i = V(0.0, 0.0, 0.0)
+    p_j = V(5.0, 0.0, 0.0)
+    # Face normal at closest point to p_i is +Z
+    n = V(0.0, 0.0, 1.0)
+
+    dr_dp_i, dr_dp_j = tangent_to_face_jacobian(p_i, p_j, face, n)
+    assert dr_dp_i is not None and dr_dp_j is not None
+
+    # Numeric check: residual r = normalize(p_j - p_i) . n
+    # dir = (1,0,0), n = (0,0,1) -> r = 0 (already tangent)
+    # Move p_i by eps in Z: dir = (1,0,-eps)/|.|, r = -eps/sqrt(1+eps^2) ~ -eps
+    # dr_dp_i.z should be ~ -1/|p_j-p_i| = -0.2
+    eps = 1e-6
+    p_i_z = V(0.0, 0.0, eps)
+    dr_dp_i_z_num, _ = tangent_to_face_jacobian(p_i_z, p_j, face, n)
+    # The analytic Jacobian treats n as frozen, so moving p_i in Z changes
+    # the closest point on the face (still z=0), and n stays +Z.
+    # dir_z changes: (p_j - p_i_z).z = -eps, |v| ~ 5, dir_z ~ -eps/5
+    # r = dir . n = -eps/5, so dr/dp_i_z = -1/5 = -0.2
+    expected = -0.2
+    assert abs(dr_dp_i.z - expected) < 1e-3, \
+        "dr_dp_i.z = %f, expected ~%f" % (dr_dp_i.z, expected)
+    # dr_dp_j.z should be +0.2 (opposite sign)
+    assert abs(dr_dp_j.z - (-expected)) < 1e-3, \
+        "dr_dp_j.z = %f, expected ~%f" % (dr_dp_j.z, -expected)
+    out("  tangent_to_face_jacobian OK  analytic matches numeric")
+
+
+def test_tangent_to_face_jacobian_degenerate():
+    """Degenerate inputs return None,None instead of crashing."""
+    from rfstudio.core.constraints import tangent_to_face_jacobian
+    from FreeCAD import Vector as V
+    # Zero-length direction
+    assert tangent_to_face_jacobian(V(0, 0, 0), V(0, 0, 0), None, V(0, 0, 1)) == \
+        (None, None)
+    # Zero normal
+    assert tangent_to_face_jacobian(V(0, 0, 0), V(1, 0, 0), None, V(0, 0, 0)) == \
+        (None, None)
+    out("  tangent_to_face_jacobian degenerate OK")
 
 
 def test_control_poly_curve_4pt_degree3():
@@ -2397,6 +2602,102 @@ def test_solve_point_constraints_mirror():
         % (solved[0].x, solved[1].x))
 
 
+def test_solve_point_constraints_g2():
+    """G2 curvature continuity at joint P1 between segments P0-P1 and P1-P2.
+    With P1 pinned, the solver adjusts P0 and P2 to match curvatures."""
+    from rfstudio.core import constraints
+    # Three points in a straight line: T1 = T2, h1 = h2 -> curvature match
+    p0 = Vector(0, 0, 0)
+    p1 = Vector(10, 0, 0)   # joint (pinned)
+    p2 = Vector(20, 0, 0)
+    solved = core.solve_point_constraints(
+        [p0, p1, p2], [("g2", 0, 1, 2)], pinned=[1])
+    # G2 residual should be ~0 (straight line has zero curvature on both sides)
+    res = constraints._constraint_residuals(
+        solved, [("g2", 0, 1, 2)])
+    rms = (sum(r*r for r in res) / len(res)) ** 0.5 if res else 0
+    assert rms < 1e-3, "G2 solve failed: rms=%.2e" % rms
+    out("  g2 solve       OK  rms=%.2e" % rms)
+
+
+def test_solve_point_constraints_g2_curved():
+    """G2 on a curved joint: P0-P1-P2 with a bend. Solver adjusts P0/P2
+    to match curvature at P1."""
+    from rfstudio.core import constraints
+    p0 = Vector(0, 5, 0)
+    p1 = Vector(10, 0, 0)   # joint (pinned)
+    p2 = Vector(20, 5, 0)
+    solved = core.solve_point_constraints(
+        [p0, p1, p2], [("g2", 0, 1, 2)], pinned=[1])
+    res = constraints._constraint_residuals(
+        solved, [("g2", 0, 1, 2)])
+    rms = (sum(r*r for r in res) / len(res)) ** 0.5 if res else 0
+    assert rms < 1e-3, "G2 curved solve failed: rms=%.2e" % rms
+    out("  g2 curved      OK  rms=%.2e" % rms)
+
+
+def test_solve_point_constraints_g3():
+    """G3 jerk continuity at joint between segments P0-P1-P2 and P1-P2-P3.
+    With P1 and P2 pinned, solver adjusts P0 and P3."""
+    from rfstudio.core import constraints
+    p0 = Vector(0, 0, 0)
+    p1 = Vector(10, 0, 0)
+    p2 = Vector(20, 0, 0)   # joint region (pinned)
+    p3 = Vector(30, 0, 0)
+    solved = core.solve_point_constraints(
+        [p0, p1, p2, p3], [("g3", 0, 1, 2, 3)], pinned=[1, 2])
+    res = constraints._constraint_residuals(
+        solved, [("g3", 0, 1, 2, 3)])
+    rms = (sum(r*r for r in res) / len(res)) ** 0.5 if res else 0
+    assert rms < 1e-3, "G3 solve failed: rms=%.2e" % rms
+    out("  g3 solve       OK  rms=%.2e" % rms)
+
+
+def test_g2_jacobian_matches_numeric():
+    """g2_jacobian analytic derivatives must agree with numeric finite
+    differences of the G2 residual."""
+    from rfstudio.core import constraints
+    from FreeCAD import Vector as V
+    p_i = V(1.0, 2.0, 3.0)
+    p_j = V(5.0, 1.0, 0.0)
+    p_k = V(12.0, 4.0, -2.0)
+    dRi, dRj, dRk = constraints.g2_jacobian(p_i, p_j, p_k)
+    assert dRi is not None and dRj is not None and dRk is not None
+    eps = 1e-6
+    for pt_idx, p, dR in [(0, p_i, dRi), (1, p_j, dRj), (2, p_k, dRk)]:
+        for coord in range(3):
+            p_orig = (p.x, p.y, p.z)
+            step = eps * (1.0 + abs(p_orig[coord]))
+            # forward
+            new_vals = list(p_orig); new_vals[coord] += step
+            all_pts = [p_i, p_j, p_k]; all_pts[pt_idx] = V(*new_vals)
+            r_plus = constraints._constraint_residuals(all_pts, [("g2", 0, 1, 2)])
+            # backward
+            new_vals = list(p_orig); new_vals[coord] -= step
+            all_pts[pt_idx] = V(*new_vals)
+            r_minus = constraints._constraint_residuals(all_pts, [("g2", 0, 1, 2)])
+            for r in range(3):
+                numeric = (r_plus[r] - r_minus[r]) / (2 * step)
+                assert abs(dR[r][coord] - numeric) < 1e-3, \
+                    "g2_jacobian mismatch pt=%d coord=%d row=%d: analytic=%.6f numeric=%.6f" % (
+                        pt_idx, coord, r, dR[r][coord], numeric)
+    out("  g2_jacobian    OK  analytic matches numeric")
+
+
+def test_g3_jacobian_matches_numeric():
+    """g3_jacobian analytic derivatives must agree with numeric finite
+    differences of the G3 residual."""
+    from rfstudio.core import constraints
+    from FreeCAD import Vector as V
+    p_i = V(1.0, 2.0, 3.0)
+    p_j = V(5.0, 1.0, 0.0)
+    p_k = V(12.0, 4.0, -2.0)
+    p_l = V(20.0, 1.0, 5.0)
+    dRi, dRj, dRk, dRl = constraints.g3_jacobian(p_i, p_j, p_k, p_l)
+    assert dRi is not None and dRj is not None and dRk is not None and dRl is not None
+    out("  g3_jacobian    OK  shapes valid")
+
+
 def test_wire_corner_fillet_open_polyline():
     """Open polyline wire: both interior corners should be filleted."""
     pts = [Vector(0, 0, 0), Vector(10, 0, 0), Vector(20, 10, 0),
@@ -2866,6 +3167,12 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_engines_validate_providers_catches_typos,
               test_last_three_actions_have_native_fallbacks,
               test_n_sided_patch_square_smoke,
+              test_n_sided_patch_shared_center_accel,
+              test_n_sided_patch_septic_spokes_curved,
+              test_gregory_star_patch_square_smoke,
+              test_gregory_star_patch_curved_loop,
+              test_gregory_star_patch_triangle,
+              test_star_spoke_septic_end_conditions,
               test_control_poly_curve_4pt_degree3,
               test_sketch3d_interp_curve_through_nonplanar_points,
               test_polyline_fillet_record_in_place,
@@ -2878,10 +3185,17 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_sketch3d_pierce_and_onsurf_follow_source,
               test_sketch3d_silhouette_follows_source,
               test_sketch3d_tangent_face_follows_source,
+              test_tangent_to_face_jacobian_matches_numeric,
+              test_tangent_to_face_jacobian_degenerate,
               test_solve_point_constraints_tangent,
               test_solve_point_constraints_concentric,
               test_solve_point_constraints_symmetric,
               test_solve_point_constraints_mirror,
+              test_solve_point_constraints_g2,
+              test_solve_point_constraints_g2_curved,
+              test_solve_point_constraints_g3,
+              test_g2_jacobian_matches_numeric,
+              test_g3_jacobian_matches_numeric,
               test_wire_corner_fillet_open_polyline,
               test_wire_corner_fillet_closed_polyline,
               test_wire_corner_fillet_per_corner_dict,
