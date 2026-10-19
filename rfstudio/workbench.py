@@ -45,10 +45,21 @@ class RailformStudioWorkbench(FreeCADGui.Workbench):
         # rather than letting each one fail individually the first time a
         # user happens to click it (see deps.verify_delegations docstring).
         # Wrap in try-except to handle cases where GUI is not fully initialized yet.
+        # Opt-in: verify_delegations() bounces through the Curves/Silk
+        # workbenches (slow, and fragile during first activation). Enable via
+        # User parameter:BaseApp/Preferences/Mod/RailformStudio -> VerifyEngineCommands.
         try:
-            deps.verify_delegations(engines.DELEGATIONS)
-        except Exception as e:
-            FreeCAD.Console.PrintMessage("Railform Studio: Skipping delegation verification due to GUI initialization: %s" % e)
+            verify = FreeCAD.ParamGet(
+                "User parameter:BaseApp/Preferences/Mod/RailformStudio"
+            ).GetBool("VerifyEngineCommands", False)
+        except Exception:
+            verify = False
+        if verify:
+            try:
+                deps.verify_delegations(engines.DELEGATIONS)
+            except Exception as e:
+                FreeCAD.Console.PrintMessage(
+                    "Railform Studio: delegation verification skipped: %s\n" % e)
 
         # Visibility for the "two hard external dependencies" risk: which
         # curated actions have no native fallback at all, so a future

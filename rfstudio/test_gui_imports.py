@@ -178,7 +178,6 @@ _MODULES = [
     "rfstudio.panel_import",
     "rfstudio.panel_solids",
     "rfstudio.panel_sketch3d",
-    "rfstudio.panel_nurbspull",
     "rfstudio.taskpanels",
     "rfstudio.commands",
     "rfstudio.toolshelf",
@@ -721,7 +720,103 @@ def check_callback_symmetry(root_dir=None):
     return problems
 
 
-if __name__ == "__main__" or True:
+
+# --------------------------------------------------------------------- #
+# Check #7: attribute READ but never ASSIGNED. The bug class behind most
+# of the editor/panel failures the other checks cannot see: `self.x` is
+# read somewhere in a class, but no method of the class, its bases or its
+# subclasses ever assigns `x` (nor defines a method/class attr `x`, nor
+# mentions it via hasattr/getattr/setattr). Typical symptoms: an
+# AttributeError swallowed by a blanket `except` so a feature silently does
+# nothing (KnotEditor._pick_px, PointEditor.comb_vis_root, BlendPanel._lay).
+# Classes with an external (Qt/FreeCAD) base are skipped: they inherit
+# attributes we cannot see.
+# --------------------------------------------------------------------- #
+def _class_attr_usage(root_dir):
+    info = {}
+    for fname in sorted(os.listdir(root_dir)):
+        if not fname.endswith(".py"):
+            continue
+        path = os.path.join(root_dir, fname)
+        with open(path, "r", encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=path)
+        for cls in (n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)):
+            rec = info.setdefault(cls.name, {"bases": [], "ext": False,
+                                             "defined": set(), "loads": []})
+            rec["bases"] += [b.id for b in cls.bases if isinstance(b, ast.Name)]
+            rec["ext"] = rec["ext"] or any(not isinstance(b, ast.Name)
+                                           for b in cls.bases)
+            for item in cls.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                     ast.ClassDef)):
+                    rec["defined"].add(item.name)
+                elif isinstance(item, (ast.Assign, ast.AnnAssign)):
+                    for t in (item.targets if isinstance(item, ast.Assign)
+                              else [item.target]):
+                        for nm in ast.walk(t):
+                            if isinstance(nm, ast.Name):
+                                rec["defined"].add(nm.id)
+            for node in ast.walk(cls):
+                if (isinstance(node, ast.Attribute)
+                        and isinstance(node.value, ast.Name)
+                        and node.value.id == "self"):
+                    if isinstance(node.ctx, (ast.Store, ast.Del)):
+                        rec["defined"].add(node.attr)
+                    else:
+                        rec["loads"].append((fname, node.lineno, node.attr))
+                elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                        and node.func.id in ("hasattr", "getattr", "setattr")
+                        and len(node.args) >= 2
+                        and isinstance(node.args[0], ast.Name)
+                        and node.args[0].id == "self"
+                        and isinstance(node.args[1], ast.Constant)
+                        and isinstance(node.args[1].value, str)):
+                    rec["defined"].add(node.args[1].value)
+    return info
+
+
+def check_unassigned_self_attrs(root_dir=None):
+    root_dir = root_dir or _rfstudio_dir()
+    info = _class_attr_usage(root_dir)
+    kids = {}
+    for name, rec in info.items():
+        for b in rec["bases"]:
+            kids.setdefault(b, []).append(name)
+
+    def up(name, seen):
+        if name in seen or name not in info:
+            return set()
+        seen.add(name)
+        out = set(info[name]["defined"])
+        for b in info[name]["bases"]:
+            out |= up(b, seen)
+        return out
+
+    def down(name, seen):
+        out = set()
+        for k in kids.get(name, []):
+            if k not in seen:
+                seen.add(k)
+                out |= info[k]["defined"] | down(k, seen)
+        return out
+
+    problems = []
+    for name, rec in info.items():
+        if _has_external_ancestor(name, _collect_class_info(root_dir)):
+            continue
+        known = up(name, set()) | down(name, set())
+        seen_attr = set()
+        for fname, lineno, attr in rec["loads"]:
+            if attr in known or attr in seen_attr or attr.startswith("__"):
+                continue
+            seen_attr.add(attr)
+            problems.append("%s:%d class %s reads self.%s but nothing in the "
+                            "class, its bases or subclasses ever assigns it"
+                            % (fname, lineno, name, attr))
+    return problems
+
+
+def main():
     print("== check 1: mocked imports ==")
     import_failures = check_imports()
 
@@ -767,14 +862,33 @@ if __name__ == "__main__" or True:
     else:
         print("  none found")
 
+    print("\n== check 7: self.<attr> read but never assigned ==")
+    unassigned_problems = check_unassigned_self_attrs()
+    if unassigned_problems:
+        for q in unassigned_problems:
+            print("  FAIL: %s" % q)
+    else:
+        print("  none found")
+
     if (import_failures or self_call_problems or bare_name_problems
-            or xref_problems or lazy_qt_problems or cb_sym_problems):
+            or xref_problems or lazy_qt_problems or cb_sym_problems
+            or unassigned_problems):
         print("\nFAILED: %d import failure(s), %d undefined self-call(s), "
               "%d bare-name issue(s), %d cross-module ref(s), "
               "%d lazy-Qt base(s), %d callback symmetry issue(s)"
               % (len(import_failures), len(self_call_problems),
                  len(bare_name_problems), len(xref_problems),
                  len(lazy_qt_problems), len(cb_sym_problems)))
-        sys.exit(1)
+        return 1
     print("\nAll checks passed (%d modules, %s)."
           % (len(_MODULES), _rfstudio_dir()))
+    return 0
+
+
+def test_gui_layer():
+    """pytest entry point (importing this file no longer runs or exits)."""
+    assert main() == 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -398,8 +398,8 @@ class ExtendSurfFP(_BaseFP):
 
     def __init__(self, obj):
         obj.Proxy = self
-        obj.addProperty("App::PropertyLink", "BaseSurface", "ExtendSurf",
-                        "Surface to extend")
+        obj.addProperty("App::PropertyLinkList", "BaseSurface", "ExtendSurf",
+                        "Surface to extend (exactly 1)")
         obj.addProperty("App::PropertyFloat", "UFirst", "ExtendSurf",
                         "Extension at start of U parameter (negative extends backward)")
         obj.UFirst = 0.0
@@ -418,6 +418,8 @@ class ExtendSurfFP(_BaseFP):
 
     def execute(self, obj):
         src = obj.BaseSurface
+        if isinstance(src, (list, tuple)):         # LinkList (old docs: Link)
+            src = src[0] if src else None
         if not src:
             return
         surf = getattr(src, "Shape", None)
@@ -452,7 +454,7 @@ class BlendSurfFP(_BaseFP):
                         "Second surface")
         obj.addProperty("App::PropertyEnumeration", "Continuity", "BlendSurf",
                         "Blend continuity")
-        obj.Continuity = ["G0", "G1", "G2"]
+        obj.Continuity = ["G0", "G1", "G2", "G3"]
         obj.Continuity = "G2"
         obj.addProperty("App::PropertyFloat", "Scale", "BlendSurf",
                         "Tangent strength")
@@ -958,8 +960,18 @@ class MatchSurfaceFP(_BaseFP):
         obj.Proxy = self
         obj.addProperty("App::PropertyLinkList", "Reference", "Match",
                         "Reference surfaces (one or more)")
-        obj.addProperty("App::PropertyLink", "Target", "Match",
+        obj.addProperty("App::PropertyLinkList", "Target", "Match",
                         "Target surface to rebuild (exactly 1)")
+        obj.addProperty("App::PropertyEnumeration", "Continuity", "Match",
+                        "Continuity to match against the reference")
+        obj.Continuity = ["G1", "G2"]
+        obj.Continuity = "G2"
+        obj.addProperty("App::PropertyIntegerConstraint", "Samples", "Match",
+                        "Sample count for the sampled-Hermite fallback")
+        obj.Samples = (24, 4, 200, 1)
+        obj.addProperty("App::PropertyFloat", "Scale", "Match",
+                        "Tangent strength")
+        obj.Scale = 1.0
         obj.addProperty("App::PropertyBool", "ShowInputs", "Match",
                         "Keep the reference and target surfaces visible")
         obj.ShowInputs = True
@@ -974,6 +986,8 @@ class MatchSurfaceFP(_BaseFP):
     def execute(self, obj):
         ref_objs = obj.Reference or []
         tgt_obj = obj.Target
+        if isinstance(tgt_obj, (list, tuple)):     # LinkList (old docs: Link)
+            tgt_obj = tgt_obj[0] if tgt_obj else None
         if not tgt_obj:
             return
         ref_surfaces = [o.Shape for o in ref_objs if getattr(o, "Shape", None)]
@@ -983,7 +997,9 @@ class MatchSurfaceFP(_BaseFP):
         try:
             rebuilt, report, _chosen = core.match_surface_to_references(
                 tgt_surf, ref_surfaces,
-                continuity="G2", n=24, scale=1.0)
+                continuity=str(getattr(obj, "Continuity", "G2")),
+                n=int(getattr(obj, "Samples", 24)),
+                scale=float(getattr(obj, "Scale", 1.0)))
             obj.Shape = rebuilt
             # Guarded for documents created before these properties
             # existed (no structural change during recompute otherwise).
@@ -1166,8 +1182,8 @@ GROUPS = {
                ("Profiles", "Profiles",  "Cross-section curves (≥ 1)")],
     "ExtendSurf": [("BaseSurface", "Base Surface", "Surface to extend")],
     "Fill":   [("Boundaries", "Boundaries", "Boundary curves (>= 3)")],
-    "Match":  [("Reference", "Reference surfaces (one or more)"),
-               ("Target",    "Target surface to rebuild (exactly 1)")],
+    "Match":  [("Reference", "Reference", "Reference surfaces (one or more)"),
+               ("Target",    "Target",    "Target surface to rebuild (exactly 1)")],
     "N_sidedPatch": [("Boundaries", "Boundaries", "Boundary curves (≥ 3)")],
     "InterpCurve": [("Points", "Points", "Interpolation points")],
     "ControlCurve": [("Points", "Points", "Control points"),
@@ -1194,6 +1210,429 @@ LIMITS = {"Loft":   {"Profiles": (2, None), "GuideRails": (0, None)},
           "Polyline": {"Points": (2, None)},
           "BezierCurve": {"Points": (2, None)},
           "MirrorGroup": {"Sources": (1, None)}}
+
+
+# --------------------------------------------------------------------------- #
+# Kinds the task panels create but this module previously never defined
+# (make_surface/make_curve raised KeyError on _LABEL[kind]).
+# --------------------------------------------------------------------------- #
+def _solid_and_subs(obj, sub_prop):
+    """(source solid Shape, [sub-element shapes]) for a Source link plus a
+    PropertyLinkSub (Edges/Edge) -- (None, []) when anything is missing."""
+    src = getattr(obj, "Source", None)
+    ref = getattr(obj, sub_prop, None)
+    if src is None or not ref or not ref[0] or not ref[1]:
+        return None, []
+    shp = getattr(src, "Shape", None)
+    if shp is None or shp.isNull():
+        return None, []
+    out = []
+    for name in ref[1]:
+        try:
+            out.append(shp.getElement(name))
+        except Exception:
+            pass
+    return shp, out
+
+
+def _first_face(o):
+    shp = getattr(o, "Shape", None)
+    if shp is None or shp.isNull() or not shp.Faces:
+        return None
+    return shp.Faces[0]
+
+
+def _err(kind, exc):
+    FreeCAD.Console.PrintError("Railform %s: %s\n" % (kind, exc))
+
+
+class BlendCurveFP(_BaseFP):
+    """G1/G2/G3 blend curve between the facing ends of two curves
+    (core.blend_curve; BlendPanel / RFS_DrawBlend)."""
+    Kind = "BlendCurve"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        obj.addProperty("App::PropertyLink", "Curve1", "BlendCurve", "First curve")
+        obj.addProperty("App::PropertyLink", "Curve2", "BlendCurve", "Second curve")
+        obj.addProperty("App::PropertyEnumeration", "Continuity", "BlendCurve",
+                        "Blend continuity")
+        obj.Continuity = ["G1", "G2", "G3"]
+        obj.Continuity = "G2"
+        obj.addProperty("App::PropertyFloat", "Scale", "BlendCurve",
+                        "Tangent strength")
+        obj.Scale = 1.0
+
+    def execute(self, obj):
+        e1, e2 = _first_edge(obj.Curve1), _first_edge(obj.Curve2)
+        if e1 is None or e2 is None:
+            return
+        try:
+            a1, a2 = core.nearest_ends(e1, e2)
+            obj.Shape = core.blend_curve(e1, a1, e2, a2,
+                                         continuity=str(obj.Continuity),
+                                         scale=float(obj.Scale))
+        except Exception as exc:
+            _err("BlendCurve", exc)
+
+
+class FilletFP(_BaseFP):
+    """Constant-radius fillet on picked edges of a solid (core.fillet_solid)."""
+    Kind = "Fillet"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        obj.addProperty("App::PropertyLink", "Source", "Fillet", "Solid to fillet")
+        obj.addProperty("App::PropertyLinkSub", "Edges", "Fillet",
+                        "Edge sub-elements of Source to round")
+        obj.addProperty("App::PropertyFloat", "Radius", "Fillet", "Fillet radius")
+        obj.Radius = 2.0
+
+    def execute(self, obj):
+        solid, edges = _solid_and_subs(obj, "Edges")
+        if solid is None or not edges:
+            return
+        try:
+            obj.Shape = core.fillet_solid(solid, edges, float(obj.Radius))
+            groups.apply_input_visibility(obj, ["Source"])
+        except Exception as exc:
+            _err("Fillet", exc)
+
+
+class ChamferFP(_BaseFP):
+    """Constant-distance chamfer on picked edges of a solid (core.chamfer_solid)."""
+    Kind = "Chamfer"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        obj.addProperty("App::PropertyLink", "Source", "Chamfer", "Solid to chamfer")
+        obj.addProperty("App::PropertyLinkSub", "Edges", "Chamfer",
+                        "Edge sub-elements of Source to chamfer")
+        obj.addProperty("App::PropertyFloat", "Distance", "Chamfer",
+                        "Chamfer distance")
+        obj.Distance = 2.0
+
+    def execute(self, obj):
+        solid, edges = _solid_and_subs(obj, "Edges")
+        if solid is None or not edges:
+            return
+        try:
+            obj.Shape = core.chamfer_solid(solid, edges, float(obj.Distance))
+            groups.apply_input_visibility(obj, ["Source"])
+        except Exception as exc:
+            _err("Chamfer", exc)
+
+
+class VariableFilletFP(_BaseFP):
+    """Variable-radius fillet on ONE solid edge (core.variable_fillet_solid;
+    this FreeCAD build can only build a LINEAR end-to-end taper)."""
+    Kind = "VariableFillet"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        obj.addProperty("App::PropertyLink", "Source", "VariableFillet", "Solid")
+        obj.addProperty("App::PropertyLinkSub", "Edge", "VariableFillet",
+                        "The single edge to round")
+        obj.addProperty("App::PropertyFloatList", "Params", "VariableFillet",
+                        "Station parameters along the edge, 0..1")
+        obj.addProperty("App::PropertyFloatList", "Radii", "VariableFillet",
+                        "Radius at each station")
+        obj.Params = [0.0, 1.0]
+        obj.Radii = [2.0, 2.0]
+
+    def execute(self, obj):
+        solid, edges = _solid_and_subs(obj, "Edge")
+        params, radii = list(obj.Params or []), list(obj.Radii or [])
+        if solid is None or not edges or len(params) < 2 \
+                or len(params) != len(radii):
+            return
+        try:
+            obj.Shape = core.variable_fillet_solid(
+                solid, edges[0], sorted(zip(params, radii)))
+            groups.apply_input_visibility(obj, ["Source"])
+        except Exception as exc:
+            _err("VariableFillet", exc)
+
+
+class RollingBallFilletFP(_BaseFP):
+    """Rolling-ball fillet strip between two faces: constant Radius, or a
+    multi-station law when >= 2 StationParams are set."""
+    Kind = "RollingBallFillet"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        obj.addProperty("App::PropertyLink", "FaceA", "RollingBallFillet", "First surface")
+        obj.addProperty("App::PropertyLink", "FaceB", "RollingBallFillet", "Second surface")
+        obj.addProperty("App::PropertyFloat", "Radius", "RollingBallFillet",
+                        "Constant radius (world units)")
+        obj.Radius = 5.0
+        obj.addProperty("App::PropertyIntegerConstraint", "Samples", "RollingBallFillet",
+                        "Cross-section sample count")
+        obj.Samples = (24, 6, 200, 1)
+        obj.addProperty("App::PropertyFloatList", "StationParams", "RollingBallFillet",
+                        "Radius-law parameters 0..1 (empty = constant Radius)")
+        obj.addProperty("App::PropertyFloatList", "StationRadii", "RollingBallFillet",
+                        "Radius-law values")
+
+    def execute(self, obj):
+        fa, fb = _first_face(obj.FaceA) if obj.FaceA else None, \
+                 _first_face(obj.FaceB) if obj.FaceB else None
+        if fa is None or fb is None:
+            return
+        sp, sr = list(obj.StationParams or []), list(obj.StationRadii or [])
+        try:
+            if len(sp) >= 2 and len(sp) == len(sr):
+                obj.Shape = core.multi_rail_fillet(
+                    fa, fb, sorted(zip(sp, sr)), n=int(obj.Samples))
+            else:
+                obj.Shape = core.rolling_ball_fillet(
+                    fa, fb, float(obj.Radius), n=int(obj.Samples))
+            groups.apply_input_visibility(obj, ["FaceA", "FaceB"])
+        except Exception as exc:
+            _err("RollingBallFillet", exc)
+
+
+class BlendSurfClosedFP(_BaseFP):
+    """Closed-loop G1/G2 blend around a ring of >= 3 faces
+    (core.blend_surface_closed)."""
+    Kind = "BlendSurfClosed"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        obj.addProperty("App::PropertyLinkList", "Faces", "BlendSurfClosed",
+                        "Ordered ring of face-bearing objects (>= 3)")
+        obj.addProperty("App::PropertyEnumeration", "Continuity", "BlendSurfClosed",
+                        "Blend continuity")
+        obj.Continuity = ["G0", "G1", "G2"]
+        obj.Continuity = "G2"
+        obj.addProperty("App::PropertyFloat", "Scale", "BlendSurfClosed",
+                        "Tangent strength")
+        obj.Scale = 1.0
+        obj.addProperty("App::PropertyIntegerConstraint", "Samples", "BlendSurfClosed",
+                        "Cross-section sample count")
+        obj.Samples = (24, 6, 200, 1)
+
+    def execute(self, obj):
+        faces = [f for f in (_first_face(o) for o in (obj.Faces or [])) if f]
+        if len(faces) < 3:
+            return
+        try:
+            obj.Shape = core.blend_surface_closed(
+                faces, continuity=str(obj.Continuity),
+                n=int(obj.Samples), scale=float(obj.Scale))
+        except Exception as exc:
+            _err("BlendSurfClosed", exc)
+
+
+class GlobalFairFP(_BaseFP):
+    """Network-wide fairing of every face's control net
+    (core.global_fair_network). The object Label carries the energy
+    before/after readout."""
+    Kind = "GlobalFair"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        obj.addProperty("App::PropertyLinkList", "Faces", "GlobalFair",
+                        "Objects whose faces form the patch network")
+        obj.addProperty("App::PropertyIntegerConstraint", "Iterations", "GlobalFair",
+                        "Relaxation iterations")
+        obj.Iterations = (20, 1, 200, 1)
+        obj.addProperty("App::PropertyFloat", "Lambda", "GlobalFair",
+                        "Relaxation strength 0..1")
+        obj.Lambda = 0.5
+        obj.addProperty("App::PropertyBool", "FixBoundary", "GlobalFair",
+                        "Keep every seam / outer boundary fixed")
+        obj.FixBoundary = True
+        self._base_label = None
+
+    def execute(self, obj):
+        faces = []
+        for o in (obj.Faces or []):
+            shp = getattr(o, "Shape", None)
+            if shp is not None and not shp.isNull():
+                faces.extend(shp.Faces)
+        if not faces:
+            return
+        try:
+            res = core.global_fair_network(
+                faces, iterations=int(obj.Iterations),
+                lambda_=float(obj.Lambda), fix_boundary=bool(obj.FixBoundary))
+            obj.Shape = Part.Compound(list(res["faces"]))
+            base = getattr(self, "_base_label", None) or "GlobalFair"
+            self._base_label = base
+            obj.Label = "%s (E %.3g -> %.3g)" % (
+                base, res["energy_before"], res["energy_after"])
+            groups.apply_input_visibility(obj, ["Faces"])
+        except Exception as exc:
+            _err("GlobalFair", exc)
+
+
+class TrimByIntersectionFP(_BaseFP):
+    """Trim two faces to their mutual intersection curve
+    (core.trim_faces_by_intersection); result is a Compound of both."""
+    Kind = "TrimByIntersection"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        obj.addProperty("App::PropertyLink", "FaceA", "TrimByIntersection", "First face")
+        obj.addProperty("App::PropertyLink", "FaceB", "TrimByIntersection", "Second face")
+        obj.addProperty("App::PropertyFloat", "Tolerance", "TrimByIntersection",
+                        "Intersection tolerance")
+        obj.Tolerance = 1e-4
+
+    def execute(self, obj):
+        fa = _first_face(obj.FaceA) if obj.FaceA else None
+        fb = _first_face(obj.FaceB) if obj.FaceB else None
+        if fa is None or fb is None:
+            return
+        try:
+            ta, tb, _wire = core.trim_faces_by_intersection(
+                fa, fb, tol=float(obj.Tolerance))
+            obj.Shape = Part.Compound([ta, tb])
+            groups.apply_input_visibility(obj, ["FaceA", "FaceB"])
+        except Exception as exc:
+            _err("TrimByIntersection", exc)
+
+
+class BooleanFP(_BaseFP):
+    """Union / Subtract / Intersect over solids (core.boolean_*)."""
+    Kind = "Boolean"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        obj.addProperty("App::PropertyLink", "Base", "Boolean", "Base solid")
+        obj.addProperty("App::PropertyLinkList", "Tools", "Boolean", "Tool solids")
+        obj.addProperty("App::PropertyEnumeration", "Operation", "Boolean", "Operation")
+        obj.Operation = ["Union", "Subtract", "Intersect"]
+        obj.Operation = "Union"
+        obj.addProperty("App::PropertyBool", "Refine", "Boolean",
+                        "Remove redundant splitter faces afterwards")
+        obj.Refine = True
+
+    def execute(self, obj):
+        if not obj.Base or not obj.Tools:
+            return
+        base = getattr(obj.Base, "Shape", None)
+        tools = [t.Shape for t in obj.Tools if getattr(t, "Shape", None)]
+        if base is None or base.isNull() or not tools:
+            return
+        refine = bool(obj.Refine)
+        try:
+            op = str(obj.Operation)
+            if op == "Subtract":
+                obj.Shape = core.boolean_subtract(base, tools, refine=refine)
+            elif op == "Intersect":
+                obj.Shape = core.boolean_intersect([base] + tools, refine=refine)
+            else:
+                obj.Shape = core.boolean_union([base] + tools, refine=refine)
+            groups.apply_input_visibility(obj, ["Base", "Tools"])
+        except Exception as exc:
+            _err("Boolean", exc)
+
+
+def _scan_points(src):
+    """Raw points from a Mesh object, any Shape's vertices, or a
+    vector-list `Points` property."""
+    mesh = getattr(src, "Mesh", None)
+    if mesh is not None:
+        try:
+            return [FreeCAD.Vector(q.Vector) for q in mesh.Points]
+        except Exception:
+            pass
+    shp = getattr(src, "Shape", None)
+    if shp is not None and not shp.isNull() and shp.Vertexes:
+        return [v.Point for v in shp.Vertexes]
+    pts = getattr(src, "Points", None)
+    if pts is not None and hasattr(pts, "Points"):
+        pts = pts.Points
+    try:
+        return [FreeCAD.Vector(q) for q in (pts or [])]
+    except Exception:
+        return []
+
+
+class MeshToSurfaceFP(_BaseFP):
+    """One approximating height-field NURBS patch fitted to a point cloud
+    (core.fit_surface_to_scan)."""
+    Kind = "MeshToSurface"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        obj.addProperty("App::PropertyLink", "Source", "MeshToSurface",
+                        "Mesh or point-bearing object")
+        obj.addProperty("App::PropertyIntegerConstraint", "GridU", "MeshToSurface",
+                        "Fit grid resolution in U")
+        obj.GridU = (24, 2, 200, 1)
+        obj.addProperty("App::PropertyIntegerConstraint", "GridV", "MeshToSurface",
+                        "Fit grid resolution in V")
+        obj.GridV = (24, 2, 200, 1)
+        obj.addProperty("App::PropertyVector", "ProjectionNormal", "MeshToSurface",
+                        "Projection direction (0,0,0 = auto)")
+        obj.ProjectionNormal = FreeCAD.Vector(0, 0, 0)
+
+    def execute(self, obj):
+        if not obj.Source:
+            return
+        pts = _scan_points(obj.Source)
+        if len(pts) < 4:
+            return
+        nrm = obj.ProjectionNormal
+        try:
+            obj.Shape = core.fit_surface_to_scan(
+                pts, nu=int(obj.GridU), nv=int(obj.GridV), degree=3,
+                projection_normal=(None if nrm.Length < 1e-9 else nrm))
+            groups.apply_input_visibility(obj, ["Source"])
+        except Exception as exc:
+            _err("MeshToSurface", exc)
+
+
+class HiddenLineDrawingFP(_BaseFP):
+    """Visible edges of a hidden-line projection (core.hidden_line_projection).
+    The hidden edges are kept on the proxy (`hidden_shape`, session-only) for
+    HiddenLineExportPanel's SVG export."""
+    Kind = "HiddenLineDrawing"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        obj.addProperty("App::PropertyLinkList", "Sources", "HiddenLineDrawing",
+                        "Solids/surfaces to project")
+        obj.addProperty("App::PropertyVector", "Direction", "HiddenLineDrawing",
+                        "View direction")
+        obj.Direction = FreeCAD.Vector(0, 0, 1)
+        self.hidden_shape = None
+
+    def execute(self, obj):
+        shapes = [s.Shape for s in (obj.Sources or []) if getattr(s, "Shape", None)]
+        if not shapes:
+            return
+        try:
+            res = core.hidden_line_projection(shapes, obj.Direction)
+            obj.Shape = res["visible"]
+            self.hidden_shape = res["hidden"]
+        except Exception as exc:
+            _err("HiddenLineDrawing", exc)
+
+
+_FP.update({
+    "BlendCurve": BlendCurveFP, "Fillet": FilletFP, "Chamfer": ChamferFP,
+    "VariableFillet": VariableFilletFP, "RollingBallFillet": RollingBallFilletFP,
+    "BlendSurfClosed": BlendSurfClosedFP, "GlobalFair": GlobalFairFP,
+    "TrimByIntersection": TrimByIntersectionFP, "Boolean": BooleanFP,
+    "MeshToSurface": MeshToSurfaceFP, "HiddenLineDrawing": HiddenLineDrawingFP,
+})
+_LABEL.update({k: "Railform" + k for k in (
+    "BlendCurve", "Fillet", "Chamfer", "VariableFillet", "RollingBallFillet",
+    "BlendSurfClosed", "GlobalFair", "TrimByIntersection", "Boolean",
+    "MeshToSurface", "HiddenLineDrawing")})
+_KIND_ICON.update({
+    "BlendCurve": "rfs_blendcurve.svg", "Fillet": "rfs_fillet.svg",
+    "Chamfer": "rfs_chamfer.svg", "VariableFillet": "rfs_fillet_variable.svg",
+    "RollingBallFillet": "rfs_rollingball.svg",
+    "BlendSurfClosed": "rfs_blend_closed.svg", "GlobalFair": "rfs_global_fair.svg",
+    "TrimByIntersection": "rfs_trim_intersect.svg",
+    "Boolean": "rfs_boolean_union.svg", "MeshToSurface": "rfs_mesh_to_surface.svg",
+    "HiddenLineDrawing": "rfs_hidden_line.svg",
+})
 
 
 def _style_curve_vobj(vobj):
@@ -1308,6 +1747,8 @@ class CurveVP(object):
                 panel = taskpanels.PolylineFilletPanel(edit_obj=vobj.Object)
             elif kind == "JoinCurve":
                 panel = taskpanels.JoinCurvePanel(edit_obj=vobj.Object)
+            elif kind == "BlendCurve":
+                panel = taskpanels.BlendPanel(edit_obj=vobj.Object)
             else:
                 panel = taskpanels.CurvePanel(edit_obj=vobj.Object)
             FreeCADGui.Control.showDialog(panel)
@@ -1361,7 +1802,10 @@ class SurfaceVP(object):
 
     def onChanged(self, vobj, prop):
         if prop == "ShowEdges" or prop == "ShowSamples":
-            vobj.Shape.update()
+            try:
+                vobj.Object.touch()      # re-render; vobj.Shape never existed
+            except Exception:
+                pass
 
     def execute(self, vobj):
         return

@@ -240,6 +240,13 @@ class PointEditor(object):
         self.is_bezier = False
         self.handle_vis_root = None
         self.handles_visible = True
+        # Overlay handles read by teardown/update paths for EVERY curve kind
+        # (previously only assigned for Bezier -> finish() raised
+        # AttributeError on every non-Bezier curve, skipping callback removal).
+        self.comb_vis_root = None
+        self.jerk_vis_root = None
+        self._hl = None             # hover-marker coord node (built in _build)
+        self._hl_markers = None
         self.dragging_handle = None  # (point_idx, 'left'|'right') or None
         self.hover_handle = None     # (point_idx, 'left'|'right') or None
         # Tangent-to-face virtual intersection handles (issue #9)
@@ -453,6 +460,22 @@ class PointEditor(object):
         snap_sep.addChild(snap_mk)
         self._snap_switch.addChild(snap_sep)
         self.root.addChild(self._snap_switch)
+
+        # hover marker: ring on the point under the cursor (deletion cue)
+        hl_sep = coin.SoSeparator()
+        hl_col = coin.SoBaseColor()
+        hl_col.rgb = (1.0, 0.3, 0.3)
+        self._hl = coin.SoCoordinate3()
+        self._hl_markers = coin.SoMarkerSet()
+        try:
+            self._hl_markers.markerIndex = coin.SoMarkerSet.CIRCLE_LINE_9_9
+        except Exception:
+            pass
+        self._hl_markers.numPoints = 0
+        hl_sep.addChild(hl_col)
+        hl_sep.addChild(self._hl)
+        hl_sep.addChild(self._hl_markers)
+        self.root.addChild(hl_sep)
 
         self.view.getSceneGraph().addChild(self.root)
         self._refresh_markers()
@@ -2148,6 +2171,10 @@ class KnotEditor(object):
         self.ok = False
         self._samples_cache = None   # list of (t, x, y) for the live curve
         self._knot_input_index = None  # index of knot being edited via input field
+        self.input_field = None        # (were read but never assigned: AttributeError
+        self.dragging_with_ctrl = False  # swallowed by _on_button -> editor inert)
+        self._pick_px = (snaputil._snap_tolerance_mm(self.view, 2.5)
+                         if self.view is not None else 14.0)
         try:
             from pivy import coin
             self.coin = coin
@@ -3065,6 +3092,8 @@ class CornerFilletEditor(object):
         self._cb_btn = None
         self._cb_mov = None
         self._idx_order = []                 # marker k -> corner index
+        self._pick_px = (snaputil._snap_tolerance_mm(self.view, 2.5)
+                         if self.view is not None else 14.0)
         self.ok = False
         try:
             from pivy import coin
@@ -3386,6 +3415,8 @@ class SurfaceEditor(object):
         self._surface_cache = {}  # cache for surface conversions
         self._original_surface = None  # backup of original surface
         self._control_grid = None  # 2D list of control points
+        self._pick_px = (snaputil._snap_tolerance_mm(self.view, 2.5)
+                         if self.view is not None else 14.0)
 
         try:
             from pivy import coin

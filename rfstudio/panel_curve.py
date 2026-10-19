@@ -442,10 +442,9 @@ class CurvePanel(_EditPanelBase):
                 num_vertices = []
                 point_idx = 0
 
-                for i in range(comb.Edges.getLength()):
-                    edge = comb.Edges[i]
-                    pts = [edge.getPoint(j) for j in range(2)]  # Line has 2 points
-                    points.extend([(p.x, p.y, p.z) for p in pts])
+                for tooth in comb.Edges:      # each tooth is a straight edge
+                    pts = [tooth.Vertexes[0].Point, tooth.Vertexes[-1].Point]
+                    points.extend([(q.x, q.y, q.z) for q in pts])
                     num_vertices.append(2)
 
                 coords.point.setValues(0, len(points), points)
@@ -839,7 +838,7 @@ class CurvePanel(_EditPanelBase):
             return
         self._sync = True
         try:
-            sx, sy, sz = self._rows[r]
+            sx, sy, sz = self._rows[r][:3]
             sx.setValue(constrained_vec.x)
             sy.setValue(constrained_vec.y)
             sz.setValue(constrained_vec.z)
@@ -1007,7 +1006,7 @@ class CurvePanel(_EditPanelBase):
             try:
                 pairs = rmirror.find_symmetric_pairs(points, base, normal)
             except Exception as exc:
-                QtGui.QMessageBox.warning(
+                QtWidgets.QMessageBox.warning(
                     self.form, "Promote to MFP",
                     "Cannot promote to MFP: the current points are not symmetric "
                     "about the selected plane. %s" % str(exc))
@@ -1044,13 +1043,13 @@ class CurvePanel(_EditPanelBase):
             Gui.Selection.addSelection(mfp_obj)
 
             # Show a message
-            QtGui.QMessageBox.information(
+            QtWidgets.QMessageBox.information(
                 self.form, "Promote to MFP",
                 "Successfully promoted to MFP. The original curve is now the source "
                 "of a MirrorFP object with weld enabled.")
 
         except Exception as exc:
-            QtGui.QMessageBox.warning(
+            QtWidgets.QMessageBox.warning(
                 self.form, "Promote to MFP",
                 "Failed to promote to MFP: %s" % str(exc))
             import traceback
@@ -2013,6 +2012,7 @@ class BlendPanel(_EditPanelBase):
         self.form = QtWidgets.QWidget()
         self.form.setWindowTitle("Railform – Blend curve")
         lay = QtWidgets.QVBoxLayout(self.form)
+        self._lay = lay      # _add_converter_controls() (end of __init__) uses it
         lay.addWidget(QtWidgets.QLabel("Select two curves, then assign:"))
         for slot_name in ("Curve1", "Curve2"):
             r = QtWidgets.QHBoxLayout()

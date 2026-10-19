@@ -487,12 +487,8 @@ class HiddenLineExportPanel(_EditPanelBase):
             return
         if not fn.lower().endswith(".svg"):
             fn += ".svg"
-        hidden_edges = []
-        doc = self.obj.Document
-        for o in doc.Objects:
-            if o.Label == self.obj.Label + "_Hidden":
-                hidden_edges = list(getattr(o.Shape, "Edges", []) or [])
-                break
+        hidden = getattr(getattr(self.obj, "Proxy", None), "hidden_shape", None)
+        hidden_edges = list(getattr(hidden, "Edges", []) or [])
         try:
             core.export_svg_drawing(
                 list(shp.Edges), hidden_edges, self.obj.Direction, fn)
@@ -569,6 +565,7 @@ class MirrorPanel(_EditPanelBase):
         # Pick from model functionality
         self._pick_mode = False
         self._pick_cb = None
+        self._pick_btn = None
         self._selected_face = None
 
         self.show_inputs = QtWidgets.QCheckBox(
@@ -661,7 +658,7 @@ class MirrorPanel(_EditPanelBase):
                 self._pick_btn.setText("Click on a face to select its plane")
         except Exception as exc:
             self._stop_pick_mode()
-            QtGui.QMessageBox.warning(
+            QtWidgets.QMessageBox.warning(
                 self.form, "Pick Mode Error",
                 "Failed to start pick mode: %s" % str(exc))
 
@@ -695,83 +692,41 @@ class MirrorPanel(_EditPanelBase):
         self.plane.setCurrentText(getattr(self.obj, "Plane", "XY"))
 
     def _on_pick(self, event):
-        """Handle mouse click events during pick mode."""
-        if not self._pick_mode or not self._pick_cb:
+        """Click during pick mode: read the face under the cursor with
+        view.getObjectInfo and turn it into a Custom mirror plane."""
+        if not self._pick_mode:
             return
-
         try:
-            if event.get("State") != "DOWN":
+            if event.get("State") != "DOWN" or event.get("Button") != "BUTTON1":
                 return
-            if event.get("Button") != "BUTTON1":
-                return
-
             doc = FreeCADGui.ActiveDocument
             view = doc.ActiveView if doc is not None else None
-            if not view:
+            if view is None:
                 return
-
-            # Get the clicked point
-            pos = event["Position"]
-            point = view.getPoint(pos[0], pos[1])
-
-            # Find the closest face under the cursor
-            from pivy import coin
-            # Create a ray from the camera through the point
-            ray = view.getRay(pos[0], pos[1])
-            if not ray:
-                return
-
-            # Get the objects under the ray
-            result = view.getObjects(ray, 5)  # Get up to 5 objects
-            if not result or not result[0]:
-                return
-
-            # Get the first object and face
-            obj_info = result[0]
-            obj = obj_info.get("Object")
-            if not obj:
-                return
-
-            # Check if it's a face
-            if hasattr(obj, "Face") and isinstance(obj.Face, Part.Face):
-                face = obj.Face
-                # Get the face normal at center
-                try:
-                    u0, u1, v0, v1 = face.ParameterRange
-                    center_u = 0.5 * (u0 + u1)
-                    center_v = 0.5 * (v0 + v1)
-                    normal = face.normalAt(center_u, center_v)
-                    # Create a plane from this normal and a point on the face
-                    point_on_face = face.valueAt(center_u, center_v)
-
-                    # Set the plane to custom with this normal and point
-                    self.obj.Plane = "Custom"
-                    self.obj.Base = point_on_face
-                    self.obj.Normal = normal
-                    self.plane.setCurrentText("Custom")
-                    self._update_custom_controls()
-
-                    # Stop pick mode
-                    self._stop_pick_mode()
-
-                    # Show feedback
-                    QtGui.QMessageBox.information(
-                        self.form, "Face Selected",
-                        "Selected face normal: (%0.3f, %0.3f, %0.3f)" %
-                        (normal.x, normal.y, normal.z))
-                except Exception as exc:
-                    QtGui.QMessageBox.warning(
-                        self.form, "Error",
-                        "Failed to process selected face: %s" % str(exc))
-            else:
-                QtGui.QMessageBox.information(
-                    self.form, "Not a Face",
-                    "Please click on a face to select its plane.")
-
+            info = view.getObjectInfo(tuple(event["Position"]))
+            if not info or not str(info.get("Component", "")).startswith("Face"):
+                return                     # not a face: keep waiting
+            from FreeCAD import Vector
+            obj = doc.Document.getObject(info["Object"])
+            face = obj.Shape.getElement(info["Component"])
+            hit = Vector(info["x"], info["y"], info["z"])
+            u, v = face.Surface.parameter(hit)
+            normal = face.normalAt(u, v)
+            self.obj.Plane = "Custom"
+            self.obj.Base = hit
+            self.obj.Normal = normal
+            self.plane.blockSignals(True)
+            self.plane.setCurrentText("Custom")
+            self.plane.blockSignals(False)
+            self._custom_row.setVisible(True)
+            self._update_custom_controls()
+            # never unregister a Coin callback from inside itself
+            from PySide import QtCore
+            QtCore.QTimer.singleShot(0, self._stop_pick_mode)
+            QtCore.QTimer.singleShot(0, self.recompute)
         except Exception as exc:
-            QtGui.QMessageBox.warning(
-                self.form, "Pick Error",
-                "Error during pick processing: %s" % str(exc))
+            FreeCAD.Console.PrintWarning(
+                "Railform: mirror plane pick failed (%s)\n" % exc)
 
     def _update_custom_controls(self):
         """Update the custom base/normal spin controls when values change."""

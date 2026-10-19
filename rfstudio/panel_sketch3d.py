@@ -114,6 +114,9 @@ class Sketch3DFP(object):
         # Issue #11: per-point construction planes (multi-plane 3D sketch)
         # PointPlanes: per-point plane data aligned 1:1 with Points
         # Format: '' = global 3D, or 'ox,oy,oz|nx,ny,nz|ux,uy,uz|vx,vy,vz'
+        if not hasattr(obj, "EqManagerState"):
+            obj.addProperty("App::PropertyString", "EqManagerState",
+                            "Sketch3D", "Equation manager state (JSON)")
         if not hasattr(obj, "PointPlanes"):
             obj.addProperty("App::PropertyStringList", "PointPlanes",
                             "Sketch3D",
@@ -1286,7 +1289,7 @@ class Sketch3DPanel(object):
             self.status.setText("Variable name must be identifier-like")
             return
         self._push_undo()
-        unit = self.var_unit.text().strip() if hasattr(self, "var_unit") else "mm"
+        unit = self.var_unit.currentText().strip() if hasattr(self, "var_unit") else "mm"
         comment = self.var_comment.text().strip() if hasattr(self, "var_comment") else ""
         self._eq_manager.add_variable(name, self.var_val.value(), unit, comment)
         self._variables = self._eq_manager.get_all_variables()
@@ -1340,7 +1343,7 @@ class Sketch3DPanel(object):
         """Add a new configuration."""
         from PySide import QtWidgets
         name, ok = QtWidgets.QInputDialog.getText(
-            self.widget, "New Configuration", "Configuration name:")
+            self.form, "New Configuration", "Configuration name:")
         if ok and name.strip():
             self._push_undo()
             self._eq_manager.add_config(name.strip())
@@ -1384,7 +1387,7 @@ class Sketch3DPanel(object):
         from PySide import QtWidgets
         txt = self._eq_manager.export_equations_txt()
         fname, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self.widget, "Export equations.txt", "equations.txt", "Text files (*.txt)")
+            self.form, "Export equations.txt", "equations.txt", "Text files (*.txt)")
         if fname:
             try:
                 with open(fname, "w") as f:
@@ -1397,7 +1400,7 @@ class Sketch3DPanel(object):
         """Import variables and configs from SolidWorks equations.txt."""
         from PySide import QtWidgets
         fname, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self.widget, "Import equations.txt", "", "Text files (*.txt)")
+            self.form, "Import equations.txt", "", "Text files (*.txt)")
         if fname:
             try:
                 with open(fname, "r") as f:
@@ -2377,12 +2380,12 @@ class Sketch3DPanel(object):
             mat = coin.SoMaterial()
             mat.diffuseColor = color
             mat.ambientColor = color
-            sep = coin.SoSeparator()
-            sep.addChild(trans)
-            sep.addChild(rot)
-            sep.addChild(mat)
-            sep.addChild(cone)
-            sep.getParent().addChild(sep)  # add to the parent separator
+            head = coin.SoSeparator()
+            head.addChild(trans)
+            head.addChild(rot)
+            head.addChild(mat)
+            head.addChild(cone)
+            sep.addChild(head)
         except Exception:
             pass
 
@@ -3705,20 +3708,19 @@ class Sketch3DPanel(object):
         if not sub.startswith("Face"):
             self.status.setText("Tangent to face: selection is %r -- pick a FACE" % sub)
             return
-        # Get the actual face shape
-        try:
-            doc = FreeCAD.ActiveDocument or FreeCAD.newDocument()
-            src = doc.getObject(name)
-            face = src.Shape.getElement(sub)
-        except Exception:
-            self.status.setText("Tangent to face: could not get face geometry")
+        # The constraint references the owning DOCUMENT OBJECT (the solver
+        # takes the normal of that body's face nearest the point); a bare
+        # Part.Face can't live in a PropertyLinkList.
+        doc = FreeCAD.ActiveDocument or FreeCAD.newDocument()
+        src = doc.getObject(name)
+        if src is None:
+            self.status.setText("Tangent to face: could not resolve %s" % name)
             return
-        # Add face to ExternalSources if not already present
         ext_sources = getattr(self, "_constraint_sources", [])
-        if face_shape not in ext_sources:
-            ext_sources.append(face_shape)
+        if src not in ext_sources:
+            ext_sources.append(src)
             self._constraint_sources = ext_sources
-        src_idx = ext_sources.index(face_shape)
+        src_idx = ext_sources.index(src)
         self._push_undo()
         # Add constraint: ("tangent_to_face", i, j, src_idx)
         c = ("tangent_to_face", idx, idx + 1, src_idx)
@@ -3892,7 +3894,13 @@ class Sketch3DPanel(object):
                 if mixed:
                     obj.SegmentTypes = types
                     obj.Bulges = [repr(b) for b in bulges]
-                obj.Constraints = _serialize_constraints(self._constraints)
+                proj_src = _resolve_sources(doc, proj_refs)
+                csrc = list(getattr(self, "_constraint_sources", []))
+                off = len(proj_src)
+                obj.Constraints = _serialize_constraints(
+                    [(c[0], c[1], c[2], c[3] + off)
+                     if c[0] == "tangent_to_face" else c
+                     for c in self._constraints])
                 # Variables: use EquationManager serialization for full state
                 obj.Variables = _serialize_variables(self._variables)
                 # EquationManager full state (issues.md #10 / #15)
@@ -3906,12 +3914,8 @@ class Sketch3DPanel(object):
                 # refs (already row-aligned via the panel's upkeep) +
                 # link dependencies + the projection plane captured now.
                 obj.ProjectedRefs = proj_refs
-                obj.ExternalSources = _resolve_sources(doc, proj_refs)
-                # Add constraint sources (tangent_to_face faces) to ExternalSources
-                if getattr(self, "_constraint_sources", []):
-                    for src in self._constraint_sources:
-                        if src not in obj.ExternalSources:
-                            obj.ExternalSources.append(src)
+                obj.ExternalSources = proj_src + csrc   # assign: list.append on a
+                                                        # property copy never persisted
                 if getattr(self, "_proj_plane", None) is not None:
                     o, n = self._proj_plane
                     obj.PlaneOrigin = Vector(*o)
@@ -3960,19 +3964,25 @@ class Sketch3DPanel(object):
                 if self.fillet_chk.isChecked():
                     r = self.fillet_r.value()
                     if r > 0:
-                        filleted = core.wire_corner_fillet(loop_wire, r)
-                        fobj = doc.addObject("Part::Feature", "Sketch3D_Fillet_Loop%d" % loop_idx)
-                        fobj.Shape = filleted
-                        groups.add_to_group(fobj, "Surfaces")
+                        try:
+                            filleted = core.wire_corner_fillet(loop_wire, r)
+                            fobj = doc.addObject("Part::Feature", "Sketch3D_Fillet_Loop%d" % loop_idx)
+                            fobj.Shape = filleted
+                            groups.add_to_group(fobj, "Surfaces")
+                        except ValueError as exc:
+                            _panel_warning(self, "Railform 3D sketch: loop %d fillet skipped -- %s" % (loop_idx, exc))
 
                 # Chamfer if checked
                 if self.chamfer_chk.isChecked():
                     d = self.chamfer_d.value()
                     if d > 0:
-                        cut = core.wire_corner_chamfer(loop_wire, d)
-                        fobj = doc.addObject("Part::Feature", "Sketch3D_Chamfer_Loop%d" % loop_idx)
-                        fobj.Shape = cut
-                        groups.add_to_group(fobj, "Surfaces")
+                        try:
+                            cut = core.wire_corner_chamfer(loop_wire, d)
+                            fobj = doc.addObject("Part::Feature", "Sketch3D_Chamfer_Loop%d" % loop_idx)
+                            fobj.Shape = cut
+                            groups.add_to_group(fobj, "Surfaces")
+                        except ValueError as exc:
+                            _panel_warning(self, "Railform 3D sketch: loop %d chamfer skipped -- %s" % (loop_idx, exc))
                 
             # Create a group for this sketch and its features (nested feature tree)
             sketch_label = "Sketch3D"

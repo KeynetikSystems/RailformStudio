@@ -27,7 +27,6 @@ except Exception:                     # older shim: widgets live in QtGui
     QtWidgets = QtGui
 
 from rfstudio import deps, engines
-from rfstudio import panel_nurbspull
 from rfstudio import panel_sketch3d
 from rfstudio import taskpanels
 
@@ -329,11 +328,6 @@ _PANEL_COMMANDS = {
                            "Balance network continuity",
                            "Iteratively rebuild the worst seam's worse face to drive the network toward a target continuity.",
                            "rfs_balance.svg"),
-    # NURBS push/pull direct manipulation
-    "RFS_NURBSPushPull": (lambda: panel_nurbspull.createPanel(),
-                                                           "NURBS Push/Pull",
-                                                           "Push/pull NURBS control points with interactive draggers",
-                                                           "rfs_nurbs_pushpull.svg"),
 }
 
 # Delegating commands -- curated label + tooltip + icon per engine command.
@@ -401,7 +395,7 @@ TOOLBARS = [
                           "RFS_BlendSurfClosed", "RFS_Trim",
                           "RFS_TrimByIntersection", "RFS_SketchOnSurf",
                           "RFS_Offset", "RFS_Thicken", "RFS_Shell",
-                          "RFS_StitchShell", "RFS_NURBSPushPull"]),
+                          "RFS_StitchShell"]),
     ("Railform Clean",   ["RFS_ControlPoly4", "RFS_CleanPatch44",
                           "RFS_CleanPatch66", "RFS_StarPatch",
                           "RFS_Fillet", "RFS_Chamfer",

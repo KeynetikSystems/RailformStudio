@@ -160,17 +160,6 @@ class SurfacePanel(_EditPanelBase):
         # Match: wrap Samples/Scale in collapsible Advanced group
         if self.kind == "Match":
             self.adv_match = _CollapsibleGroup("Advanced: samples / scale", collapsed=True)
-            for name in ("Samples", "Scale"):
-                if name in obj.PropertiesList and obj.getGroupOfProperty(name) == self.kind:
-                    tid = obj.getTypeIdOfProperty(name)
-                    if tid == "App::PropertyInteger":
-                        self._add_int(name)
-                    elif tid == "App::PropertyFloat":
-                        self._add_float(name)
-                    # Move the created widgets into the collapsible group
-                    # (they were added via _row -> _lay, so we need to move them)
-            # This is complex - let's use a simpler approach
-            # Instead, add the controls directly in the group
             self.adv_match.content_layout.addWidget(QtWidgets.QLabel("Samples"))
             self.samples = QtWidgets.QSpinBox()
             self.samples.setRange(4, 200)
