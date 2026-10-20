@@ -358,7 +358,7 @@ def _match_degrees(s1, s2, s3):
 
 
 
-def gordon_network(profiles, guides, samples_per_curve=24):
+def gordon_network(profiles, guides, samples_per_curve=24, extra_per_gap=4):
     """Gordon surface from a network of U- and V-curves (TiGL 1969).
 
     Implements `S = S1 + S2 - S3` (control-point-wise sum), the standard
@@ -399,6 +399,10 @@ def gordon_network(profiles, guides, samples_per_curve=24):
       profiles, guides  : iterables of Part.Edge or Part.BSplineCurve.
       samples_per_curve : refinement samples for the closest-approach
                           fallback when two curves don't actually cross.
+      extra_per_gap     : extra samples inserted between crossings on each
+                          family's continuous axis (shape-fidelity knob;
+                          the multi-rail sweep raises it when it solves
+                          through this function).
     """
     bs_profiles = [_to_bspline(e) for e in profiles]
     bs_guides = [_to_bspline(e) for e in guides]
@@ -483,7 +487,8 @@ def gordon_network(profiles, guides, samples_per_curve=24):
     #    (v_bar). No exchangeUV needed: built directly in the (u_bar,
     #    v_bar) orientation S1 needs for the final sum.
     own_v_per_guide = [[params_v[i][j] for i in range(nu)] for j in range(nv)]
-    s1, u_ref = _skin_through_family(bs_guides, own_v_per_guide, u_bar, v_bar)
+    s1, u_ref = _skin_through_family(bs_guides, own_v_per_guide, u_bar, v_bar,
+                                     extra_per_gap=extra_per_gap)
 
     # 4) S2: skin through profiles -- continuous along each profile's own
     #    arc (v_bar anchors), discrete across the nu profiles (u_bar).
@@ -491,7 +496,8 @@ def gordon_network(profiles, guides, samples_per_curve=24):
     #    exchangeUV()'d to align -- mirrors the original algorithm's use
     #    of exchangeUV for the same reason.
     own_u_per_profile = [[params_u[i][j] for j in range(nv)] for i in range(nu)]
-    s2, v_ref = _skin_through_family(bs_profiles, own_u_per_profile, v_bar, u_bar)
+    s2, v_ref = _skin_through_family(bs_profiles, own_u_per_profile, v_bar,
+                                     u_bar, extra_per_gap=extra_per_gap)
     s2.exchangeUV()
 
     # 5) S3 = tensor interpolation through the (nu x nv) intersection
@@ -1193,6 +1199,41 @@ def _nearest_t(edge, pt, samples=100):
     return best_t
 
 
+class _NearestTCache:
+    """One sweep call's worth of sampled edges for repeated _nearest_t queries.
+
+    multi_rail_sweep / two_rail_sweep query their rails once per profile
+    (flip heuristics, stations), so the same rails were re-evaluated
+    through OCCT 101 times per profile per query site. The cache samples
+    each edge once and re-uses the point list; the returned parameters are
+    bit-identical to _nearest_t's (same samples, same distances).
+
+    Lives only inside one sweep call, and only grips edges the caller
+    keeps referenced for that whole call, so id() recycling can never
+    poison a lookup."""
+    def __init__(self, samples=100):
+        self._samples = int(samples)
+        self._by_edge = {}
+
+    def points(self, edge):
+        pts = self._by_edge.get(id(edge))
+        if pts is None:
+            pts = [_eval01(edge, k / float(self._samples))
+                   for k in range(self._samples + 1)]
+            self._by_edge[id(edge)] = pts
+        return pts
+
+    def param(self, edge, pt):
+        pts = self.points(edge)
+        step = 1.0 / self._samples
+        best_t, best_d = 0.0, 1e18
+        for k in range(len(pts)):
+            d = pts[k].distanceToPoint(pt)
+            if d < best_d:
+                best_d, best_t = d, k * step
+        return best_t
+
+
 
 def _polygon_normal(pts):
     """Newell's-method normal of a point sequence (robust, non-planar OK)."""
@@ -1230,6 +1271,7 @@ def two_rail_sweep(rail1, rail2, profiles, n_rail=40, n_prof=20):
     n_prof = max(2, int(n_prof))
     n_rail = max(2, int(n_rail))
     cols = [s / (n_prof - 1.0) for s in range(n_prof)]
+    cache = _NearestTCache()
 
     # --- per-profile local description ---------------------------------- #
     descs = []          # (station_t, up_vector, [(cx, cy, cz), ...])
@@ -1237,8 +1279,8 @@ def two_rail_sweep(rail1, rail2, profiles, n_rail=40, n_prof=20):
     for pro in profiles:
         e0, e1 = _eval01(pro, 0.0), _eval01(pro, 1.0)
         # orient so sample param 0 lands on rail1, last sample on rail2
-        flip = (_nearest_t(rail1, e1) + _nearest_t(rail2, e0)) < \
-               (_nearest_t(rail1, e0) + _nearest_t(rail2, e1))
+        flip = (cache.param(rail1, e1) + cache.param(rail2, e0)) < \
+               (cache.param(rail1, e0) + cache.param(rail2, e1))
         samp = [_eval01(pro, (1.0 - s) if flip else s) for s in cols]
         a, b = samp[0], samp[-1]
         chord = b.sub(a)
@@ -1264,7 +1306,7 @@ def two_rail_sweep(rail1, rail2, profiles, n_rail=40, n_prof=20):
         for p in samp:
             d = p.sub(a)
             local.append((d.dot(ex) / L, d.dot(ey), d.dot(ez)))
-        descs.append((_nearest_t(rail1, a), ey, local))
+        descs.append((cache.param(rail1, a), ey, local))
     if not descs:
         raise ValueError("two-rail sweep: no usable profiles")
     descs.sort(key=lambda d: d[0])
@@ -1312,6 +1354,679 @@ def two_rail_sweep(rail1, rail2, profiles, n_rail=40, n_prof=20):
     return grid_to_surface(grid)
 
 
+# --- cross-section spine (the polyline a station's rails trace out) -------- #
+def _spine_params(pts):
+    """Normalized cumulative chord-length params of the polyline through pts."""
+    n = len(pts)
+    if n < 2:
+        return [0.0]
+    if n == 2:
+        return [0.0, 1.0]
+    acc, total = [0.0], 0.0
+    for i in range(n - 1):
+        total += max(pts[i + 1].sub(pts[i]).Length, 1e-12)
+        acc.append(total)
+    inv = 1.0 / total
+    out = [s * inv for s in acc]
+    out[0], out[-1] = 0.0, 1.0
+    return out
+
+
+def _spine_segment(params, u):
+    """Index of the polyline segment param u sits on (clamped to the ends)."""
+    n = len(params)
+    if u <= params[0]:
+        return 0
+    if u >= params[n - 1]:
+        return n - 2
+    k = 0
+    while params[k + 1] < u:
+        k += 1
+    return k
+
+
+def _spine_eval(params, pts, u):
+    """Point on the polyline at param u (linear extrapolation outside it)."""
+    k = _spine_segment(params, u)
+    span = params[k + 1] - params[k]
+    w = 0.0 if span < 1e-15 else (u - params[k]) / span
+    return pts[k] + pts[k + 1].sub(pts[k]) * w
+
+
+def _spine_project(params, pts, p):
+    """Polyline param of the point on the spine closest to p.
+
+    Projects onto each segment's INFINITE line (deliberately unclamped) so a
+    2-point spine reproduces two_rail_sweep's raw (d.ex)/L coordinate even
+    for a sample that overhangs the chord."""
+    best_u, best_d = params[0], None
+    for k in range(len(pts) - 1):
+        a, b = pts[k], pts[k + 1]
+        sx, sy, sz = b.x - a.x, b.y - a.y, b.z - a.z
+        l2 = sx * sx + sy * sy + sz * sz
+        if l2 < 1e-24:
+            t = 0.0
+        else:
+            t = ((p.x - a.x) * sx + (p.y - a.y) * sy + (p.z - a.z) * sz) / l2
+        dx = p.x - (a.x + sx * t)
+        dy = p.y - (a.y + sy * t)
+        dz = p.z - (a.z + sz * t)
+        d = dx * dx + dy * dy + dz * dz
+        if best_d is None or d < best_d:
+            best_d = d
+            best_u = params[k] + (params[k + 1] - params[k]) * t
+    return best_u
+
+
+def _spine_map(z_params, s_params, u):
+    """Reference-spine param -> station-spine param, pinning vertex i of the
+    reference polyline to vertex i of the station polyline (that vertex-wise
+    anchoring is what puts the surface ON every rail).  Identity for a
+    2-point spine, so the two-rail case never moves."""
+    k = _spine_segment(z_params, u)
+    span = z_params[k + 1] - z_params[k]
+    w = 0.0 if span < 1e-15 else (u - z_params[k]) / span
+    return s_params[k] + (s_params[k + 1] - s_params[k]) * w
+
+
+def _spine_invert(z_params, pts, evaluate, u_target, lo, hi, iters=32,
+                  scan=64):
+    """Profile param in [lo, hi] whose projection onto the reference spine is
+    u_target.
+
+    Monotonicity is only assumed LOCALLY, not across the whole bracket:
+    a coarse scan locates the FIRST (in profile-param order) interval
+    where the projection crosses u_target, and bisection -- which needs a
+    sign change, i.e. a locally monotone branch -- refines inside just
+    that bracket. The previous plain-bisection version assumed the
+    projection increased over [lo, 1] throughout; an S-swaying profile
+    that crosses the spine, swings back and crosses again made it bisect
+    around whatever the mid parameter happened to project to, silently
+    mis-assigning the rail's column. When the projection never reaches
+    u_target (a profile that stops short of the spine) the nearest
+    scanned sample is returned -- the best correspondence available,
+    instead of an arbitrary bracket end.
+
+    32 halvings of the found bracket finish well below the rail's own
+    resolution."""
+    n_scan = max(2, int(scan))
+    span = hi - lo
+    prev_t, prev_p = lo, _spine_project(z_params, pts, evaluate(lo))
+    below = prev_p < u_target
+    best_t, best_gap = prev_t, abs(prev_p - u_target)
+    bracket = None
+    for k in range(1, n_scan + 1):
+        t = lo + span * k / float(n_scan)
+        p = _spine_project(z_params, pts, evaluate(t))
+        gap = abs(p - u_target)
+        if gap < best_gap:
+            best_t, best_gap = t, gap
+        if (p < u_target) != below:
+            bracket = (prev_t, t, below)
+            break
+        prev_t, prev_p, below = t, p, (p < u_target)
+    if bracket is None:
+        return best_t
+    a, b, below_a = bracket
+    for _ in range(iters):
+        mid = 0.5 * (a + b)
+        if (_spine_project(z_params, pts, evaluate(mid)) < u_target) == below_a:
+            a = mid
+        else:
+            b = mid
+    return 0.5 * (a + b)
+
+
+def _sweep_columns(z_params, ref, evaluate, n_prof):
+    """Column set for one profile, in (profile param, spine param).
+
+    One column is pinned to each rail's spine vertex (its profile param is
+    the inverse of that vertex's projection), so the sweep always has a
+    column sitting exactly on every rail at the profile's own station; the
+    remaining columns are spread evenly through the gaps.  For 2 rails the
+    pins are the profile's endpoints and the spread is j/(n_prof-1) --
+    exactly two_rail_sweep's uniform sampling.
+
+    Returns (profile params, spine params, pinned column indices)."""
+    n = len(z_params)
+    n_prof = max(int(n_prof), n)
+    qs = [0.0] * n
+    for i in range(1, n - 1):
+        qs[i] = _spine_invert(z_params, ref, evaluate, z_params[i],
+                              qs[i - 1], 1.0)
+    qs[n - 1] = 1.0
+    params, pinned = [qs[0]], [0]
+    fillers, gaps = n_prof - n, n - 1
+    for k in range(gaps):
+        lo, hi = qs[k], qs[k + 1]
+        m = fillers // gaps + (1 if k < (fillers % gaps) else 0)
+        for i in range(1, m + 1):
+            params.append(lo + (hi - lo) * (i / (m + 1.0)))
+        params.append(hi)
+        pinned.append(len(params) - 1)
+    at = {col: i for i, col in enumerate(pinned)}
+    us = [z_params[at[k]] if k in at else
+          _spine_project(z_params, ref, evaluate(params[k]))
+          for k in range(len(params))]
+    return params, us, pinned
+
+
+# --- multi-rail sweep: continuous (Gordon) route ---------------------------- #
+# When the profile/rail network is COMPATIBLE (every profile genuinely
+# crosses every rail), an exact continuous solve exists and the
+# station-skinned spine approximation is strictly worse between profile
+# stations. These knobs gate when the Gordon route ships:
+_MULTIRAIL_GORDON_DENSIFY = 8       # extra_per_gap fed to gordon_network
+_MULTIRAIL_GORDON_RAIL_TOL = 1e-5
+_MULTIRAIL_GORDON_PROFILE_TOL = 5e-4
+_MULTIRAIL_GORDON_RAIL_SAMPLES = 33
+_MULTIRAIL_GORDON_PROFILE_SAMPLES = 13
+
+# --- multi-rail sweep: adaptive station-skinning fallback ------------------- #
+# Ports of the C++ multi-rail transport design's fallback machinery onto the
+# crossed-network spine path (the exact continuous Gordon route above already
+# covers what it does better):
+_MULTIRAIL_SPINE_TOL = 1e-4        # between-station hold target (model units)
+_MULTIRAIL_STATION_FACTOR = 4      # station budget = factor x n_rail (C++ room)
+_MULTIRAIL_STATION_PASSES = 10     # subdivision rounds (C++)
+_MULTIRAIL_STATION_SAG = 4.0       # subdivide a gap whose midpoint row sags
+                                   # more than this x tol (C++ heuristic)
+
+
+def _smootherstep(s):
+    """C2 quintic smootherstep s^3(6s-15s+10), clamped to [0,1] -- the weight
+    the C++ design uses for its phi_i partition of unity (zero slope AND zero
+    curvature at both ends, so a contact anchor is 'dwellable', not merely
+    passable)."""
+    s = min(max(s, 0.0), 1.0)
+    return s * s * s * (s * (6.0 * s - 15.0) + 10.0)
+
+
+class _ArcRail:
+    """Cumulative chord-length table over one rail edge -- the Python port of
+    the C++ transport's ArcCurve.  Stations on the sweep axis are arc
+    FRACTIONS, and every rail is evaluated at its own arc-fraction-equivalent
+    point, so rails of different lengths or parametrizations stay in sync
+    (the normalized-parameter sampling the spine path used before silently
+    desynced them; on equal-length, evenly-parametrized fixtures this table
+    is the identity, on real rails it is not)."""
+    def __init__(self, edge, samples=256):
+        self.edge = edge
+        # The table lives in NORMALIZED-parameter space end to end:
+        # _NearestTCache.param and the station conventions feed normalized
+        # params in, and point_at feeds its own results through _eval01,
+        # which also expects [0,1]. Edges produced by interpolating
+        # BSplineCurve.toShape() often carry RAW geometric parameters
+        # (e.g. chord length), so anything that kept raw edge params here
+        # would double-scale by the rail length.
+        self.params = [k / float(samples) for k in range(samples + 1)]
+        pts = [_eval01(edge, k / float(samples)) for k in range(samples + 1)]
+        acc = [0.0]
+        for k in range(samples):
+            acc.append(acc[-1] + pts[k].distanceToPoint(pts[k + 1]))
+        self.total = acc[-1] if acc[-1] > 1e-12 else 1.0
+        self.acc = [a / self.total for a in acc]
+
+    def fraction_of(self, t_norm):
+        """Normalized parameter -> arc fraction in [0,1] (piecewise linear)."""
+        params, acc = self.params, self.acc
+        if t_norm <= params[0]:
+            return 0.0
+        if t_norm >= params[-1]:
+            return 1.0
+        for k in range(len(params) - 1):
+            if params[k] <= t_norm <= params[k + 1]:
+                span = params[k + 1] - params[k]
+                w = 0.0 if span < 1e-15 else (t_norm - params[k]) / span
+                return acc[k] + w * (acc[k + 1] - acc[k])
+        return 1.0
+
+    def param_at(self, s):
+        """Arc fraction -> normalized parameter (piecewise linear inverse)."""
+        acc = self.acc
+        s = min(max(s, 0.0), 1.0)
+        for k in range(len(acc) - 1):
+            if acc[k] <= s <= acc[k + 1]:
+                span = acc[k + 1] - acc[k]
+                w = 0.0 if span < 1e-15 else (s - acc[k]) / span
+                return self.params[k] + w * (self.params[k + 1] - self.params[k])
+        return self.params[-1]
+
+    def point_at(self, s):
+        """Point on the rail at arc fraction s."""
+        return _eval01(self.edge, self.param_at(s))
+
+
+def _spine_map_c2(z_params, s_params, u):
+    """C2 upgrade of _spine_map: the same vertex-wise rail pinning (vertex i
+    of the reference spine still maps to vertex i of the station spine
+    EXACTLY, which is what puts the surface on every rail), but the position
+    between two consecutive pins eases with _smootherstep instead of ramping
+    linearly -- the map dwells tangent at each pinned rail vertex, the same
+    zero-slope-at-contact behaviour the C++ phi_i weights give, so the
+    section transitions between rails are C2 instead of kinked at the pins."""
+    k = _spine_segment(z_params, u)
+    span = z_params[k + 1] - z_params[k]
+    w = 0.0 if span < 1e-15 else (u - z_params[k]) / span
+    return s_params[k] + _smootherstep(w) * (s_params[k + 1] - s_params[k])
+
+
+def _dedupe_stations(stations, gap=1e-9):
+    """Drop consecutive sweep-station params closer than `gap`."""
+    out = []
+    for s in stations:
+        if out and s - out[-1] < gap:
+            continue
+        out.append(s)
+    return out
+
+
+def _deviation_of_curves(curves, shape, samples):
+    """Worst distance from midpoints along each curve to `shape`."""
+    worst = 0.0
+    for c in curves:
+        fp, lp = c.FirstParameter, c.LastParameter
+        for k in range(int(samples)):
+            t = fp + (k + 0.5) / float(samples) * (lp - fp)
+            worst = max(worst, Part.Vertex(c.value(t)).distToShape(shape)[0])
+    return worst
+
+
+def _rail_order_warning(profile_params):
+    """Message when rail ORDER disagrees with how the profiles traverse
+    them, else None.
+
+    profile_params[i][j] is the parameter along profile i of its
+    crossing/closest approach to rail j (index-aligned with the rails
+    list). Each row must increase with the rail index: if it doesn't,
+    the station-skinned spine walks the rails in a zigzag the profiles
+    don't follow -- the surface still passes through every rail (each
+    gets its pinned column) but the shaped span between them is
+    geometrically meaningless. The Gordon route doesn't need this check
+    (it relabels each family onto its own shared axis) -- it is only
+    consulted when the spine fallback engages."""
+    for i, row in enumerate(profile_params):
+        for j in range(len(row) - 1):
+            if row[j] >= row[j + 1] - 1e-9:
+                return ("rail %d does not come after rail %d along profile "
+                        "%d -- the rail order does not match how the "
+                        "sections run through them. Reorder the rails so "
+                        "the sections cross them in that order."
+                        % (j + 1, j, i + 1))
+    return None
+
+
+def _try_gordon_route(rails, profiles):
+    """Exact continuous solve for a well-formed multi-rail sweep network.
+
+    The compatibility preconditions are measured, not assumed: every
+    profile must genuinely cross every rail (within _GORDON_CROSS_TOL,
+    plain closest-approach otherwise -- the same test gordon_network's
+    own warning enforces). The result is then measured against both
+    input families and only shipped when it actually holds every rail
+    within _MULTIRAIL_GORDON_RAIL_TOL and every profile within
+    _MULTIRAIL_GORDON_PROFILE_TOL -- anything less falls back to the
+    station-skinned spine path, which lands ON every rail at every
+    station by construction.
+
+    Returns the Part shape, or None to signal "use the spine path".
+    The intersection grid is computed here for validation and again
+    inside gordon_network for the solve; the duplicate OCCT work buys
+    not having to restructure gordon_network's public signature.
+    """
+    bs_rails = [_to_bspline(r) for r in rails]
+    bs_prof = [_to_bspline(p) for p in profiles]
+    params_u, _params_v, gaps = _intersect_grid(bs_prof, bs_rails)
+    nu, nv = len(bs_prof), len(bs_rails)
+    worst, worst_ij = 0.0, None
+    for i in range(nu):
+        for j in range(nv):
+            if gaps[i][j] > worst:
+                worst, worst_ij = gaps[i][j], (i, j)
+    if worst_ij is not None and worst > _GORDON_CROSS_TOL:
+        FreeCAD.Console.PrintWarning(
+            "Railform Multi-rail sweep: profile %d never truly crosses rail "
+            "%d (closest approach %.4g), so no exact network solve exists "
+            "-- skinning across stations instead. The surface will pass "
+            "BETWEEN those two rather than through both there.\n"
+            % (worst_ij[0] + 1, worst_ij[1] + 1, worst))
+        order_msg = _rail_order_warning(params_u)
+        if order_msg:
+            FreeCAD.Console.PrintWarning(
+                "Railform Multi-rail sweep: %s\n" % order_msg)
+        return None
+    try:
+        shape = gordon_network(profiles, rails,
+                               extra_per_gap=_MULTIRAIL_GORDON_DENSIFY)
+    except Exception as exc:
+        FreeCAD.Console.PrintWarning(
+            "Railform Multi-rail sweep: Gordon solve failed (%s) -- "
+            "skinning across stations instead.\n" % exc)
+        return None
+    rail_dev = _deviation_of_curves(bs_rails, shape,
+                                    _MULTIRAIL_GORDON_RAIL_SAMPLES)
+    prof_dev = _deviation_of_curves(bs_prof, shape,
+                                    _MULTIRAIL_GORDON_PROFILE_SAMPLES)
+    if rail_dev <= _MULTIRAIL_GORDON_RAIL_TOL and \
+            prof_dev <= _MULTIRAIL_GORDON_PROFILE_TOL:
+        return shape
+    FreeCAD.Console.PrintWarning(
+        "Railform Multi-rail sweep: Gordon solve does not hold the input "
+        "(worst rail deviation %.3g, profile %.3g) -- skinning across "
+        "stations instead.\n" % (rail_dev, prof_dev))
+    return None
+
+
+def multi_rail_sweep(rails, profiles, n_rail=40, n_prof=20):
+    """Skin a set of profile curves across N >= 2 rail curves.
+
+    With >= 3 rails and >= 2 profiles, and a COMPATIBLE network (every
+    profile genuinely crosses every rail), the surface comes from a
+    Gordon boolean-sum solve -- it passes through the FULL shape of every
+    rail and profile continuously, not just at the sample stations (see
+    _try_gordon_route for the measured acceptance gates and fallbacks).
+
+    Everything else uses an adaptive station-skinning transport that ports
+    the C++ multi-rail sweep design's exact-facing machinery onto the
+    crossed-network spine idea:
+
+      * rails[0] and rails[-1] bound the sweep exactly as in
+        two_rail_sweep; every INTERMEDIATE rail anchors it too.  Each
+        station samples ALL rails and bases the section on the polyline
+        through those points, with each profile's transverse offsets
+        measured against its own reference spine.
+      * the stations live on an ARC-FRACTION axis shared by every rail
+        (_ArcRail): each rail is sampled at its own arc-fraction point,
+        so rails of different lengths or parametrizations stay in sync.
+      * each profile's own station is a HARD station (the C++ design's
+        contact-point breaks): at exactly that position the row is that
+        profile's reconstruction, so "the profile wins at its own
+        station" is exact, not an accident of where uniform stations
+        happened to fall.
+      * between stations the row count ADAPTS: a gap whose midpoint row
+        deviates from the average of its bracketing rows by more than
+        _MULTIRAIL_STATION_SAG x _MULTIRAIL_SPINE_TOL subdivides, within
+        a budget of _MULTIRAIL_STATION_FACTOR x n_rail rows and
+        _MULTIRAIL_STATION_PASSES rounds.
+      * the section's remap between pinned rail columns eases with a C2
+        smootherstep (_spine_map_c2, the C++ phi_i partition of unity),
+        and the template morph between adjacent profiles eases the same
+        way -- tangent dwell at every anchor instead of C0 kinks.
+      * a degenerate station (rails collapsing onto a common point) is
+        refused with a message, in the C++ spirit of "failures as text,
+        never a bad surface".
+      * the finished surface is MEASURED against the boundary rails (the
+        one guarantee profile-endpoint pinning always gives); when the
+        between-station hold misses the target a warning names the
+        number and the knob.  The station pins themselves are exact by
+        construction.
+
+    For exactly two rails the call delegates to two_rail_sweep directly:
+    the old spine remap was the identity and the columns j/(n_prof-1)
+    there, so both paths already produced the same surface to
+    floating-point noise -- the delegation now makes that exact instead
+    of approximate.
+
+    No Curves/libS2R dependency; robust and headless-testable.
+    """
+    rails = list(rails)
+    n_rails = len(rails)
+    if n_rails < 2:
+        raise ValueError(
+            "multi-rail sweep: need >= 2 rails -- got %d" % n_rails)
+    n_prof = max(2, int(n_prof), n_rails)
+    n_rail = max(2, int(n_rail))
+
+    # Exactly two rails IS two_rail_sweep: there the spine remap is the
+    # identity and the columns spread j/(n_prof-1), so the old N=2
+    # reduction reproduced it to floating-point noise. Delegate directly --
+    # same numbers, zero reduction drift.
+    if n_rails == 2:
+        return two_rail_sweep(rails[0], rails[1], profiles, n_rail, n_prof)
+
+    base, far = rails[0], rails[-1]
+
+    if n_rails >= 3 and len(profiles) >= 2:
+        gordon = _try_gordon_route(rails, profiles)
+        if gordon is not None:
+            return gordon
+
+    # --- arc-length rail tables (the shared sweep axis) ------------------ #
+    arc = [_ArcRail(r) for r in rails]
+
+    cache = _NearestTCache()
+    descs = []
+    prev_up = None
+    for pro in profiles:
+        e0, e1 = _eval01(pro, 0.0), _eval01(pro, 1.0)
+        # orient so sample param 0 lands on rail 0, last sample on rail N-1
+        flip = (cache.param(base, e1) + cache.param(far, e0)) < \
+               (cache.param(base, e0) + cache.param(far, e1))
+
+        def P(t, _pro=pro, _flip=flip):
+            return _eval01(_pro, 1.0 - t if _flip else t)
+
+        # Reference spine for this profile: its own two ends (which is what
+        # two_rail_sweep measures against) plus every interior rail sampled
+        # at the arc-fraction-synced station of the profile's start.  Vertex
+        # i is therefore the point the sweep must sit on for rail i, and
+        # the profile's transverse coordinates are taken relative to it.
+        s_p = arc[0].fraction_of(cache.param(base, P(0.0)))
+        ref = [P(0.0)]
+        ref += [arc[k].point_at(s_p) for k in range(1, n_rails - 1)]
+        ref.append(P(1.0))
+        zref = _spine_params(ref)
+        qcols, ucols, _pinned = _sweep_columns(zref, ref, P, n_prof)
+        samp = [P(q) for q in qcols]
+        a, b = samp[0], samp[-1]
+        chord = b.sub(a)
+        L = chord.Length
+        if L < 1e-9:
+            continue
+        ex = Vector(chord)
+        ex.normalize()
+        nrm = _polygon_normal(samp)
+        up = nrm if nrm.Length > 1e-7 else _perp(ex)
+        up.normalize()
+        if prev_up is not None and up.dot(prev_up) < 0:
+            up = up.negative()
+        ez = ex.cross(up)
+        if ez.Length < 1e-9:
+            up = _perp(ex)
+            ez = ex.cross(up)
+        ez.normalize()
+        ey = ez.cross(ex)
+        ey.normalize()
+        prev_up = ey
+        local = []
+        for k, p in enumerate(samp):
+            u = ucols[k]
+            d = p.sub(_spine_eval(zref, ref, u))
+            # full 3-component offset in the profile's orthonormal frame --
+            # the along-chord piece matters whenever the profile bulges away
+            # from the polyline spine between rail points
+            local.append((u, d.dot(ex), d.dot(ey), d.dot(ez)))
+        descs.append((s_p, ey, local, zref))
+    if not descs:
+        raise ValueError("multi-rail sweep: no usable profiles")
+    descs.sort(key=lambda d: d[0])
+
+    # --- rows at sweep stations (cached; adaptive passes reuse them) ----- #
+    rows = {}
+
+    def station_row(s):
+        """One grid row (plus its per-column spine params) at sweep-station
+        arc fraction s."""
+        cached = rows.get(s)
+        if cached is not None:
+            return cached
+        wpts = [arc[k].point_at(s) for k in range(n_rails)]
+        sparams = _spine_params(wpts)
+        # Degenerate-station guard (the C++ zero-Jacobian check): a rail
+        # chord that collapses to a point cannot carry a section -- refuse
+        # instead of silently skinning garbage.
+        chord = wpts[-1].sub(wpts[0])
+        if chord.Length < 1e-9:
+            raise ValueError(
+                "multi-rail sweep: rails collapse (zero Jacobian) at "
+                "station %.4g -- the rails touch there, so the sweep "
+                "degenerates" % s)
+        ex = Vector(chord)
+        ex.normalize()
+        # A row ON a profile's own station (within table noise of that
+        # station's arc fraction) is that profile's exact reconstruction --
+        # the hard-station contract. Proximity, not float equality: the
+        # uniform grid and an arc-table anchor differ by ~1e-14, and
+        # _dedupe_stations keeps only one of the pair, so whichever
+        # station survives must still anchor to the profile.
+        hard = None
+        for d in descs:
+            if abs(s - d[0]) <= 1e-9:
+                hard = d
+                break
+        if hard is not None:
+            lo = hi = hard
+            w = 0.0
+        elif len(descs) == 1 or s <= descs[0][0]:
+            lo = hi = descs[0]
+            w = 0.0
+        elif s >= descs[-1][0]:
+            lo = hi = descs[-1]
+            w = 0.0
+        else:
+            k = 0
+            while k < len(descs) - 1 and descs[k + 1][0] < s:
+                k += 1
+            lo, hi = descs[k], descs[k + 1]
+            span = hi[0] - lo[0]
+            # C2 template morph between the bracketing profiles: the shape
+            # blend eases in/out at every anchor (the C++ phi behaviour)
+            # instead of ramping linearly, so a profile's own station is a
+            # genuine dwell on that profile's shape.
+            w = 0.0 if span < 1e-12 else \
+                _smootherstep((s - lo[0]) / span)
+        up = lo[1] * (1.0 - w) + hi[1] * w
+        ez = ex.cross(up)
+        if ez.Length < 1e-9:
+            up = _perp(ex)
+            ez = ex.cross(up)
+        ez.normalize()
+        ey = ez.cross(ex)
+        ey.normalize()
+        # interpolated reference spine: vertex k of lo/hi -> vertex k here
+        zmap = [lo[3][k] * (1.0 - w) + hi[3][k] * w for k in range(n_rails)]
+        row, sps = [], []
+        for j in range(n_prof):
+            u0, cx0, cy0, cz0 = lo[2][j]
+            u1, cx1, cy1, cz1 = hi[2][j]
+            u = u0 * (1.0 - w) + u1 * w
+            cx = cx0 * (1.0 - w) + cx1 * w
+            cy = cy0 * (1.0 - w) + cy1 * w
+            cz = cz0 * (1.0 - w) + cz1 * w
+            # C2 remap between the pinned rail columns for the GEOMETRY
+            # between two anchors (the C++ phi weights: dwell tangent at
+            # each rail vertex, so station transitions across the section
+            # are C2, not kinked).  At a hard station (w exactly 0 or 1:
+            # the row IS one profile's anchor) keep the plain linear map:
+            # with the anchor's own spine as the map source it is the
+            # identity there, so the row reproduces the profile's original
+            # interior positions exactly.
+            if 0.0 < w < 1.0:
+                sp = _spine_map_c2(zmap, sparams, u)
+            else:
+                sp = _spine_map(zmap, sparams, u)
+            # the section PARAMETERIZATION bookkeeping stays on the plain
+            # linear map (pre-C2 behaviour): the finisher's v grid must be
+            # the profiles' own column params for the anchor iso-curve's
+            # stage-A interpolation to reconstruct the profile curve to
+            # machine precision (OCC's interpolate() with a curve's own
+            # parameterization reproduces it exactly), which the C2
+            # dwell-plateau values would shift.
+            sps.append(_spine_map(zmap, sparams, u))
+            pt = _spine_eval(sparams, wpts, sp)
+            row.append(pt + ex * cx + ey * cy + ez * cz)
+        rows[s] = (row, sps)
+        return rows[s]
+
+    # initial station set: the uniform n_rail grid plus the profiles' own
+    # hard stations and the exact ends
+    station_list = _dedupe_stations(sorted(
+        [i / float(n_rail - 1) for i in range(n_rail)]
+        + [d[0] for d in descs] + [0.0, 1.0]))
+
+    # adaptive subdivision: probe each gap's midpoint row against the
+    # average of its bracketing rows over the full pinned-column set
+    # (the C++ chord-deviation probe); subdivide where it sags past the
+    # target, one round at a time, within the station budget
+    max_stations = _MULTIRAIL_STATION_FACTOR * n_rail
+    for _round in range(_MULTIRAIL_STATION_PASSES):
+        room = max_stations - len(station_list)
+        if room <= 0:
+            break
+        inserts = {}
+        for k in range(len(station_list) - 1):
+            if room <= 0:
+                break
+            sa, sb = station_list[k], station_list[k + 1]
+            row_m = station_row(0.5 * (sa + sb))
+            row_a = station_row(sa)
+            row_b = station_row(sb)
+            dev = 0.0
+            for j in range(n_prof):
+                chord2 = 0.5 * (row_a[0][j] + row_b[0][j])
+                dev = max(dev, row_m[0][j].distanceToPoint(chord2))
+            if dev > _MULTIRAIL_STATION_SAG * _MULTIRAIL_SPINE_TOL:
+                inserts[k] = 0.5 * (sa + sb)
+                room -= 1
+        if not inserts:
+            break
+        grown = []
+        for k in range(len(station_list) - 1):
+            grown.append(station_list[k])
+            if k in inserts:
+                grown.append(inserts[k])
+        grown.append(station_list[-1])
+        station_list = _dedupe_stations(grown)
+
+    # final rows: every adaptive station, exactly interpolated through the
+    # grid points at EXPLICIT parameters (the station arc fractions along
+    # the sweep axis, each column's mean spine position across stations
+    # along the section axis) -- the between-node shape tracks the real
+    # rail/profile correspondence instead of chord-length guesses
+    spine_u_acc = [0.0] * n_prof
+    grid = []
+    for s in station_list:
+        row, sps = station_row(s)
+        grid.append(row)
+        for j in range(n_prof):
+            spine_u_acc[j] += sps[j]
+    v_vals = [acc / float(len(station_list)) for acc in spine_u_acc]
+    try:
+        shape = _grid_interpolation_surface(
+            grid, station_list, v_vals).toShape()
+    except Exception:
+        shape = grid_to_surface(grid)
+
+    # measured, not assumed (the C++ Result::maxRailDeviation gate): hold
+    # the finished surface against the boundary rails -- the one guarantee
+    # profile-endpoint pinning always gives -- and say so when the
+    # between-station hold misses the target.  Warn, never throw: this
+    # path exists for input the exact continuous solve already refused.
+    try:
+        dev = _deviation_of_curves([base.Curve, far.Curve], shape,
+                                   _MULTIRAIL_GORDON_RAIL_SAMPLES)
+        if dev > 10.0 * _MULTIRAIL_SPINE_TOL:
+            FreeCAD.Console.PrintWarning(
+                "Railform Multi-rail sweep: station skinning holds the "
+                "boundary rails to %.3g between stations (target %.3g) -- "
+                "raise Rail Samples (denser stations) or add profiles near "
+                "the worst gap for a tighter sweep.\n"
+                % (dev, _MULTIRAIL_SPINE_TOL))
+    except Exception:
+        pass
+    return shape
+
+
 
 # --- N-sided fill (GeomPlate G0) ----------------------------------------- #
 def plate_fill(edges, tol=0.001):
@@ -1345,6 +2060,19 @@ __all__ = [
     '_to_bspline',
     '_intersect_pair',
     '_GORDON_CROSS_TOL',
+    '_MULTIRAIL_GORDON_DENSIFY',
+    '_MULTIRAIL_GORDON_RAIL_TOL',
+    '_MULTIRAIL_GORDON_PROFILE_TOL',
+    '_MULTIRAIL_GORDON_RAIL_SAMPLES',
+    '_MULTIRAIL_GORDON_PROFILE_SAMPLES',
+    '_MULTIRAIL_SPINE_TOL',
+    '_MULTIRAIL_STATION_FACTOR',
+    '_MULTIRAIL_STATION_PASSES',
+    '_MULTIRAIL_STATION_SAG',
+    '_smootherstep',
+    '_ArcRail',
+    '_spine_map_c2',
+    '_dedupe_stations',
     '_intersect_grid',
     '_strictly_increasing',
     '_param_map',
@@ -1366,8 +2094,20 @@ __all__ = [
     '_gregory_triangle_grid',
     '_triangular_coons_grid',
     '_nearest_t',
+    '_NearestTCache',
     '_polygon_normal',
     '_perp',
+    '_spine_params',
+    '_spine_segment',
+    '_spine_eval',
+    '_spine_project',
+    '_spine_map',
+    '_spine_invert',
+    '_sweep_columns',
+    '_deviation_of_curves',
+    '_rail_order_warning',
+    '_try_gordon_route',
     'two_rail_sweep',
+    'multi_rail_sweep',
     'plate_fill',
 ]

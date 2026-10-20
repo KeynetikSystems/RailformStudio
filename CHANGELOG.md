@@ -10,6 +10,135 @@ fresh `Unreleased` section above it.
 
 ## Unreleased
 
+### Fixed
+- Multi-rail sweep spine fallback desynced stations when rails carried RAW
+  edge parameters: `_ArcRail`, the port of the C++ transport's ArcCurve
+  arc-length table, kept its parameter table in RAW edge-param space while
+  every caller works in normalized [0,1] space -- an edge produced by
+  interpolating `BSplineCurve.toShape()` carries its chord length as the
+  parameter range (e.g. [0, 10] for a 2-point line 10 units long), so the
+  mixed conventions double-scaled every sampled station by the rail length
+  (rows landed at x=50/x=100 on 10-unit rails and the finished surface
+  blew past the rails). The table is now normalized-parameter end to end
+  (sample points from `_eval01(edge, 0..1)`, station fractions in, native
+  rail params out), and the profiles-exact-at-stations spine test that
+  exposed this reads ~9e-12 instead of 0.14.
+
+### Improved
+- Multi-rail sweep spine fallback is now a Python mashup of the strengths
+  measured in the C++ FeatureMultiRailSweep/MultiRailSweep transport
+  (n_rail=N still keeps the 2-rail == two_rail_sweep exact delegation and
+  any Gordon-route network ships unchanged):
+  `_ArcRail` arc-fraction stations so rails of different lengths or
+  parameterizations stay in sync (the old normalized-param grid silently
+  desynced them); per-profile stations pinned from the profile's own
+  near-t on the base rail so "profile wins at its own station" is EXACT
+  (the anchor rows reconstruct the profile curve to ~9e-12, guarded
+  against uniform-grid/arc-table float ties by proximity matching);
+  adaptive midpoint subdivision of station gaps measured by chord
+  deviation over the whole pinned-column set (budget 4x n_rail
+  stations, 10 passes, sag factor 4 over the 1e-4 target -- measured
+  worst sag on the sag-bound fixture: 7.8e-8); a C2 smootherstep remap
+  between anchor pins (`_spine_map_c2`, rows between anchors only -- at
+  anchor rows the plain linear map stays the identity that preserves
+  profile exactness) plus a smootherstep shape blend between bracketing
+  profiles, so section transitions ease at each rail instead of kinking;
+  a zero-Jacobian guard that refuses loosely-bounded sweeps where the
+  rails touch mid-sweep instead of skinning garbage; and a final
+  measured boundary-rail deviation gate (the C++ maxRailDeviation
+  behaviour: warn on the result, never throw -- this path already runs
+  on input the exact solve refused). New headless tests:
+  2-rail exact delegation, profile exactness at stations, adaptive sag
+  bound, collapsed-rail rejection.
+
+### Fixed (GUI session)
+- GUI: every curated TASK-PANEL command (the Draw and Surface toolbars:
+  Interp/Control/Approx/Polyline/Bezier, Blend, FilletPolyline, JoinCurve,
+  3D sketch, Loft, Gordon, Coons, ImportRails, Sweep2Rail, SweepN, Fill,
+  MatchSurf, Offset, Thicken, Shell, ExtendSurf, Mirror, MirrorGroup,
+  StitchShell, BalanceNetwork, WorkflowGuide, SurfaceReview,
+  Continuity/NetworkAudit/curvature panels, Fillet, Chamfer,
+  BlendSurfClosed, TrimByIntersection) was permanently GREYED OUT:
+  `PanelCommand.__init__` never stored the command id, and
+  `PanelCommand.IsActive` referenced it -- every availability poll
+  therefore raised AttributeError, which FreeCAD treats as "command
+  disabled". `IsActive` stores the id now (passed by `commands.register`).
+  Guarded by `test_gui_commands.py`, a real-GUI regression test
+  (`freecad.exe test_gui_commands.py`) that polls IsActive for all 57
+  curated commands across three selection states with spot checks.
+- Workbench console text no longer claims "Silk detected" (Silk was
+  removed; the message now names the engine(s) actually detected).
+
+### Added
+ - Multi-rail sweep: exact continuous Gordon route. With >= 3 rails and
+   >= 2 profiles, and every profile genuinely crossing every rail
+   (measured via the curve-network intersection grid, not assumed),
+   `multi_rail_sweep` now solves the sweep as a Gordon boolean sum
+   (`gordon_network` with `extra_per_gap=8`) instead of the
+   station-skinned spine approximation: the surface passes through the
+   FULL shape of every rail and profile continuously, between the
+   `RailSamples` stations too, and rail LIST order no longer affects the
+   geometry. The result is measured against both curve families before
+   shipping (rails <= 1e-5 over 33 samples, profiles <= 5e-4 over 13
+   samples); anything worse, an incompatible network, or a failed solve
+   falls back to the station-skinned spine path with a console warning.
+   Headless tests: continuous-hold, curved-interior-rail,
+   order-insensitivity, spine-fallback, gate tests
+   (`test_multi_rail_sweep_gordon_route_*`, `test_try_gordon_route_gates`).
+ - `gordon_network(extra_per_gap=4)` -- new keyword on the public Gordon
+   API controlling between-crossing sampling density (default preserves
+   prior behavior); the multi-rail Gordon route raises it to 8.
+   `_skin_through_family` threads it into both family skins.
+ - Multi-rail sweep spine-path validation/UX: `_rail_order_warning`
+   reports a rails-list order that disagrees with how the sections
+   traverse them whenever the spine fallback engages (the spine path is
+   order-sensitive; the Gordon route is not). The SweepN task panel now
+   exposes Up/Down reorder buttons on the Rails list, and the Rails hint
+   documents the ordering.
+ - Multi-rail sweep spine-path robustness: `_spine_invert` now assumes
+   monotonicity only LOCALLY -- a coarse scan picks the FIRST
+   profile-param crossing of a rail's spine position and bisects inside
+   that bracket. An S-swaying profile used to silently bisect around
+   whichever root the monotone assumption exposed; profiles that never
+   reach the spine now fall back to the nearest sampled correspondence.
+   Verified headless (`test_spine_invert_first_crossing_on_swaying_profile`).
+
+### Improved
+ - Multi-rail sweep spine-path final interpolation: the N >= 3 station
+   grid is now interpolated at EXPLICIT parameters (the station values
+   along the sweep axis, each column's mean spine position across
+   stations along the section axis) via `_grid_interpolation_surface`, so
+   the between-node shape tracks the real rail/profile correspondence
+   instead of `BSplineSurface.interpolate()`'s internal re-parametrization
+   (with `grid_to_surface` still as the failure fallback). The exactly-2
+   rails case intentionally keeps the legacy call so `multi_rail_sweep`
+   and `two_rail_sweep` stay bit-for-bit equivalent (verified to ~1e-14).
+ - Multi-rail/two-rail sweep perf: `_NearestTCache` samples each rail
+   once per sweep call instead of 101 OCCT evaluations per profile per
+   query site (`_nearest_t` queries: flip heuristics, stations).
+   Bit-identical results.
+
+### Added
+ - Multi-rail sweep (N>=2, N>2 is the new case): `core.multi_rail_sweep`
+   skins profiles across an ordered list of rails where **every** rail --
+   not just the outer two -- anchors the surface. Each station samples
+   all rails; the polyline through those points is the section spine.
+   Column offsets (full 3-vector in the profile's own orthonormal frame)
+   are measured against that spine at the profile's own station and
+   remapped vertex-wise onto each station's spine, so the surface passes
+   through every rail at every station and through each profile at that
+   profile's station (they coincide when profiles run through the rails,
+   the well-formed input). Two rails reduces to `two_rail_sweep` to
+   floating-point noise. Headless-tested in `test_core.py` (2/3/5-rail
+   areas, both reject paths, all-rail interp ~6e-10, profile interp
+   ~4e-6, interior-rail-bites-surface).
+   Parametric wiring: new `SweepN` kind (`SweepNFP`, one ordered `Rails`
+   link list >= 2 + `Profiles`), surfaced as `RFS_SweepN` ("Multi-rail
+   sweep", reuses `rfs_sweep.svg`) in the Railform Surface toolbar and
+   the type-converter, alongside the existing two-rail `Sweep`. Also
+   reachable through Loft's GuideRails when >= 3 rails are supplied
+   (`LoftFP.execute` routes those to `multi_rail_sweep`).
+
 ### Added
  - GUI smoke harness hardened into a real regression net
    (`rfstudio/test_gui_imports.py`, <1s, zero FreeCAD dependency,

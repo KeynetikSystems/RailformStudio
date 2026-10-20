@@ -234,6 +234,398 @@ def test_gordon_preserves_user_direction():
         % (orig_mid_grid, flipped_mid_grid, delta))
 
 
+# ---- Multi-rail sweep ----
+
+def _rails_profiles():
+    """Two straight rails along X (y=0 and y=5) with three cross profiles
+    spanning rail1->rail2 at x = 0, 5, 10."""
+    r0 = spline([Vector(0, 0, 0), Vector(5, 0, 0), Vector(10, 0, 0)])
+    r1 = spline([Vector(0, 5, 0), Vector(5, 5, 0), Vector(10, 5, 0)])
+    rmid = spline([Vector(0, 2.5, 0), Vector(5, 2.5, 0), Vector(10, 2.5, 0)])
+    profs = [
+        spline([Vector(0, 0, 0), Vector(0, 2.5, 0.5), Vector(0, 5, 0)]),
+        spline([Vector(5, 0, 0), Vector(5, 2.5, 1.0), Vector(5, 5, 0)]),
+        spline([Vector(10, 0, 0), Vector(10, 2.5, 0.5), Vector(10, 5, 0)]),
+    ]
+    return (r0, r1, rmid), profs
+
+
+def test_multi_rail_sweep_two_rail_equiv():
+    """With exactly 2 rails, multi_rail_sweep must match two_rail_sweep."""
+    (r0, r1, _rmid), profs = _rails_profiles()
+    a = core.two_rail_sweep(r0, r1, profs, n_rail=20, n_prof=8)
+    b = core.multi_rail_sweep([r0, r1], profs, n_rail=20, n_prof=8)
+    assert abs(a.Area - b.Area) < 1e-6, (a.Area, b.Area)
+    out("  multi-rail 2-rail equiv OK  area=%.4f" % a.Area)
+
+
+def test_multi_rail_sweep_three_rail():
+    """Three rails + profiles must build a usable surface shaped by all rails."""
+    (r0, r1, rmid), profs = _rails_profiles()
+    s = core.multi_rail_sweep([r0, rmid, r1], profs, n_rail=20, n_prof=8)
+    assert s.Area > 0
+    out("  multi-rail 3-rail OK  area=%.4f" % s.Area)
+
+
+def test_multi_rail_sweep_more_rails():
+    """Five rails should still build a valid surface."""
+    (r0, r1, rmid), profs = _rails_profiles()
+    rails = [
+        spline([Vector(0, y, 0), Vector(5, y, 0), Vector(10, y, 0)])
+        for y in (0, 1.25, 2.5, 3.75, 5)]
+    s = core.multi_rail_sweep(rails, profs, n_rail=20, n_prof=8)
+    assert s.Area > 0
+    out("  multi-rail 5-rail OK  area=%.4f" % s.Area)
+
+
+def test_multi_rail_sweep_rejects_fewer_than_two_rails():
+    (r0, r1, _rmid), profs = _rails_profiles()
+    for rails in ([], [r0]):
+        try:
+            core.multi_rail_sweep(rails, profs)
+            raise AssertionError("expected ValueError for %d rails" % len(rails))
+        except ValueError:
+            pass
+    out("  multi-rail reject <2 rails OK")
+
+
+def test_multi_rail_sweep_rejects_no_profiles():
+    (r0, r1, _rmid), profs = _rails_profiles()
+    try:
+        core.multi_rail_sweep([r0, r1], [])
+        raise AssertionError("expected ValueError for no profiles")
+    except ValueError:
+        pass
+    out("  multi-rail reject no profiles OK")
+
+
+def _consistent_rails_profiles():
+    """Three rails and three profiles that genuinely run THROUGH all three
+    rails (the well-formed input a multi-rail sweep is meant for): the
+    outer rails flat at y=0/y=5, the interior one bulging in +Z at mid-span
+    in x, and each profile passing through the same three rail points at
+    its own station."""
+    rails = [
+        spline([Vector(0, 0, 0), Vector(5, 0, 0), Vector(10, 0, 0)]),
+        spline([Vector(0, 2.5, 0), Vector(5, 2.5, 1), Vector(10, 2.5, 0)]),
+        spline([Vector(0, 5, 0), Vector(5, 5, 0), Vector(10, 5, 0)]),
+    ]
+    profs = [
+        spline([Vector(x, 0, 0), Vector(x, 2.5, 1.0 if x == 5 else 0.0),
+                Vector(x, 5, 0)])
+        for x in (0, 5, 10)]
+    return rails, profs
+
+
+def test_multi_rail_sweep_interpolates_every_rail():
+    """THE point of a multi-rail sweep: interior rails must land ON the
+    surface at every station the grid samples -- two_rail_sweep only ever
+    contains the outer pair."""
+    rails, profs = _consistent_rails_profiles()
+    n_rail = 9
+    s = core.multi_rail_sweep(rails, profs, n_rail=n_rail, n_prof=16)
+    worst = 0.0
+    for i in range(n_rail):
+        t = i / (n_rail - 1.0)
+        for r in rails:
+            fp, lp = r.FirstParameter, r.LastParameter
+            p = r.valueAt(fp + t * (lp - fp))
+            worst = max(worst, Part.Vertex(p).distToShape(s)[0])
+    assert worst < 1e-5, "rails drift off the sweep by %g" % worst
+    out("  multi-rail all-rail interp OK  max dev=%.3e" % worst)
+
+
+def test_multi_rail_sweep_still_follows_the_profiles():
+    """Rails must not swallow the sections: where the profiles run through
+    the rails the sweep still passes through the profiles themselves."""
+    rails, profs = _consistent_rails_profiles()
+    s = core.multi_rail_sweep(rails, profs, n_rail=9, n_prof=16)
+    worst = 0.0
+    for pro in profs:
+        fp, lp = pro.FirstParameter, pro.LastParameter
+        for k in range(11):
+            p = pro.valueAt(fp + (k / 10.0) * (lp - fp))
+            worst = max(worst, Part.Vertex(p).distToShape(s)[0])
+    assert worst < 1e-3, "profiles drift off the sweep by %g" % worst
+    out("  multi-rail profile interp OK  max dev=%.3e" % worst)
+
+
+def test_multi_rail_sweep_interior_rail_changes_the_surface():
+    """An interior rail is not decorative: rebuilding with and without it
+    must give measurably different geometry (the earlier frame-tilt-only
+    attempt produced a bit-identical surface)."""
+    rails, profs = _consistent_rails_profiles()
+    with_mid = core.multi_rail_sweep(rails, profs, n_rail=16, n_prof=16)
+    without = core.multi_rail_sweep([rails[0], rails[2]], profs,
+                                    n_rail=16, n_prof=16)
+    assert abs(with_mid.Area - without.Area) > 1e-3, \
+        (with_mid.Area, without.Area)
+    out("  multi-rail interior rail bites OK  area %.3f vs %.3f"
+        % (with_mid.Area, without.Area))
+
+
+def _max_curve_deviation(curves, shape, samples):
+    """Worst distance from midpoints of the (normalized-param) samples of
+    each curve to `shape` -- the same measurement core._deviation_of_curves
+    performs, inlined here so the test measures independently."""
+    worst = 0.0
+    for curve in curves:
+        fp, lp = curve.FirstParameter, curve.LastParameter
+        for k in range(samples):
+            t = fp + (k + 0.5) / float(samples) * (lp - fp)
+            worst = max(worst, Part.Vertex(curve.value(t)).distToShape(shape)[0])
+    return worst
+
+
+def test_multi_rail_sweep_gordon_route_holds_rails_continuously():
+    """The well-formed network (every profile genuinely crosses every rail)
+    must be solved CONTINUOUSLY, not station-skinned: the surface follows
+    the full shape of every rail BETWEEN profile stations too. This is the
+    property the station-skinned spine path cannot give (the polyline
+    spine only anchors rail points at the stations)."""
+    rails, profs = _consistent_rails_profiles()
+    s = core.multi_rail_sweep(rails, profs, n_rail=13, n_prof=16)
+    rail_dev = _max_curve_deviation(
+        [r.Curve for r in rails], s, 33)
+    prof_dev = _max_curve_deviation(
+        [p.Curve for p in profs], s, 13)
+    assert rail_dev < 1e-6, "rails drift off the Gordon sweep: %g" % rail_dev
+    assert prof_dev < 1e-6, ("profiles drift off the Gordon sweep: %g"
+                             % prof_dev)
+    out("  multi-rail Gordon route continuous OK  rails=%.3e profiles=%.3e"
+        % (rail_dev, prof_dev))
+
+
+def test_multi_rail_sweep_gordon_route_curved_interior_rail():
+    """A curved interior rail between two profile stations: the Gordon
+    route must follow its sag between the stations (the station-skinning
+    spine path would leave a ~sag-sized gap)."""
+    profs = [
+        spline([Vector(0, 0, 0), Vector(0, 2.5, 1.0), Vector(0, 5, 0)]),
+        spline([Vector(10, 0, 0), Vector(10, 2.5, 1.0), Vector(10, 5, 0)]),
+    ]
+    rails = [
+        spline([Vector(0, 0, 0), Vector(10, 0, 0)]),
+        spline([Vector(0, 2.5, 1.0), Vector(5, 2.5, 2.0),
+                Vector(10, 2.5, 1.0)]),
+        spline([Vector(0, 5, 0), Vector(10, 5, 0)]),
+    ]
+    s = core.multi_rail_sweep(rails, profs, n_rail=13, n_prof=12)
+    worst = _max_curve_deviation([rails[1].Curve], s, 41)
+    assert worst < 1e-6, ("curved interior rail drifts off the sweep: %g"
+                          % worst)
+    out("  multi-rail Gordon curved interior rail OK  dev=%.3e" % worst)
+
+
+def test_multi_rail_sweep_gordon_route_is_order_insensitive():
+    """Rail order must not change the solved geometry: the Gordon route
+    relabels each family onto its own shared axis (gordon_network's
+    u_bar/v_bar sort), so a zigzag rails list gives the same surface, and
+    every rail is still held exactly."""
+    zfun = lambda y: 1.0 * math.sin(math.pi * y / 5.0)
+    rails = [
+        spline([Vector(0, y, zfun(y)), Vector(10, y, zfun(y))])
+        for y in (0, 1.25, 2.5, 3.75, 5)]
+    profs = [spline([Vector(x, y, zfun(y))
+                     for y in (0, 1.25, 2.5, 3.75, 5)])
+             for x in (0, 10)]
+    a = core.multi_rail_sweep(rails, profs, n_rail=17, n_prof=20)
+    zrails = [rails[i] for i in (0, 4, 1, 3, 2)]
+    b = core.multi_rail_sweep(zrails, profs, n_rail=17, n_prof=20)
+    assert abs(a.Area - b.Area) < 1e-6, (a.Area, b.Area)
+    worst = _max_curve_deviation([r.Curve for r in rails], b, 25)
+    assert worst < 1e-5, ("zigzag order loses a rail: %g" % worst)
+    out("  multi-rail Gordon order-insensitive OK  area=%.4f dev=%.3e"
+        % (a.Area, worst))
+
+
+def test_multi_rail_sweep_spine_fallback_keeps_station_bites():
+    """An incompatible network (profiles that miss an interior rail) must
+    fall back to station skinning and still bite every rail: profiles win
+    at their own stations, so the OUTER two rails -- which every profile
+    genuinely reaches -- must stay exact at the n_rail stations."""
+    r0 = spline([Vector(0, 0, 0), Vector(10, 0, 0)])
+    rmid = spline([Vector(0, 2.5, 0), Vector(10, 2.5, 0)])
+    r1 = spline([Vector(0, 5, 0), Vector(10, 5, 0)])
+    prods = [
+        spline([Vector(0, 0, 0), Vector(0, 2.5, 0.5), Vector(0, 5, 0)]),
+        spline([Vector(5, 0, 0), Vector(5, 2.5, 1.0), Vector(5, 5, 0)]),
+        spline([Vector(10, 0, 0), Vector(10, 2.5, 0.5), Vector(10, 5, 0)]),
+    ]
+    s = core.multi_rail_sweep([r0, rmid, r1], prods, n_rail=9, n_prof=16)
+    worst = 0.0
+    n_rail = 9
+    for i in range(n_rail):
+        t = i / (n_rail - 1.0)
+        for r in (r0, r1):
+            fp, lp = r.FirstParameter, r.LastParameter
+            worst = max(worst, Part.Vertex(
+                r.valueAt(fp + t * (lp - fp))).distToShape(s)[0])
+    assert worst < 1e-5, "outer rails drift off the stroke fallback: %g" % worst
+    out("  multi-rail spine fallback outer rails OK  dev=%.3e" % worst)
+
+
+def test_multi_rail_sweep_two_rail_exact_delegation():
+    """With exactly 2 rails multi_rail_sweep now delegates to two_rail_sweep
+    directly -- the spine reduction it replaced only matched to
+    floating-point noise, the delegation must match EXACTLY."""
+    (r0, r1, _rmid), profs = _rails_profiles()
+    a = core.two_rail_sweep(r0, r1, profs, n_rail=20, n_prof=8)
+    b = core.multi_rail_sweep([r0, r1], profs, n_rail=20, n_prof=8)
+    assert a.Area == b.Area
+    assert len(a.Faces) == len(b.Faces)
+    out("  multi-rail 2-rail exact delegation OK")
+
+
+def _spine_fallback_fixture():
+    """Three rails (two boundary straights + one straight interior the
+    profiles miss) with bulged cross profiles -- the canonical incompatible
+    network the station-skinning fallback serves."""
+    r0 = spline([Vector(0, 0, 0), Vector(10, 0, 0)])
+    rmid = spline([Vector(0, 2.5, 0), Vector(10, 2.5, 0)])
+    r1 = spline([Vector(0, 5, 0), Vector(10, 5, 0)])
+    prods = [
+        spline([Vector(0, 0, 0), Vector(0, 2.5, 0.5), Vector(0, 5, 0)]),
+        spline([Vector(5, 0, 0), Vector(5, 2.5, 1.0), Vector(5, 5, 0)]),
+        spline([Vector(10, 0, 0), Vector(10, 2.5, 0.5), Vector(10, 5, 0)]),
+    ]
+    return (r0, rmid, r1), prods
+
+
+def test_multi_rail_sweep_spine_profiles_exact_at_stations():
+    """On the adaptive fallback each profile's own station is a HARD
+    station (the C++ contact-point break), so the surface passes through
+    the profiles' pinned columns exactly at their stations instead of
+    approximating them from wherever the uniform grid happened to fall."""
+    rails, prods = _spine_fallback_fixture()
+    s = core.multi_rail_sweep(rails, prods, n_rail=9, n_prof=16)
+    worst = 0.0
+    for pro in prods:
+        fp, lp = pro.FirstParameter, pro.LastParameter
+        for k in range(9):
+            p = pro.valueAt(fp + (k / 8.0) * (lp - fp))
+            worst = max(worst, Part.Vertex(p).distToShape(s)[0])
+    assert worst < 1e-3, "profiles drift off their own stations: %g" % worst
+    out("  multi-rail spine profiles-exact-at-stations OK  dev=%.3e" % worst)
+
+
+def test_multi_rail_sweep_spine_adaptive_bounds_rail_sag():
+    """Adaptive stations: a SAGGING boundary rail between profile stations
+    triggers subdivision, so the between-station rail hold is bounded --
+    the old fixed uniform grid left the full per-gap sag unmanaged."""
+    r0 = spline([Vector(0, 0, 0), Vector(5, 0, 2.0), Vector(10, 0, 0)])
+    rmid = spline([Vector(0, 2.5, 0), Vector(10, 2.5, 0)])
+    r1 = spline([Vector(0, 5, 0), Vector(10, 5, 0)])
+    # profiles miss the interior rail -> incompatible -> skinning route
+    prods = [
+        spline([Vector(0, 0, 0), Vector(0, 2.5, 0.5), Vector(0, 5, 0)]),
+        spline([Vector(5, 0, 2), Vector(5, 2.5, 0.5), Vector(5, 5, 0)]),
+        spline([Vector(10, 0, 0), Vector(10, 2.5, 0.5), Vector(10, 5, 0)]),
+    ]
+    s = core.multi_rail_sweep([r0, rmid, r1], prods, n_rail=13, n_prof=12)
+    worst = _max_curve_deviation([r0.Curve], s, 41)
+    assert worst < 5e-3, "sagging boundary rail drifts off the sweep: %g" % worst
+    out("  multi-rail spine adaptive sag bound OK  dev=%.3e" % worst)
+
+
+def test_multi_rail_sweep_spine_rejects_collapsed_rails():
+    """Rails that lie on top of each other collapse the station chord to a
+    point (zero Jacobian in the C++ design) -- the sweep must refuse with
+    a message instead of silently skinning garbage."""
+    r0 = spline([Vector(0, 0, 0), Vector(10, 0, 0)])
+    r_shared = spline([Vector(0, 0, 0), Vector(5, 0, 0), Vector(10, 0, 0)])
+    (_r0, _rm, _r1), prods = _spine_fallback_fixture()
+    try:
+        core.multi_rail_sweep([r0, _rm, r_shared], prods, n_rail=9)
+        raise AssertionError("expected ValueError for collapsed rails")
+    except ValueError as exc:
+        assert "Jacobian" in str(exc), exc
+    out("  multi-rail spine collapsed rails rejected OK")
+
+
+def test_spine_invert_first_crossing_on_swaying_profile():
+    """_spine_invert must return the FIRST profile-param crossing, not the
+    last one a monotone-bisection assumption happens to land on: a profile
+    that sways across its spine (projection non-monotone) crosses the
+    target several times, and the rail's column must anchor to the
+    earliest one -- the plain-bisection version silently picked whichever
+    root its bracket arithmetic exposed."""
+    pts = [Vector(0, 0, 0), Vector(10, 0, 0)]
+    z_params = core._spine_params(pts)
+    eval_sway = lambda t: Vector(
+        10.0 * t + 6.0 * math.sin(2.0 * math.pi * t), 0, 0)
+    target = 0.3
+
+    # independent reference: dense scan for the first crossing
+    def proj(t):
+        return (10.0 * t + 6.0 * math.sin(2.0 * math.pi * t)) / 10.0
+    n = 20001
+    first = None
+    for k in range(1, n):
+        t0, t1 = (k - 1) / (n - 1.0), k / (n - 1.0)
+        if (proj(t0) < target) != (proj(t1) < target):
+            lo, hi = t0, t1
+            sign0 = proj(t0) < target
+            for _ in range(60):
+                mm = 0.5 * (lo + hi)
+                if (proj(mm) < target) != sign0:
+                    hi = mm
+                else:
+                    lo = mm
+            first = 0.5 * (lo + hi)
+            break
+    assert first is not None
+    got = core._spine_invert(z_params, pts, eval_sway, target, 0.0, 1.0)
+    assert abs(got - first) < 1e-6, (got, first)
+    # multiple crossings exist (else this test proves nothing)
+    crossings = 0
+    for k in range(1, n):
+        if (proj(k - 1 / (n - 1.0)) < target) != \
+                (proj(k / (n - 1.0)) < target):
+            crossings += 1
+    assert crossings >= 2, crossings
+    # monotone profile: old behavior fully preserved
+    got = core._spine_invert(z_params, pts, lambda t: Vector(10.0 * t, 0, 0),
+                             0.5, 0.0, 1.0)
+    assert abs(got - 0.5) < 1e-9, got
+    out("  spine_invert first-crossing OK  first=%.6f got=%.6f"
+        % (first, core._spine_invert(z_params, pts, eval_sway, target,
+                                     0.0, 1.0)))
+
+
+def test_rail_order_warning_flags_zigzag():
+    """The rail-order heuristics must flag a rails list whose order does
+    not match how the sections traverse them, and stay silent on a
+    coherent one."""
+    good = [[0.1, 0.4, 1.0], [0.0, 0.5, 0.9]]
+    assert core._rail_order_warning(good) is None
+    bad = [[0.4, 0.1, 1.0], [0.0, 0.5, 0.9]]
+    msg = core._rail_order_warning(bad)
+    assert msg is not None and "rail" in msg
+    out("  rail order warning OK")
+
+
+def test_try_gordon_route_gates():
+    """_try_gordon_route must answer None (fall back) for an incompatible
+    network and a shape for a compatible one."""
+    rails, profs = _consistent_rails_profiles()
+    shape = core._try_gordon_route(rails, profs)
+    assert shape is not None
+    rail_dev = core._deviation_of_curves(
+        [r.Curve for r in rails], shape, 25)
+    assert rail_dev <= core._MULTIRAIL_GORDON_RAIL_TOL
+    # incompatible: profiles bump away from the interior rail
+    r0 = spline([Vector(0, 0, 0), Vector(10, 0, 0)])
+    rmid = spline([Vector(0, 2.5, 0), Vector(10, 2.5, 0)])
+    r1 = spline([Vector(0, 5, 0), Vector(10, 5, 0)])
+    prods = [
+        spline([Vector(0, 0, 0), Vector(0, 2.5, 0.5), Vector(0, 5, 0)]),
+        spline([Vector(10, 0, 0), Vector(10, 2.5, 1.0), Vector(10, 5, 0)]),
+    ]
+    assert core._try_gordon_route([r0, rmid, r1], prods) is None
+    out("  try_gordon_route gates OK")
+
+
 # ---- Gordon: input validation --------------------------------------------
 
 def test_gordon_too_few_curves():
@@ -1851,18 +2243,18 @@ def test_engines_validate_providers_catches_typos():
 
 
 def test_last_three_actions_have_native_fallbacks():
-    """RFS_Analysis/RFS_ControlPoly4 get native-first chains (like the
-    QA tools); RFS_StarPatch gets engine-first with a degraded native
-    last resort -- either way, no action is engine-only any more."""
+    """RFS_Analysis is native-first with the Curves engine kept as a
+    fallback; RFS_ControlPoly4 and RFS_StarPatch are native-only now
+    (their old Silk engines are gone with the Silk dependency). No
+    action is left without a provider either way."""
     from rfstudio import engines
     a = engines.PROVIDERS["RFS_Analysis"]
     assert a[0] == ("native", "native_analysis"), a
     assert any(p[0] == "engine" for p in a), a
     c = engines.PROVIDERS["RFS_ControlPoly4"]
-    assert c[0] == ("native", "native_control_poly4"), c
-    assert any(p[0] == "engine" for p in c), c
+    assert c == [("native", "native_control_poly4")], c
     s = engines.PROVIDERS["RFS_StarPatch"]
-    assert s[0] == ("native", "native_star_patch"), s   # Silk removed; native only
+    assert s == [("native", "native_star_patch")], s
     for fn in ("native_analysis", "native_control_poly4",
                "native_star_patch"):
         assert hasattr(engines, fn), fn
@@ -3242,6 +3634,25 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_rolling_ball_fillet_rejects_bad_radius,
               test_multi_rail_fillet_tapered,
               test_multi_rail_fillet_rejects_single_station,
+              test_multi_rail_sweep_two_rail_equiv,
+              test_multi_rail_sweep_three_rail,
+              test_multi_rail_sweep_more_rails,
+              test_multi_rail_sweep_rejects_fewer_than_two_rails,
+              test_multi_rail_sweep_rejects_no_profiles,
+              test_multi_rail_sweep_interpolates_every_rail,
+              test_multi_rail_sweep_still_follows_the_profiles,
+              test_multi_rail_sweep_interior_rail_changes_the_surface,
+              test_multi_rail_sweep_gordon_route_holds_rails_continuously,
+              test_multi_rail_sweep_gordon_route_curved_interior_rail,
+              test_multi_rail_sweep_gordon_route_is_order_insensitive,
+              test_multi_rail_sweep_spine_fallback_keeps_station_bites,
+              test_multi_rail_sweep_two_rail_exact_delegation,
+              test_multi_rail_sweep_spine_profiles_exact_at_stations,
+              test_multi_rail_sweep_spine_adaptive_bounds_rail_sag,
+              test_multi_rail_sweep_spine_rejects_collapsed_rails,
+              test_spine_invert_first_crossing_on_swaying_profile,
+              test_rail_order_warning_flags_zigzag,
+              test_try_gordon_route_gates,
               test_global_fair_network_reduces_energy_on_bumpy_patch,
               test_global_fair_network_keeps_boundary_when_fixed,
               test_global_fair_network_rejects_empty,
