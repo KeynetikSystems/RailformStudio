@@ -163,6 +163,8 @@ _MODULES = [
     "rfstudio.compat",
     "rfstudio.groups",
     "rfstudio.snaputil",
+    "rfstudio.snapsettings",
+    "rfstudio.statusbar",
     "rfstudio.mirror",
     "rfstudio.panel_logic",
     "rfstudio.core",

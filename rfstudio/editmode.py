@@ -37,6 +37,8 @@ import Part
 from FreeCAD import Vector
 
 from rfstudio import snaputil
+from rfstudio import snapsettings
+from rfstudio import statusbar
 from rfstudio import core
 from rfstudio.panel_base import drop_callbacks
 
@@ -217,6 +219,10 @@ class PointEditor(object):
         self._snap_shapes = []
         self._hover_pts_cache = None    # lazily built for hover-snap preview
         self._hover_shapes_cache = None
+        # Live drag readout (ΔXYZ / distance) on the status bar, coalesced
+        # off the Coin move callback via a single pending QTimer tick.
+        self._status_scheduled = False
+        self._status_text = None
         self._sym_pairs = None      # {idx: partner_idx} or None (off)
         self._sym_plane = None      # (base, normal) or None
         self.on_commit = None       # called after each drag commit (panel refresh)
@@ -435,22 +441,27 @@ class PointEditor(object):
         self.prev_switch.addChild(pv)
         self.root.addChild(self.prev_switch)
 
-        # snap indicator: cyan ring that appears on a nearby existing point
+        # snap indicator: a marker that appears on the engaged snap target,
+        # colour + glyph telling you WHICH kind of snap won (Draft-style) --
+        # green square = vertex/control point, yellow cross = curve-curve
+        # intersection, cyan ring = on-curve projection. The colour node and
+        # marker node are kept so _show_snap_marker can restyle per snap.
         self._snap_switch = coin.SoSwitch()
         self._snap_switch.whichChild = -1
         snap_sep = coin.SoSeparator()
-        snap_col = coin.SoBaseColor()
-        snap_col.rgb = (0.1, 0.95, 0.95)
+        self._snap_col = coin.SoBaseColor()
+        self._snap_col.rgb = (0.1, 0.95, 0.95)
         self._snap_coord = coin.SoCoordinate3()
-        snap_mk = coin.SoMarkerSet()
+        self._snap_mk = coin.SoMarkerSet()
+        self._snap_glyphs = self._resolve_snap_glyphs(coin)
         try:
-            snap_mk.markerIndex = coin.SoMarkerSet.CIRCLE_LINE_9_9
+            self._snap_mk.markerIndex = self._snap_glyphs[snaputil.SNAP_EDGE][0]
         except Exception:
             pass
-        snap_mk.numPoints = 1
-        snap_sep.addChild(snap_col)
+        self._snap_mk.numPoints = 1
+        snap_sep.addChild(self._snap_col)
         snap_sep.addChild(self._snap_coord)
-        snap_sep.addChild(snap_mk)
+        snap_sep.addChild(self._snap_mk)
         self._snap_switch.addChild(snap_sep)
         self.root.addChild(self._snap_switch)
 
@@ -500,36 +511,104 @@ class PointEditor(object):
 
     # ---- snap ---- #
     def _snap_candidates(self):
-        """EXACT high-priority discrete targets from all other objects:
-        control points, vertices, knot positions, and true curve-curve
-        intersections (see snaputil.collect_strong_snap_points). These win
-        over a generic on-edge projection in _snap. Coarse arc-length
+        """EXACT high-priority discrete targets from all other objects,
+        each tagged with its snap family (vertex/control/knot ->
+        SNAP_VERTEX, curve-curve crossing -> SNAP_INTERSECTION) so the
+        indicator can show which kind engaged. Gated by the user's snap
+        toggles (rfstudio.snapsettings): a muted family isn't collected,
+        so it neither snaps nor flashes its marker. Coarse arc-length
         samples are intentionally excluded -- the exact ray->edge path
-        already covers 'anywhere on a curve' precisely, so a sample could
-        only pull a snap OFF the true curve. Shared with CurvePanel's 3D
-        pick mode."""
-        return snaputil.collect_strong_snap_points(self.obj.Document,
-                                                   exclude=self.obj)
+        already covers 'anywhere on a curve' precisely."""
+        return snaputil.collect_strong_snap_points_kinded(
+            self.obj.Document, exclude=self.obj,
+            kinds=snapsettings.enabled_kinds())
 
     def _snap_shape_candidates(self):
         """Edges from all other objects, for EXACT perpendicular-
         projection snapping (see snaputil.nearest_point_on_shapes) --
         lets a drag snap onto any arbitrary point along another curve,
-        not just its vertices/samples/knots."""
+        not just its vertices/samples/knots. Empty when the 'edge' snap
+        family is toggled off, so on-curve projection stops entirely."""
+        if not snapsettings.enabled(snaputil.SNAP_EDGE):
+            return []
         return [e for e, _o in
                 snaputil.collect_snap_shapes(self.obj.Document,
                                              exclude=self.obj)]
 
     def _snap(self, pos):
-        """Return the snapped point within self._snap_px screen pixels, or
-        None. Vertex/endpoint priority: an EXACT discrete target (vertex,
-        control point, knot, or curve-curve intersection) within tolerance
-        always wins over a generic on-edge projection -- only if none is in
-        range do we fall to the exact point anywhere along a curve's real
-        geometry (see snaputil.nearest_snap_ranked)."""
-        return snaputil.nearest_snap_ranked(
+        """(point, kind) snapped within self._snap_px screen pixels, or
+        (None, None). Vertex/endpoint priority: an EXACT discrete target
+        (vertex, control point, knot, or curve-curve intersection) within
+        tolerance always wins over a generic on-edge projection -- only if
+        none is in range do we fall to the exact point anywhere along a
+        curve's real geometry (see snaputil.nearest_snap_ranked_kind). The
+        returned kind drives the indicator colour/glyph."""
+        return snaputil.nearest_snap_ranked_kind(
             self.view, self._snap_pts, getattr(self, "_snap_shapes", []),
             pos, self._snap_px)
+
+    @staticmethod
+    def _resolve_snap_glyphs(coin):
+        """{kind: (markerIndex, rgb)} for the snap indicator. Resolves the
+        SoMarkerSet glyph constants defensively (the available names vary
+        across Coin builds; each falls back to the cyan ring). Green square
+        = vertex/control point, yellow cross = curve-curve intersection,
+        cyan ring = on-curve projection -- the Draft-workbench convention."""
+        ms = coin.SoMarkerSet
+
+        def mk(*names):
+            for n in names:
+                g = getattr(ms, n, None)
+                if g is not None:
+                    return g
+            return getattr(ms, "CIRCLE_LINE_9_9", 0)
+
+        return {
+            snaputil.SNAP_VERTEX: (
+                mk("SQUARE_FILLED_9_9", "SQUARE_LINE_9_9"), (0.2, 0.95, 0.3)),
+            snaputil.SNAP_INTERSECTION: (
+                mk("CROSS_9_9", "PLUS_9_9", "STAR_9_9"), (1.0, 0.9, 0.2)),
+            snaputil.SNAP_EDGE: (mk("CIRCLE_LINE_9_9"), (0.1, 0.95, 0.95)),
+        }
+
+    def _show_snap_marker(self, pt, kind):
+        """Place and style the snap indicator at `pt` for snap family
+        `kind` (colour + glyph). Safe to call from a move callback -- it
+        only writes our own Coin overlay nodes."""
+        glyph = self._snap_glyphs.get(kind) \
+            or self._snap_glyphs[snaputil.SNAP_EDGE]
+        marker_idx, rgb = glyph
+        try:
+            self._snap_mk.markerIndex = marker_idx
+        except Exception:
+            pass
+        try:
+            self._snap_col.rgb = rgb
+        except Exception:
+            pass
+        self._snap_coord.point.set1Value(0, pt.x, pt.y, pt.z)
+        self._snap_switch.whichChild = 0
+
+    def _hide_snap_marker(self):
+        self._snap_switch.whichChild = -1
+
+    def _queue_drag_readout(self, p0, newp):
+        """Schedule a live status-bar readout of the drag delta/distance.
+        Coalesced off the Coin move callback through a single pending
+        QTimer tick (the _pending/_scheduled pattern), so a fast drag
+        can't flood the event loop and nothing heavy runs in the callback."""
+        d = newp - p0
+        self._status_text = (
+            u"Δ  X %.3f   Y %.3f   Z %.3f      dist %.3f"
+            % (d.x, d.y, d.z, d.Length))
+        if not self._status_scheduled:
+            self._status_scheduled = True
+            QtCore.QTimer.singleShot(0, self._flush_drag_readout)
+
+    def _flush_drag_readout(self):
+        self._status_scheduled = False
+        if self._status_text is not None:
+            statusbar.show(self._status_text)
 
     def _hover_snap_candidates(self):
         """(shapes, points) for the hover-snap preview, built lazily and
@@ -542,11 +621,14 @@ class PointEditor(object):
         drag begins -- the whole point of the hover preview."""
         if self._hover_shapes_cache is None:
             try:
-                self._hover_shapes_cache = [
-                    e for e, _o in snaputil.collect_snap_shapes(
+                kinds = snapsettings.enabled_kinds()
+                self._hover_shapes_cache = (
+                    [e for e, _o in snaputil.collect_snap_shapes(
                         self.obj.Document, exclude=self.obj)]
-                self._hover_pts_cache = snaputil.collect_strong_snap_points(
-                    self.obj.Document, exclude=self.obj)
+                    if snaputil.SNAP_EDGE in kinds else [])
+                self._hover_pts_cache = \
+                    snaputil.collect_strong_snap_points_kinded(
+                        self.obj.Document, exclude=self.obj, kinds=kinds)
             except Exception:
                 self._hover_shapes_cache = []
                 self._hover_pts_cache = []
@@ -741,23 +823,22 @@ class PointEditor(object):
                             getattr(self, "_snap_shapes", []), pos, self._snap_px)
                         if snapped is not None:
                             newp = snapped
-                            self._snap_coord.point.set1Value(
-                                0, snapped.x, snapped.y, snapped.z)
-                            self._snap_switch.whichChild = 0
+                            # an axis crossing lands on a curve -> edge glyph
+                            self._show_snap_marker(snapped, snaputil.SNAP_EDGE)
                         else:
-                            self._snap_switch.whichChild = -1
+                            self._hide_snap_marker()
                     else:
                         # Free drag in the view plane, with snap-to-other-curves.
                         g = self.view.getPoint(pos[0], pos[1])
                         newp = p0 + (g - self.drag["g0"])
-                        snapped = self._snap(pos)
+                        snapped, kind = self._snap(pos)
                         if snapped is not None:
                             newp = snapped
-                            self._snap_coord.point.set1Value(
-                                0, snapped.x, snapped.y, snapped.z)
-                            self._snap_switch.whichChild = 0
+                            self._show_snap_marker(snapped, kind)
                         else:
-                            self._snap_switch.whichChild = -1
+                            self._hide_snap_marker()
+                    # live status-bar readout of the drag delta / distance
+                    self._queue_drag_readout(p0, newp)
                     self._live(self.drag["idx"], newp)
             else:
                 # Handle hover detection when not dragging
@@ -806,16 +887,14 @@ class PointEditor(object):
             if (not self.creating and self.hover_point is None
                     and self.hover_handle is None):
                 shapes, dpts = self._hover_snap_candidates()
-                snapped = snaputil.nearest_snap_ranked(
+                snapped, kind = snaputil.nearest_snap_ranked_kind(
                     self.view, dpts, shapes, pos, self._snap_px)
                 if snapped is not None:
-                    self._snap_coord.point.set1Value(
-                        0, snapped.x, snapped.y, snapped.z)
-                    self._snap_switch.whichChild = 0
+                    self._show_snap_marker(snapped, kind)
                 else:
-                    self._snap_switch.whichChild = -1
+                    self._hide_snap_marker()
             elif self._snap_switch.whichChild != -1:
-                self._snap_switch.whichChild = -1
+                self._hide_snap_marker()
 
         except Exception:
             pass
@@ -1605,6 +1684,9 @@ class PointEditor(object):
         self._snap_switch.whichChild = -1
         self._snap_pts = []
         self._snap_shapes = []
+        # drop the live drag readout off the status bar
+        self._status_text = None
+        statusbar.clear()
         # The edited curve just changed shape -> drop the hover-snap cache so
         # the preview rebuilds against current geometry on the next hover.
         self._hover_pts_cache = None

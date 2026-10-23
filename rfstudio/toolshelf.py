@@ -30,6 +30,8 @@ except Exception:
 
 from rfstudio import commands
 from rfstudio import engines
+from rfstudio import snapsettings
+from rfstudio import statusbar
 
 _DOCK = None
 
@@ -205,6 +207,29 @@ class _Section(QtWidgets.QWidget):
         return any_match
 
 
+class _SnapBar(QtWidgets.QGroupBox):
+    """Vertex / Edge / Intersection snap on-off toggles (Draft-style),
+    backed by rfstudio.snapsettings so the editor snap collectors honour
+    them and the choice persists. Changing a box takes effect on the next
+    drag (the collectors read snapsettings when a drag begins)."""
+
+    def __init__(self):
+        super(_SnapBar, self).__init__("Snapping")
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(6, 2, 6, 4)
+        lay.setSpacing(8)
+        short = {"vertex": "Vertex", "edge": "Edge",
+                 "intersection": "Intersect"}
+        for kind in snapsettings.KINDS:
+            cb = QtWidgets.QCheckBox(short.get(kind, kind))
+            cb.setChecked(snapsettings.enabled(kind))
+            cb.setToolTip(snapsettings.LABELS.get(kind, kind))
+            cb.toggled.connect(
+                lambda checked, k=kind: snapsettings.set_enabled(k, checked))
+            lay.addWidget(cb)
+        lay.addStretch(1)
+
+
 class _ToolShelf(QtWidgets.QDockWidget):
 
     def __init__(self, mw):
@@ -223,6 +248,8 @@ class _ToolShelf(QtWidgets.QDockWidget):
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._on_filter)
         outer.addWidget(self.search)
+
+        outer.addWidget(_SnapBar())
 
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
@@ -272,8 +299,17 @@ class _ToolShelf(QtWidgets.QDockWidget):
         try:
             FreeCADGui.runCommand(cmd_id, 0)
         except Exception as exc:
+            # A console-only PrintError leaves the button looking like it
+            # did nothing (most users keep the Report view closed) -- flash
+            # the failure on the status bar too, named by the tool's menu
+            # label rather than its raw command id.
+            try:
+                label = commands.command_info(cmd_id)[0]
+            except Exception:
+                label = cmd_id
             FreeCAD.Console.PrintError("Railform: %s failed (%s)\n"
                                        % (cmd_id, exc))
+            statusbar.flash("%s failed: %s" % (label, exc), error=True)
 
 
 def show():

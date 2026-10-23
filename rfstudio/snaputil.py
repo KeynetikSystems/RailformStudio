@@ -730,6 +730,68 @@ def nearest_snap_ranked(view, strong_points, edge_shapes, pos, max_px,
                               max_world_dist=max_world_dist)
 
 
+# ---- kinded snapping (which snap FAMILY won, for visible feedback) -------- #
+# The three families nearest_snap_ranked distinguishes, as plain string tags
+# so a caller can colour/glyph the snap indicator by kind and gate collection
+# with rfstudio.snapsettings. These MUST match snapsettings.KINDS.
+SNAP_VERTEX = "vertex"            # vertices, control points, knots (exact pts)
+SNAP_INTERSECTION = "intersection"   # true curve-curve crossings
+SNAP_EDGE = "edge"               # perpendicular projection onto a curve
+
+
+def collect_strong_snap_points_kinded(doc, exclude=None, kinds=None):
+    """collect_strong_snap_points, but each point tagged with its family so
+    the snap indicator can show WHICH kind engaged. Returns
+    [(Vector, kind), ...] with kind in {SNAP_VERTEX, SNAP_INTERSECTION}.
+
+    `kinds` (a set of kind tags), if given, limits which families are
+    collected -- e.g. {SNAP_VERTEX} skips the O(n^2) intersection scan
+    entirely. None collects both. Gui-free -- headless-testable, same as
+    collect_strong_snap_points which it delegates to."""
+    want_vertex = kinds is None or SNAP_VERTEX in kinds
+    want_inter = kinds is None or SNAP_INTERSECTION in kinds
+    out = []
+    if want_vertex:
+        for p in collect_snap_points(doc, exclude=exclude):
+            out.append((p, SNAP_VERTEX))
+    if want_inter:
+        shapes = [e for e, _o in collect_snap_shapes(doc, exclude=exclude)]
+        for p in collect_intersection_points(shapes):
+            out.append((p, SNAP_INTERSECTION))
+    return out
+
+
+def nearest_snap_kind(view, kinded_points, pos, max_px):
+    """nearest_snap over a KINDED candidate list [(pt, kind), ...]. Returns
+    (point, kind) for the nearest within `max_px`, or (None, None)."""
+    best, bestd, bestk = None, max_px, None
+    for p, k in kinded_points:
+        sp = screen_project(view, p)
+        if sp is None:
+            continue
+        d = ((sp[0] - pos[0]) ** 2 + (sp[1] - pos[1]) ** 2) ** 0.5
+        if d < bestd:
+            best, bestd, bestk = p, d, k
+    return best, bestk
+
+
+def nearest_snap_ranked_kind(view, kinded_strong, edge_shapes, pos, max_px,
+                             max_world_dist=None):
+    """nearest_snap_ranked that also reports which snap family won, for a
+    kind-coloured indicator. `kinded_strong` is a [(pt, kind), ...] list
+    (from collect_strong_snap_points_kinded); `edge_shapes` the on-edge
+    projection candidates (from collect_snap_shapes), used only when no
+    strong point is in range -- the same vertex-over-edge priority
+    nearest_snap_ranked applies. Returns (point, kind) with kind one of
+    SNAP_VERTEX / SNAP_INTERSECTION / SNAP_EDGE, or (None, None)."""
+    pt, kind = nearest_snap_kind(view, kinded_strong, pos, max_px)
+    if pt is not None:
+        return pt, kind
+    pt = nearest_exact_snap(view, edge_shapes, pos, max_px,
+                            max_world_dist=max_world_dist)
+    return (pt, SNAP_EDGE) if pt is not None else (None, None)
+
+
 def nearest_index(pos, screen_points, max_px):
     """Index into `screen_points` (list of (sx,sy)-or-None) nearest to
     screen `pos`, within `max_px`, or None."""
