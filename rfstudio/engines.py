@@ -1,9 +1,15 @@
 # -*- coding: utf-8 -*-
 """Engine adapter layer (GUI side).
 
-Thin wrappers that drive the Curves and Silk workbench commands. This is where
-depend-and-wrap lives: we translate a curated Railform action into an existing
-engine command, ensuring that engine's commands are registered first.
+Thin wrappers that optionally drive the Curves workbench command as a
+FALLBACK for actions whose native path can't handle a selection. This is
+where the remains of depend-and-wrap live: translate a curated Railform
+action into an existing engine command, ensuring that engine's commands
+are registered first.
+
+There is no Silk dependency any more: every Silk-backed action
+(CleanPatch44/66, ControlPoly4, StarPatch) has a native provider in this
+module and runs entirely from OCCT.
 """
 
 import FreeCAD
@@ -43,16 +49,14 @@ def run_engine_command(mod_name, cmd_id):
 # of truth for "what engine command would satisfy this action" -- used by
 # deps.verify_delegations() for the startup health check -- but it is no
 # longer the *only* way to satisfy an action; see PROVIDERS below.
+# NOTE: this is now a CURVES-ONLY fallback map. The former Silk entries
+# (CleanPatch44/66, ControlPoly4, StarPatch) are gone -- those actions are
+# native-only (see NATIVE_OVERRIDES), so nothing here may name Silk.
 DELEGATIONS = {
     # ---- Surface --------------------------------------------------------
     "RFS_BlendSurf":    ("Curves", "Curves_BlendSurf2"),
     "RFS_Trim":         ("Curves", "Trim"),
     "RFS_SketchOnSurf": ("Curves", "SoS"),
-    # ---- Surface (Silk: clean low-CP + star points) ---------------------
-    "RFS_CleanPatch44": ("Silk",   "CubicSurface_44"),
-    "RFS_CleanPatch66": ("Silk",   "CubicSurface_66"),
-    "RFS_ControlPoly4": ("Silk",   "ControlPoly4"),
-    "RFS_StarPatch":    ("Silk",   "ControlGridNStar66"),
     # ---- Inspect (diagnostics) -> Curves --------------------------------
     "RFS_Combs":        ("Curves", "ParametricComb"),
     "RFS_Zebra":        ("Curves", "ZebraTool"),
@@ -77,58 +81,57 @@ DELEGATIONS = {
 # Triage (see project SWOT discussion for the reasoning):
 #   - RFS_MultiLoft is redundant with the workbench's own parametric Loft
 #     (core.loft / LoftFP) and has been switched to native-only below --
-#     it never needed Curves in the first place.
+#     it never needed an engine in the first place.
 #   - RFS_Combs/Zebra/Reflect/DraftAnalysis are now native too (see
 #     core.curvature_comb / zebra_stripes / reflection_lines /
-#     draft_angle_analysis) -- pure OCCT curvature/normal evaluation, no
-#     CAGD novelty required, so unlike the star-point G2 problem this was
-#     a genuinely closeable gap. The Curves delegation is kept as a
-#     fallback for each in case a selection/geometry edge case the native
-#     path doesn't yet handle comes up. RFS_Analysis is likewise now
-#     native-first (core.surface_review_summary); the Curves delegation
-#     remains as its fallback.
-#   - RFS_Analysis (generic surface review) got its native path too:
-#     core.surface_review_summary / review_recommendation drive
-#     native_analysis below, with the Curves delegation kept as fallback.
-#   - RFS_ControlPoly4 builds a degree-3 control-polygon curve natively
-#     from the same core.control_poly_curve technique, with Silk kept as
+#     draft_angle_analysis) -- pure OCCT curvature/normal evaluation, so
+#     unlike the star-point G2 problem this was a genuinely closeable
+#     gap. The Curves delegation is kept as a fallback for each in case a
+#     selection/geometry edge case the native path doesn't yet handle
+#     comes up. RFS_Analysis is likewise now native-first
+#     (core.surface_review_summary); the Curves delegation remains as its
 #     fallback.
-#   - RFS_StarPatch is different: true G2 N-sided patching stays Silk-only,
-#     but it is no longer a single point of failure -- it has a degraded
-#     native last resort (native_star_patch over core.n_sided_patch, exact
-#     G0/tangent-plane G1 only). If Silk is installed it always wins; the
-#     native path only runs when the engine command is unavailable or
-#     errors, and says so loudly.
-#   - RFS_CleanPatch44/66 and RFS_ControlPoly4 are the surface analog of
+#   - RFS_ControlPoly4 builds a degree-3 control-polygon curve natively
+#     from the same core.control_poly_curve technique -- Silk, its old
+#     engine, is gone, so it is native-only now.
+#   - RFS_StarPatch is native-only (native_star_patch over
+#     core.gregory_star_patch: exact G0/tangent-plane G1 by construction,
+#     septic-Hermite spoke continuity in parameter space). Its old Silk
+#     engine (ControlGridNStar66, true geometric G2) was removed with the
+#     rest of Silk -- no engine reference remains for it.
+#   - RFS_CleanPatch44/66 are the surface analog of
 #     core.control_poly_curve (already native for curves) -- same
 #     buildFromPolesMultsKnots technique on a 2D grid instead of 1D.
+#     Silk was their original engine and is gone; they are native-only.
 #   - RFS_Trim/RFS_SketchOnSurf are moderate OCCT work (BRepFeat_SplitShape
 #     / Geom2d projection).
 #   - RFS_BlendSurf now has a native path too (core.blend_surface, the
 #     same quintic-Hermite technique match_surface already uses) --
 #     Curves_BlendSurf2 is kept only as the fallback for selections the
 #     native nearest-facing-side search can't resolve.
-#   - RFS_StarPatch is now native only (core.n_sided_patch, exact G0 /
-#     tangent-plane G1). Silk's ControlGridNStar66 offered true G2 but is
-#     no longer a dependency; the curated button degrades gracefully to a
-#     working native tool instead of a dead button.
+#
+# Net effect: the only engine still referenced anywhere in this module is
+# Curves, and only as a FALLBACK behind an existing native provider.
 #
 # RFS_CleanPatch44/66 and RFS_Trim/RFS_SketchOnSurf are chained NATIVE
-# FIRST, then the original engine command as fallback -- unlike MultiLoft
-# (a clean redundancy, safe to cut over fully), these are freshly written
-# and only geometry-tested (see test_core.py), not field-tested against
-# every selection shape a real user will throw at them. Each native_*
-# function below raises ValueError on a bad/ambiguous selection rather
-# than printing-and-returning, specifically so ProviderCommand's chain
-# logic (commands.py) falls through to the still-installed engine command
-# instead of silently doing nothing -- see the "silent no-op" discussion
-# in the project SWOT for why that distinction matters.
+# FIRST, then (for the Curves-backed two) the original engine command as
+# fallback -- unlike MultiLoft (a clean redundancy, safe to cut over
+# fully), these are freshly written and only geometry-tested (see
+# test_core.py), not field-tested against every selection shape a real
+# user will throw at them. Each native_* function below raises ValueError
+# on a bad/ambiguous selection rather than printing-and-returning,
+# specifically so ProviderCommand's chain logic (commands.py) falls
+# through to the still-installed engine command instead of silently doing
+# nothing -- see the "silent no-op" discussion in the project SWOT for
+# why that distinction matters.
 NATIVE_OVERRIDES = {
     "RFS_MultiLoft":    [("native", "native_multiloft")],
-    "RFS_CleanPatch44": [("native", "native_clean_patch_44"),
-                         ("engine", "Silk", "CubicSurface_44")],
-    "RFS_CleanPatch66": [("native", "native_clean_patch_66"),
-                         ("engine", "Silk", "CubicSurface_66")],
+    # The three Silk-backed actions are now FULLY native (Silk is gone).
+    # They are deliberately single-provider: the native path raises
+    # ValueError on a bad selection so ProviderCommand reports the failure
+    # chain clearly instead of silently doing nothing.
+    "RFS_CleanPatch44": [("native", "native_clean_patch_44")],
+    "RFS_CleanPatch66": [("native", "native_clean_patch_66")],
     "RFS_Trim":         [("native", "native_trim"),
                          ("engine", "Curves", "Trim")],
     "RFS_SketchOnSurf": [("native", "native_sketch_on_surf"),
@@ -146,12 +149,11 @@ NATIVE_OVERRIDES = {
     # (flagged by deps.report_single_points_of_failure):
     "RFS_Analysis":     [("native", "native_analysis"),
                           ("engine", "Curves", "Curves_SurfaceAnalysis")],
-    "RFS_ControlPoly4": [("native", "native_control_poly4"),
-                          ("engine", "Silk", "ControlPoly4")],
-    # Star patch: native only (exact G0 / tangent-plane G1). Silk's
-    # ControlGridNStar66 offered true G2 but is no longer a dependency;
-    # the curated button degrades gracefully to a working native tool
-    # instead of a dead button when Silk is absent.
+    "RFS_ControlPoly4": [("native", "native_control_poly4")],
+    # Star patch: native only (Gregory construction, exact G0 /
+    # tangent-plane G1 -- see native_star_patch's docstring). Silk's
+    # ControlGridNStar66 offered true G2 but Silk is no longer a
+    # dependency; the curated button runs fully self-contained.
     "RFS_StarPatch":    [("native", "native_star_patch")],
     # Native visual-QA tools (fix for "no native fallback" gap #3) --
     # curvature comb / zebra stripes / reflection lines / draft-angle
@@ -170,8 +172,8 @@ NATIVE_OVERRIDES = {
 
 
 # Brand-new curated actions with NO engine equivalent at all (unlike
-# everything above, which each replaced or still falls back to a Curves/
-# Silk delegation): variable-radius fillets, radius-driven rolling-ball
+# everything above, which each replaced or still falls back to a Curves
+# delegation): variable-radius fillets, radius-driven rolling-ball
 # blends, and network-wide fairing are native-only chains from day one.
 NATIVE_OVERRIDES["RFS_VariableFillet"] = [("native", "native_variable_fillet")]
 NATIVE_OVERRIDES["RFS_RollingBallFillet"] = [
@@ -180,8 +182,8 @@ NATIVE_OVERRIDES["RFS_GlobalFair"] = [("native", "native_global_fair")]
 
 # Booleans, mesh/scan-to-NURBS fitting, and hidden-line drafting export --
 # three more native-only additions, none of which had ANY engine
-# equivalent (Curves/Silk never offered booleans, mesh import, or
-# drafting output). Unlike the fillet/fairing gaps above, these were
+# equivalent (neither Curves nor Silk ever offered booleans, mesh import,
+# or drafting output). Unlike the fillet/fairing gaps above, these were
 # never a kernel limitation -- see native_boolean_*/native_mesh_to_surface/
 # native_hidden_line_export's own docstrings below for what each wraps.
 NATIVE_OVERRIDES["RFS_BooleanUnion"] = [("native", "native_boolean_union")]
@@ -202,6 +204,37 @@ def _build_providers():
 
 
 PROVIDERS = _build_providers()
+
+
+def missing_engine_for(cmd_id):
+    """Name of the engine a curated command NEEDS but which isn't
+    installed, or None if the command can run right now.
+
+    A command is runnable whenever its provider chain has at least one
+    provider that can fire: a native provider always can (self-contained
+    OCCT), and an engine provider can when that engine is installed. Only
+    a command whose ENTIRE chain is engine providers, none of them
+    installed, is currently unrunnable -- we return the first such
+    engine's name so the tool shelf can grey the button and say why.
+
+    Commands with no PROVIDERS chain at all (the native task-panel
+    commands -- DrawInterp, Loft, ...) are never engine-backed, so they
+    always return None. Gui-free (only reads deps.installed), so the tool
+    shelf can call it at activation time without a live document."""
+    chain = PROVIDERS.get(cmd_id)
+    if not chain:
+        return None
+    needed = None
+    for p in chain:
+        if p[0] == "native":
+            return None
+        if p[0] == "engine":
+            mod = p[1]
+            if deps.installed(mod):
+                return None
+            if needed is None:
+                needed = mod
+    return needed
 
 
 def _add_feature_with_undo(doc, label, shape):
@@ -303,16 +336,18 @@ def _grid_points_from_selection(n):
 
 
 def native_clean_patch_44():
-    """Native provider for RFS_CleanPatch44 -- replaces Silk's
-    CubicSurface_44. See core.clean_patch_44 for the geometry (an exact,
-    non-interpolated 4x4 control-net bicubic patch, the same technique
+    """Native provider for RFS_CleanPatch44 (the only provider -- no
+    engine fallback; Silk, its original engine, is gone). See
+    core.clean_patch_44 for the geometry (an exact, non-interpolated 4x4
+    control-net bicubic patch, the same technique
     core.control_poly_curve already uses for curves)."""
     _run_clean_patch(4, "CleanPatch44")
 
 
 def native_clean_patch_66():
-    """Native provider for RFS_CleanPatch66 -- replaces Silk's
-    CubicSurface_66. See core.clean_patch_66."""
+    """Native provider for RFS_CleanPatch66 (the only provider -- no
+    engine fallback; Silk, its original engine, is gone).
+    See core.clean_patch_66."""
     _run_clean_patch(6, "CleanPatch66")
 
 
@@ -757,12 +792,13 @@ def native_analysis():
 
 
 def native_control_poly4():
-    """Native provider for RFS_ControlPoly4 -- replaces Silk's
-    ControlPoly4 with core.control_poly_curve (the same
-    buildFromPolesMultsKnots technique already native for curves).
-    Takes exactly 4 control points (the 2x2 grid convention used by
-    _grid_points_from_selection) and builds a degree-3 clamped-uniform
-    B-spline whose control polygon is those 4 points."""
+    """Native provider for RFS_ControlPoly4 (the only provider -- Silk,
+    its original engine, is gone). Builds a degree-3 control-polygon
+    curve via core.control_poly_curve (the same buildFromPolesMultsKnots
+    technique already native for curves). Takes exactly 4 control points
+    (the 2x2 grid convention used by _grid_points_from_selection) and
+    builds a degree-3 clamped-uniform B-spline whose control polygon is
+    those 4 points."""
     import FreeCAD
     from rfstudio import core
     pts = _grid_points_from_selection(2)   # raises on bad selection
@@ -780,7 +816,7 @@ def native_star_patch():
 
     True provably-exact geometric G2 across every seam remains an open CAGD
     problem for arbitrary valence; Gregory patches are the standard
-    practical approximation. No Silk or Curves dependency.
+    practical approximation. Fully self-contained: no engine dependency.
 
     Selection: the >= 3 boundary edges of one closed loop, picked as
     edge sub-objects (or one object whose shape is the loop itself).
