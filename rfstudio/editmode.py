@@ -199,76 +199,35 @@ def _closest_on_line_to_ray(p0, u, ro, rd):
 
 
 # --------------------------------------------------------------------- #
-# Custom "magnet" snap glyph. Coin's SoMarkerSet ships only geometric
-# markers (squares/circles/crosses/...), so the recognisable snap-magnet
-# symbol is registered once as a custom 16x16 bitmap marker. It's drawn
-# monochrome and tinted by the SoBaseColor above it, so the per-kind
-# colour still encodes WHICH snap engaged -- only the shape changes.
+# Snap glyphs matching FreeCAD Draft. Draft draws its viewport snap markers
+# as plain SoMarkerSet shapes resolved through FreeCADGui.getMarkerIndex
+# (so the user's View/MarkerSize pref sets the size) and switches shape on
+# the Draft "snapStyle" pref (default = circles, alt = squares). We reuse
+# both prefs below so RFS snaps look exactly like Draft's -- then add back
+# the one thing Draft lacks, a per-kind COLOUR, so you still see which snap
+# engaged (Draft is monochrome, using a single snapcolor for every type).
 # --------------------------------------------------------------------- #
-# A horseshoe magnet opening downward, 16 cols x 16 rows, col 0 leftmost.
-_MAGNET_ROWS = (
-    "0011111111111100",
-    "0111111111111110",
-    "1111111111111111",
-    "1110000000000111",
-    "1110000000000111",
-    "1110000000000111",
-    "1110000000000111",
-    "1110000000000111",
-    "1110000000000111",
-    "1110000000000111",
-    "1110000000000111",
-    "1110000000000111",
-    "1110000000000111",
-    "1110000000000111",
-    "1111000000001111",
-    "1111000000001111",
-)
-# Registered lazily, once per process (addMarker allocates a new glyph each
-# call, so re-registering per editor would leak indices).
-_MAGNET_IDX = None
-_MAGNET_TRIED = False
+_DRAFT_VIEW_PARAMS = "User parameter:BaseApp/Preferences/View"
+_DRAFT_MOD_PARAMS = "User parameter:BaseApp/Preferences/Mod/Draft"
 
 
-def _magnet_bitmap_bytes(rows):
-    """Pack the '1'/'0' row strings into a row-major, MSB-first bitmap
-    (each row padded to a byte boundary) for SoMarkerSet.addMarker."""
-    data = bytearray()
-    for row in rows:
-        bits = row + "0" * ((8 - len(row) % 8) % 8)
-        for i in range(0, len(bits), 8):
-            data.append(int(bits[i:i + 8], 2))
-    return bytes(data)
-
-
-def _magnet_marker_index(coin):
-    """The SoMarkerSet index of the custom magnet glyph, registering it on
-    first use. Returns None if this Coin build won't accept a custom marker
-    (the caller then falls back to the built-in per-kind glyphs). Best-effort
-    and cached -- a failure is not retried, and never raises."""
-    global _MAGNET_IDX, _MAGNET_TRIED
-    if _MAGNET_TRIED:
-        return _MAGNET_IDX
-    _MAGNET_TRIED = True
+def _draft_marker_size():
+    """The View/MarkerSize preference Draft sizes its snap markers by
+    (default 9), so RFS markers are the same size the user already sees."""
     try:
-        ms = coin.SoMarkerSet
-        w = len(_MAGNET_ROWS[0])
-        h = len(_MAGNET_ROWS)
-        data = _magnet_bitmap_bytes(_MAGNET_ROWS)
-        try:
-            idx = int(ms.getNumDefinedMarkers())   # next free index
-        except Exception:
-            idx = 100
-        # isLSBFirst=False (leftmost pixel is the MSB), isUpToDown=True
-        # (first row is the top).
-        ms.addMarker(idx, coin.SbVec2s(w, h), data, False, True)
-        _MAGNET_IDX = idx
-    except Exception as exc:
-        FreeCAD.Console.PrintWarning(
-            "Railform: custom snap-magnet marker unavailable (%s) -- "
-            "using built-in glyphs.\n" % exc)
-        _MAGNET_IDX = None
-    return _MAGNET_IDX
+        return FreeCAD.ParamGet(_DRAFT_VIEW_PARAMS).GetInt("MarkerSize", 9)
+    except Exception:
+        return 9
+
+
+def _draft_square_style():
+    """Draft's 'snapStyle' preference: True = square markers, False
+    (default) = circle markers. Matching it keeps RFS consistent with
+    whichever style the user picked for Draft."""
+    try:
+        return FreeCAD.ParamGet(_DRAFT_MOD_PARAMS).GetBool("snapStyle", False)
+    except Exception:
+        return False
 
 
 class PointEditor(object):
@@ -514,11 +473,12 @@ class PointEditor(object):
         self.prev_switch.addChild(pv)
         self.root.addChild(self.prev_switch)
 
-        # snap indicator: a marker that appears on the engaged snap target,
-        # colour + glyph telling you WHICH kind of snap won (Draft-style) --
-        # green square = vertex/control point, yellow cross = curve-curve
-        # intersection, cyan ring = on-curve projection. The colour node and
-        # marker node are kept so _show_snap_marker can restyle per snap.
+        # snap indicator: a marker on the engaged snap target. Shape matches
+        # FreeCAD Draft (filled marker for vertex/intersection landings,
+        # hollow for on-curve projection; circle/square + size per Draft's
+        # prefs -- see _resolve_snap_glyphs), and the per-kind COLOUR tells
+        # you which kind won (green/yellow/cyan). The colour node and marker
+        # node are kept so _show_snap_marker can restyle per snap.
         self._snap_switch = coin.SoSwitch()
         self._snap_switch.whichChild = -1
         snap_sep = coin.SoSeparator()
@@ -622,34 +582,40 @@ class PointEditor(object):
 
     @staticmethod
     def _resolve_snap_glyphs(coin):
-        """{kind: (markerIndex, rgb)} for the snap indicator. The shape is
-        the custom magnet glyph (_magnet_marker_index); the per-kind COLOUR
-        still encodes which snap engaged -- green = vertex/control point,
-        yellow = curve-curve intersection, cyan = on-curve projection.
+        """{kind: (markerIndex, rgb)} matching FreeCAD Draft's snap markers.
 
-        If this Coin build won't register the custom marker, each kind falls
-        back to a distinct built-in glyph (green square / yellow cross /
-        cyan ring -- the Draft-workbench convention), resolving the glyph
-        constant names defensively since they vary across builds."""
-        ms = coin.SoMarkerSet
+        Shape: exactly Draft's -- a FILLED marker for landing snaps
+        (vertex/control point, intersection; Draft's endpoint/intersection)
+        and a HOLLOW marker for the on-curve projection (Draft's
+        passive/near). Circle vs square follows Draft's snapStyle pref, and
+        the size follows View/MarkerSize, both resolved through the same
+        FreeCADGui.getMarkerIndex call Draft uses -- so a user who changed
+        either pref sees RFS snaps change to match.
 
-        def mk(*names):
-            for n in names:
-                g = getattr(ms, n, None)
-                if g is not None:
-                    return g
-            return getattr(ms, "CIRCLE_LINE_9_9", 0)
+        Colour: the one thing Draft doesn't do -- RFS tints each family
+        (green = vertex/control point, yellow = curve-curve intersection,
+        cyan = on-curve projection) so you still see which snap engaged.
 
-        magnet = _magnet_marker_index(coin)
-        vertex_g = magnet if magnet is not None \
-            else mk("SQUARE_FILLED_9_9", "SQUARE_LINE_9_9")
-        inter_g = magnet if magnet is not None \
-            else mk("CROSS_9_9", "PLUS_9_9", "STAR_9_9")
-        edge_g = magnet if magnet is not None else mk("CIRCLE_LINE_9_9")
+        Falls back to the built-in coin SoMarkerSet _9_9 constants if
+        FreeCADGui.getMarkerIndex isn't available on this build."""
+        square = _draft_square_style()
+        size = _draft_marker_size()
+        filled = "SQUARE_FILLED" if square else "CIRCLE_FILLED"
+        hollow = "SQUARE_LINE" if square else "CIRCLE_LINE"
+
+        def idx(name):
+            try:
+                return FreeCADGui.getMarkerIndex(name, size)
+            except Exception:
+                const = getattr(coin.SoMarkerSet, name + "_9_9", None)
+                if const is None:
+                    const = getattr(coin.SoMarkerSet, "CIRCLE_LINE_9_9", 0)
+                return const
+
         return {
-            snaputil.SNAP_VERTEX: (vertex_g, (0.2, 0.95, 0.3)),
-            snaputil.SNAP_INTERSECTION: (inter_g, (1.0, 0.9, 0.2)),
-            snaputil.SNAP_EDGE: (edge_g, (0.1, 0.95, 0.95)),
+            snaputil.SNAP_VERTEX: (idx(filled), (0.2, 0.95, 0.3)),
+            snaputil.SNAP_INTERSECTION: (idx(filled), (1.0, 0.9, 0.2)),
+            snaputil.SNAP_EDGE: (idx(hollow), (0.1, 0.95, 0.95)),
         }
 
     def _show_snap_marker(self, pt, kind):
