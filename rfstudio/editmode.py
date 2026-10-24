@@ -411,6 +411,28 @@ class PointEditor(object):
         mk.addChild(self.mk_set)
         self.root.addChild(mk)
 
+        # curve knots (read-only display): cyan diamonds sitting ON the curve
+        # at each unique B-spline knot, visible throughout authoring/editing
+        # so you can see where the spline's segments actually join. Same cyan
+        # as the KnotEditor's draggable knots (so "cyan diamond = knot" reads
+        # consistently), one size down to stay informational next to the
+        # yellow control points. Updated live with the curve (_refresh_knots).
+        kn = coin.SoSeparator()
+        kc = coin.SoBaseColor()
+        kc.rgb = (0.30, 0.85, 1.0)
+        self.knot_coord = coin.SoCoordinate3()
+        self.knot_set = coin.SoMarkerSet()
+        for _name in ("DIAMOND_FILLED_7_7", "DIAMOND_FILLED_9_9"):
+            _g = getattr(coin.SoMarkerSet, _name, None)
+            if _g is not None:
+                self.knot_set.markerIndex = _g
+                break
+        self.knot_set.numPoints = 0
+        kn.addChild(kc)
+        kn.addChild(self.knot_coord)
+        kn.addChild(self.knot_set)
+        self.root.addChild(kn)
+
         # RGB axis arrows (shaft + cone tip) — SoSwitch so they can be hidden
         self.arrow_switch = coin.SoSwitch()
         self.arrow_switch.whichChild = 0
@@ -516,6 +538,38 @@ class PointEditor(object):
         self.mk_coord.point.setValues(
             0, len(pts), [(p.x, p.y, p.z) for p in pts])
         self.mk_set.numPoints = len(pts)
+        self._refresh_knots()
+
+    def _knot_points(self, shape=None):
+        """World positions of the curve's unique B-spline knots (empty for a
+        non-BSpline edge, e.g. a polyline or raw Bezier). Reuses
+        snaputil._edge_knot_points so the displayed knots coincide exactly
+        with the knot snap targets."""
+        try:
+            shp = shape if shape is not None else getattr(self.obj, "Shape", None)
+            edges = getattr(shp, "Edges", None) if shp is not None else None
+            if not edges:
+                return []
+            pts = []
+            for e in edges:
+                pts.extend(snaputil._edge_knot_points(e))
+            return pts
+        except Exception:
+            return []
+
+    def _refresh_knots(self, shape=None):
+        """Update the read-only knot markers from the current (or supplied)
+        shape. Called on build, after each commit / spinbox edit (via
+        _refresh_markers), and live during a drag (from _live's preview
+        shape, so the knots slide with the curve). Safe before the knot
+        nodes exist (guarded), so a partial _build never raises here."""
+        if getattr(self, "knot_coord", None) is None:
+            return
+        pts = self._knot_points(shape)
+        if pts:
+            self.knot_coord.point.setValues(
+                0, len(pts), [(p.x, p.y, p.z) for p in pts])
+        self.knot_set.numPoints = len(pts)
 
     def _update_cones(self, p, L):
         cone_h = max(L * 0.35, 0.3)
@@ -1701,6 +1755,7 @@ class PointEditor(object):
         try:
             shape = self.obj.Proxy.compute(self.obj, pts)
             line = shape.discretize(60) if shape is not None else None
+            self._refresh_knots(shape)   # slide knot markers with the curve
         except Exception:
             line = None
         if line:
