@@ -290,6 +290,107 @@ def _ShortcutHintBar(shortcuts_text="X/Y/Z: lock  |  Tab: plane  |  Esc: drop  |
     return bar
 
 
+# ---------------------------------------------------------------------- #
+# Coordinate-table styling (points/weights grids), theme-aware.
+# ---------------------------------------------------------------------- #
+# These replace per-panel hard-coded dark stylesheets that washed out on a
+# light FreeCAD theme, and the filled-maroon delete button whose rows
+# stacked into a heavy red column. Factory FUNCTIONS (not Qt subclasses) so
+# this module keeps its lazy-Qt property (guarded by test_gui_imports #5).
+
+# X/Y/Z header colours per theme, chosen to read on that background
+# (brighter on dark, deeper on light). Keyed by the is-dark flag.
+_AXIS_HEADER_RGB = {
+    True:  ((235, 110, 110), (120, 205, 120), (110, 160, 240)),
+    False: ((198, 52, 52), (36, 148, 56), (36, 92, 200)),
+}
+
+
+def _is_dark_palette(widget):
+    """True if `widget`'s Base colour is dark -- used to pick table colours
+    that stay legible on both light and dark FreeCAD themes. Defaults to
+    dark (FreeCAD's common case) if the palette can't be read."""
+    try:
+        from PySide import QtGui
+        c = widget.palette().color(QtGui.QPalette.Base)
+        lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
+        return lum < 128
+    except Exception:
+        return True
+
+
+def _muted_color(dark=True):
+    """Hex for secondary/placeholder text that stays legible per theme."""
+    return "#9aa6b2" if dark else "#6b7580"
+
+
+def _point_table_style(dark):
+    """Stylesheet for a coordinate table, theme-aware so it has real
+    contrast on both light and dark FreeCAD themes rather than hard-coded
+    dark values that wash out on a light theme."""
+    if dark:
+        return (
+            "QTableWidget{gridline-color:#4a5563;background:#2b333d;"
+            "alternate-background-color:#333e4b;color:#e8eef4;}"
+            "QHeaderView::section{background:#3a4552;color:#dfe6ee;"
+            "padding:3px;border:0;border-bottom:1px solid #4a5563;}"
+            "QTableCornerButton::section{background:#3a4552;border:0;}"
+            "QDoubleSpinBox{background:#1f2730;color:#f0f5fa;"
+            "border:1px solid #4a5563;border-radius:3px;padding:1px 2px;}"
+            "QDoubleSpinBox:focus{border:1px solid #6c93c7;}")
+    return (
+        "QTableWidget{gridline-color:#c6cfd9;background:#ffffff;"
+        "alternate-background-color:#eef2f6;color:#1d242c;}"
+        "QHeaderView::section{background:#e4e9ef;color:#2a323b;"
+        "padding:3px;border:0;border-bottom:1px solid #c6cfd9;}"
+        "QTableCornerButton::section{background:#e4e9ef;border:0;}"
+        "QDoubleSpinBox{background:#ffffff;color:#1d242c;"
+        "border:1px solid #b7c0cb;border-radius:3px;padding:1px 2px;}"
+        "QDoubleSpinBox:focus{border:1px solid #3a7bd5;}")
+
+
+def _style_point_table(table):
+    """Apply theme-aware styling + axis-coloured X/Y/Z headers to a
+    coordinate table. Returns True if a dark theme was detected, so callers
+    can reuse it for per-row widgets (delete button, weight label). The
+    first three header columns are assumed to be X/Y/Z."""
+    from PySide import QtGui
+    dark = _is_dark_palette(table)
+    table.setAlternatingRowColors(True)
+    table.setShowGrid(True)
+    table.setStyleSheet(_point_table_style(dark))
+    bold = QtGui.QFont()
+    bold.setBold(True)
+    for c, rgb in enumerate(_AXIS_HEADER_RGB[dark]):
+        it = table.horizontalHeaderItem(c)
+        if it is not None:
+            it.setForeground(QtGui.QBrush(QtGui.QColor(*rgb)))
+            it.setFont(bold)
+    return dark
+
+
+def _delete_cell_button(dark=True):
+    """A flat, borderless 'x' delete button for a table cell: quiet (muted
+    grey) by default, turning red only on hover. Replaces the filled-maroon
+    button whose rows stacked into a heavy, alarming red column."""
+    qw = _get_qt_widgets()
+    from PySide import QtCore
+    btn = qw.QPushButton("×")
+    btn.setFixedWidth(22)
+    btn.setFlat(True)
+    btn.setToolTip("Delete this point")
+    try:
+        btn.setCursor(QtCore.Qt.PointingHandCursor)
+    except Exception:
+        pass
+    base = "#8a95a2" if dark else "#8a929c"
+    btn.setStyleSheet(
+        "QPushButton{background:transparent;border:none;color:%s;"
+        "font-weight:bold;font-size:15px;padding:0;}"
+        "QPushButton:hover{color:#e74c3c;}" % base)
+    return btn
+
+
 # Shared status-line styling: one source for the grey/red status text
 # that used to be inlined ~20 times across panels (see _status_label).
 _STATUS_STYLE = "color:#9aa6b2;font-size:11px;padding:4px 0;"

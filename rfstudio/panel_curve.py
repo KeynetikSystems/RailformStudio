@@ -22,6 +22,7 @@ from rfstudio import snaputil
 from rfstudio.panel_base import (
     _EditPanelBase, _selected_points, _notify_overlay_unavailable,
     _ShortcutHintBar, drop_callbacks,
+    _style_point_table, _delete_cell_button, _muted_color,
 )
 
 
@@ -191,22 +192,10 @@ class CurvePanel(_EditPanelBase):
         self.table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.table.setMaximumHeight(220)
         self.table.setMaximumWidth(300)
-        self.table.setAlternatingRowColors(True)
-        # colour the X/Y/Z headers to match the gizmo axes (red/green/blue)
-        axis_rgb = ((232, 96, 96), (110, 200, 110), (96, 150, 235))
-        bold = QtGui.QFont()
-        bold.setBold(True)
-        for c, rgb in enumerate(axis_rgb):
-            it = self.table.horizontalHeaderItem(c)
-            if it is not None:
-                it.setForeground(QtGui.QBrush(QtGui.QColor(*rgb)))
-                it.setFont(bold)
-        self.table.setStyleSheet(
-            "QTableWidget{gridline-color:#5a6675;"
-            "alternate-background-color:#323b47;background:#2b333d;}"
-            "QHeaderView::section{background:#39434f;padding:2px;}"
-            "QDoubleSpinBox{background:#222a33;color:#eef3f8;border:1px solid "
-            "#4a5563;border-radius:2px;}")
+        # Theme-aware styling + axis-coloured X/Y/Z headers (legible on both
+        # light and dark FreeCAD themes). _table_dark is reused per row for
+        # the delete-button / weight-label colours.
+        self._table_dark = _style_point_table(self.table)
         self._lay.addWidget(self.table)
 
         row = QtWidgets.QHBoxLayout()
@@ -629,16 +618,12 @@ class CurvePanel(_EditPanelBase):
             else:
                 w_label = QtWidgets.QLabel(str(self._weights[i] if i < len(self._weights) else 1.0))
                 w_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-                w_label.setStyleSheet("color: #aaa;")
+                w_label.setStyleSheet(
+                    "color:%s;" % _muted_color(getattr(self, "_table_dark", True)))
                 self.table.setCellWidget(i, 3, w_label)
                 spins.append(w_label)
             # Delete button
-            del_btn = QtWidgets.QPushButton("×")
-            del_btn.setFixedWidth(22)
-            del_btn.setStyleSheet(
-                "QPushButton{background:#7a1c1c;color:#fff;border:none;"
-                "border-radius:2px;font-weight:bold;padding:0;}"
-                "QPushButton:hover{background:#c0392b;}")
+            del_btn = _delete_cell_button(getattr(self, "_table_dark", True))
             del_btn.clicked.connect(lambda checked=False, r=i: self._delete_row(r))
             self.table.setCellWidget(i, 4, del_btn)
             self._rows.append(tuple(spins))
