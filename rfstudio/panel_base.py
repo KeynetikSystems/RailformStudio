@@ -291,88 +291,64 @@ def _ShortcutHintBar(shortcuts_text="X/Y/Z: lock  |  Tab: plane  |  Esc: drop  |
 
 
 # ---------------------------------------------------------------------- #
-# Coordinate-table styling (points/weights grids), theme-aware.
+# Coordinate-table styling (points/weights grids).
 # ---------------------------------------------------------------------- #
-# These replace per-panel hard-coded dark stylesheets that washed out on a
-# light FreeCAD theme, and the filled-maroon delete button whose rows
-# stacked into a heavy red column. Factory FUNCTIONS (not Qt subclasses) so
-# this module keeps its lazy-Qt property (guarded by test_gui_imports #5).
+# These DELIBERATELY set no background / gridline / alternate-row / spinbox
+# colours: FreeCAD's theme stylesheet (FreeCAD.qss) already styles
+# QAbstractItemView / QTableView / QHeaderView / QSpinBox from the user's
+# own General->Colors preferences (e.g. gridline-color:@GeneralGridLinesColor,
+# alternate-background-color:@GeneralAlternateBackgroundColor), applied
+# globally. Setting our own table stylesheet would OVERRIDE that theme per
+# widget -- the opposite of matching it. So we only add what the theme
+# can't express: axis-coloured X/Y/Z headers, a flat delete button, and a
+# muted weight label. (An earlier version detected dark/light via QPalette
+# and swapped two hard-coded palettes; that both fought the theme and was
+# unreliable -- a global Qt stylesheet doesn't repopulate QPalette, so the
+# luminance read didn't reflect what was actually painted.)
+# Factory FUNCTIONS (not Qt subclasses) so this module keeps its lazy-Qt
+# property (guarded by test_gui_imports #5).
 
-# X/Y/Z header colours per theme, chosen to read on that background
-# (brighter on dark, deeper on light). Keyed by the is-dark flag.
-_AXIS_HEADER_RGB = {
-    True:  ((235, 110, 110), (120, 205, 120), (110, 160, 240)),
-    False: ((198, 52, 52), (36, 148, 56), (36, 92, 200)),
-}
-
-
-def _is_dark_palette(widget):
-    """True if `widget`'s Base colour is dark -- used to pick table colours
-    that stay legible on both light and dark FreeCAD themes. Defaults to
-    dark (FreeCAD's common case) if the palette can't be read."""
-    try:
-        from PySide import QtGui
-        c = widget.palette().color(QtGui.QPalette.Base)
-        lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
-        return lum < 128
-    except Exception:
-        return True
+# X/Y/Z header text colours matching the gizmo axes (red/green/blue). One
+# mid-tone set that reads on both light and dark table backgrounds, since
+# we can't reliably detect the active theme (see note above). These are a
+# deliberate RFS semantic, not a theme colour, and are set as item
+# foreground (not via stylesheet) so they survive whatever theme is active.
+_AXIS_HEADER_RGB = ((214, 69, 69), (52, 164, 84), (58, 123, 213))
 
 
-def _muted_color(dark=True):
-    """Hex for secondary/placeholder text that stays legible per theme."""
-    return "#9aa6b2" if dark else "#6b7580"
-
-
-def _point_table_style(dark):
-    """Stylesheet for a coordinate table, theme-aware so it has real
-    contrast on both light and dark FreeCAD themes rather than hard-coded
-    dark values that wash out on a light theme."""
-    if dark:
-        return (
-            "QTableWidget{gridline-color:#4a5563;background:#2b333d;"
-            "alternate-background-color:#333e4b;color:#e8eef4;}"
-            "QHeaderView::section{background:#3a4552;color:#dfe6ee;"
-            "padding:3px;border:0;border-bottom:1px solid #4a5563;}"
-            "QTableCornerButton::section{background:#3a4552;border:0;}"
-            "QDoubleSpinBox{background:#1f2730;color:#f0f5fa;"
-            "border:1px solid #4a5563;border-radius:3px;padding:1px 2px;}"
-            "QDoubleSpinBox:focus{border:1px solid #6c93c7;}")
-    return (
-        "QTableWidget{gridline-color:#c6cfd9;background:#ffffff;"
-        "alternate-background-color:#eef2f6;color:#1d242c;}"
-        "QHeaderView::section{background:#e4e9ef;color:#2a323b;"
-        "padding:3px;border:0;border-bottom:1px solid #c6cfd9;}"
-        "QTableCornerButton::section{background:#e4e9ef;border:0;}"
-        "QDoubleSpinBox{background:#ffffff;color:#1d242c;"
-        "border:1px solid #b7c0cb;border-radius:3px;padding:1px 2px;}"
-        "QDoubleSpinBox:focus{border:1px solid #3a7bd5;}")
+def _muted_color():
+    """A neutral mid-grey for secondary/placeholder text (e.g. the
+    read-only weight label) that stays legible on both light and dark
+    FreeCAD themes. A single value, not theme-derived, because a global Qt
+    stylesheet theme doesn't repopulate QPalette for us to read."""
+    return "#808a93"
 
 
 def _style_point_table(table):
-    """Apply theme-aware styling + axis-coloured X/Y/Z headers to a
-    coordinate table. Returns True if a dark theme was detected, so callers
-    can reuse it for per-row widgets (delete button, weight label). The
-    first three header columns are assumed to be X/Y/Z."""
+    """Enable the active FreeCAD theme's own alternating-row and grid
+    styling (FreeCAD.qss paints those from the user's colour prefs) and
+    colour the X/Y/Z header text to match the gizmo axes. Sets NO
+    background / gridline / spinbox colours of its own, so the table
+    inherits the active theme rather than overriding it. The first three
+    header columns are assumed to be X/Y/Z."""
     from PySide import QtGui
-    dark = _is_dark_palette(table)
-    table.setAlternatingRowColors(True)
-    table.setShowGrid(True)
-    table.setStyleSheet(_point_table_style(dark))
+    table.setAlternatingRowColors(True)   # use the theme's alternate colour
+    table.setShowGrid(True)               # use the theme's gridline colour
     bold = QtGui.QFont()
     bold.setBold(True)
-    for c, rgb in enumerate(_AXIS_HEADER_RGB[dark]):
+    for c, rgb in enumerate(_AXIS_HEADER_RGB):
         it = table.horizontalHeaderItem(c)
         if it is not None:
             it.setForeground(QtGui.QBrush(QtGui.QColor(*rgb)))
             it.setFont(bold)
-    return dark
 
 
-def _delete_cell_button(dark=True):
-    """A flat, borderless 'x' delete button for a table cell: quiet (muted
-    grey) by default, turning red only on hover. Replaces the filled-maroon
-    button whose rows stacked into a heavy, alarming red column."""
+def _delete_cell_button():
+    """A flat, borderless 'x' delete button for a table cell. Inherits the
+    theme's own text colour at rest (no colour override, so it matches the
+    active FreeCAD theme) and turns red only on hover -- replacing the
+    filled-maroon button whose rows stacked into a heavy, alarming red
+    column."""
     qw = _get_qt_widgets()
     from PySide import QtCore
     btn = qw.QPushButton("×")
@@ -383,11 +359,10 @@ def _delete_cell_button(dark=True):
         btn.setCursor(QtCore.Qt.PointingHandCursor)
     except Exception:
         pass
-    base = "#8a95a2" if dark else "#8a929c"
     btn.setStyleSheet(
-        "QPushButton{background:transparent;border:none;color:%s;"
+        "QPushButton{background:transparent;border:none;"
         "font-weight:bold;font-size:15px;padding:0;}"
-        "QPushButton:hover{color:#e74c3c;}" % base)
+        "QPushButton:hover{color:#e74c3c;}")
     return btn
 
 

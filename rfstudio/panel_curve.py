@@ -192,10 +192,10 @@ class CurvePanel(_EditPanelBase):
         self.table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.table.setMaximumHeight(220)
         self.table.setMaximumWidth(300)
-        # Theme-aware styling + axis-coloured X/Y/Z headers (legible on both
-        # light and dark FreeCAD themes). _table_dark is reused per row for
-        # the delete-button / weight-label colours.
-        self._table_dark = _style_point_table(self.table)
+        # Let the active FreeCAD theme paint the table (background, gridlines,
+        # alternating rows, spinboxes); we only add axis-coloured X/Y/Z
+        # headers. See panel_base._style_point_table.
+        _style_point_table(self.table)
         self._lay.addWidget(self.table)
 
         row = QtWidgets.QHBoxLayout()
@@ -618,12 +618,11 @@ class CurvePanel(_EditPanelBase):
             else:
                 w_label = QtWidgets.QLabel(str(self._weights[i] if i < len(self._weights) else 1.0))
                 w_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-                w_label.setStyleSheet(
-                    "color:%s;" % _muted_color(getattr(self, "_table_dark", True)))
+                w_label.setStyleSheet("color:%s;" % _muted_color())
                 self.table.setCellWidget(i, 3, w_label)
                 spins.append(w_label)
             # Delete button
-            del_btn = _delete_cell_button(getattr(self, "_table_dark", True))
+            del_btn = _delete_cell_button()
             del_btn.clicked.connect(lambda checked=False, r=i: self._delete_row(r))
             self.table.setCellWidget(i, 4, del_btn)
             self._rows.append(tuple(spins))
