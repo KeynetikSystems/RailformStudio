@@ -12,6 +12,16 @@ gui_commands_probe.FCStd
 # Local-only working documents (not part of the published workbench)
 Refined_Grant_Proposal.md
 test_gui_commands.py
+commit_msg.txt
+test_basic.py
+
+# Tooling / AI working notes (not part of the workbench)
+.claude/
+memory/
+rfstudio/memory/
+
+# Stray typo directory (icons live in rfstudio/resources/)
+rfstudio/rfsources/
 
 # IDE / editor
 .vs/
