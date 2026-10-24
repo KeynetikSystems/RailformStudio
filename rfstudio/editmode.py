@@ -198,6 +198,79 @@ def _closest_on_line_to_ray(p0, u, ro, rd):
     return p0 + u * s
 
 
+# --------------------------------------------------------------------- #
+# Custom "magnet" snap glyph. Coin's SoMarkerSet ships only geometric
+# markers (squares/circles/crosses/...), so the recognisable snap-magnet
+# symbol is registered once as a custom 16x16 bitmap marker. It's drawn
+# monochrome and tinted by the SoBaseColor above it, so the per-kind
+# colour still encodes WHICH snap engaged -- only the shape changes.
+# --------------------------------------------------------------------- #
+# A horseshoe magnet opening downward, 16 cols x 16 rows, col 0 leftmost.
+_MAGNET_ROWS = (
+    "0011111111111100",
+    "0111111111111110",
+    "1111111111111111",
+    "1110000000000111",
+    "1110000000000111",
+    "1110000000000111",
+    "1110000000000111",
+    "1110000000000111",
+    "1110000000000111",
+    "1110000000000111",
+    "1110000000000111",
+    "1110000000000111",
+    "1110000000000111",
+    "1110000000000111",
+    "1111000000001111",
+    "1111000000001111",
+)
+# Registered lazily, once per process (addMarker allocates a new glyph each
+# call, so re-registering per editor would leak indices).
+_MAGNET_IDX = None
+_MAGNET_TRIED = False
+
+
+def _magnet_bitmap_bytes(rows):
+    """Pack the '1'/'0' row strings into a row-major, MSB-first bitmap
+    (each row padded to a byte boundary) for SoMarkerSet.addMarker."""
+    data = bytearray()
+    for row in rows:
+        bits = row + "0" * ((8 - len(row) % 8) % 8)
+        for i in range(0, len(bits), 8):
+            data.append(int(bits[i:i + 8], 2))
+    return bytes(data)
+
+
+def _magnet_marker_index(coin):
+    """The SoMarkerSet index of the custom magnet glyph, registering it on
+    first use. Returns None if this Coin build won't accept a custom marker
+    (the caller then falls back to the built-in per-kind glyphs). Best-effort
+    and cached -- a failure is not retried, and never raises."""
+    global _MAGNET_IDX, _MAGNET_TRIED
+    if _MAGNET_TRIED:
+        return _MAGNET_IDX
+    _MAGNET_TRIED = True
+    try:
+        ms = coin.SoMarkerSet
+        w = len(_MAGNET_ROWS[0])
+        h = len(_MAGNET_ROWS)
+        data = _magnet_bitmap_bytes(_MAGNET_ROWS)
+        try:
+            idx = int(ms.getNumDefinedMarkers())   # next free index
+        except Exception:
+            idx = 100
+        # isLSBFirst=False (leftmost pixel is the MSB), isUpToDown=True
+        # (first row is the top).
+        ms.addMarker(idx, coin.SbVec2s(w, h), data, False, True)
+        _MAGNET_IDX = idx
+    except Exception as exc:
+        FreeCAD.Console.PrintWarning(
+            "Railform: custom snap-magnet marker unavailable (%s) -- "
+            "using built-in glyphs.\n" % exc)
+        _MAGNET_IDX = None
+    return _MAGNET_IDX
+
+
 class PointEditor(object):
 
     def __init__(self, vobj):
@@ -549,11 +622,15 @@ class PointEditor(object):
 
     @staticmethod
     def _resolve_snap_glyphs(coin):
-        """{kind: (markerIndex, rgb)} for the snap indicator. Resolves the
-        SoMarkerSet glyph constants defensively (the available names vary
-        across Coin builds; each falls back to the cyan ring). Green square
-        = vertex/control point, yellow cross = curve-curve intersection,
-        cyan ring = on-curve projection -- the Draft-workbench convention."""
+        """{kind: (markerIndex, rgb)} for the snap indicator. The shape is
+        the custom magnet glyph (_magnet_marker_index); the per-kind COLOUR
+        still encodes which snap engaged -- green = vertex/control point,
+        yellow = curve-curve intersection, cyan = on-curve projection.
+
+        If this Coin build won't register the custom marker, each kind falls
+        back to a distinct built-in glyph (green square / yellow cross /
+        cyan ring -- the Draft-workbench convention), resolving the glyph
+        constant names defensively since they vary across builds."""
         ms = coin.SoMarkerSet
 
         def mk(*names):
@@ -563,12 +640,16 @@ class PointEditor(object):
                     return g
             return getattr(ms, "CIRCLE_LINE_9_9", 0)
 
+        magnet = _magnet_marker_index(coin)
+        vertex_g = magnet if magnet is not None \
+            else mk("SQUARE_FILLED_9_9", "SQUARE_LINE_9_9")
+        inter_g = magnet if magnet is not None \
+            else mk("CROSS_9_9", "PLUS_9_9", "STAR_9_9")
+        edge_g = magnet if magnet is not None else mk("CIRCLE_LINE_9_9")
         return {
-            snaputil.SNAP_VERTEX: (
-                mk("SQUARE_FILLED_9_9", "SQUARE_LINE_9_9"), (0.2, 0.95, 0.3)),
-            snaputil.SNAP_INTERSECTION: (
-                mk("CROSS_9_9", "PLUS_9_9", "STAR_9_9"), (1.0, 0.9, 0.2)),
-            snaputil.SNAP_EDGE: (mk("CIRCLE_LINE_9_9"), (0.1, 0.95, 0.95)),
+            snaputil.SNAP_VERTEX: (vertex_g, (0.2, 0.95, 0.3)),
+            snaputil.SNAP_INTERSECTION: (inter_g, (1.0, 0.9, 0.2)),
+            snaputil.SNAP_EDGE: (edge_g, (0.1, 0.95, 0.95)),
         }
 
     def _show_snap_marker(self, pt, kind):
