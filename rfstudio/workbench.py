@@ -18,8 +18,8 @@ ICON = os.path.join(os.path.dirname(__file__), "resources", "rfstudio.svg")
 class RailformStudioWorkbench(FreeCADGui.Workbench):
 
     MenuText = "Railform Studio"
-    ToolTip = ("Curated curve->surface modeling over Curves + Silk, "
-               "plus Blender rail import")
+    ToolTip = ("Curated curve->surface modeling over an optional Curves "
+               "fallback engine, plus Blender rail import")
     Icon = ICON
 
     def Initialize(self):
@@ -34,12 +34,13 @@ class RailformStudioWorkbench(FreeCADGui.Workbench):
         missing = [k for k, v in st.items() if not v]
         if missing:
             FreeCAD.Console.PrintWarning(
-                "Railform Studio: engine(s) not found: %s. Commands needing "
-                "them are disabled. Install via Addon Manager.\n"
+                "Railform Studio: optional engine(s) not found: %s. Commands "
+                "needing them are disabled. Install via Addon Manager.\n"
                 % ", ".join(missing))
         else:
             FreeCAD.Console.PrintMessage(
-                "Railform Studio: Curves + Silk detected.\n")
+                "Railform Studio: optional engine detected: %s.\n"
+                % ", ".join(st))
 
         # One consolidated check of every curated -> engine command mapping,
         # rather than letting each one fail individually the first time a

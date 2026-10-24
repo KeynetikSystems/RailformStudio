@@ -2027,6 +2027,230 @@ def multi_rail_sweep(rails, profiles, n_rail=40, n_prof=20):
     return shape
 
 
+# --- single-rail (pipe) sweep ---------------------------------------------- #
+def _rail_tangent(arc, s):
+    """Unit tangent of an _ArcRail's edge at arc fraction s.
+
+    Central difference of valueAt over neighbouring normalized parameters --
+    no reliance on edge.tangentAt/TableCurve tangent conventions (interpolated
+    edges often carry RAW geometric parameters, and the tangent needs the
+    same normalized convention _eval01 and the arc table use).
+    """
+    eps = 1.0 / max(2.0 * len(arc.acc), 4.0)
+    s = min(max(s, 0.0), 1.0)
+    lo, hi = max(s - eps, 0.0), min(s + eps, 1.0)
+    if hi - lo < 1e-12:
+        lo, hi = max(s - 2.0 * eps, 0.0), 1.0
+    d = _eval01(arc.edge, hi).sub(_eval01(arc.edge, lo))
+    if d.Length < 1e-12:
+        raise ValueError("single-rail sweep: rail has no tangent at "
+                         "station %.4g" % s)
+    d.normalize()
+    return d
+
+
+def _rmf_frames(arc, stations, up0):
+    """Rotation-minimizing frames along the rail at the given arc stations.
+
+    Wang et al. double-reflection: each consecutive station pair reflects
+    the transported up vector across the tangent bisector, then across the
+    plane containing the old/new up, so the frame rides the spine WITHOUT
+    the Frenet frame's twist/flip pathologies (a Frenet frame flips at every
+    inflection point and a fixed world-up shears the section off the pipe).
+    Returns one (tangent, ey, ez) triple per station; all orthonormal.
+    """
+    frames = []
+    prev_tan = prev_up = None
+    for s in stations:
+        t = _rail_tangent(arc, s)
+        if prev_up is None:
+            ey = up0
+        else:
+            v1 = t.sub(prev_tan)
+            c1 = v1.dot(v1)
+            ey = prev_up
+            if c1 > 1e-14:
+                ey = ey - v1 * (2.0 * v1.dot(ey) / c1)
+                tl = prev_tan + v1 * (2.0 * v1.dot(t) / c1)
+                v2 = t.sub(tl)
+                c2 = v2.dot(v2)
+                if c2 > 1e-14:
+                    ey = ey - v2 * (2.0 * v2.dot(ey) / c2)
+        ey = ey.sub(t * (ey.dot(t)))
+        if ey.Length < 1e-9:
+            ey = _perp(t)
+        ey.normalize()
+        ez = t.cross(ey)
+        if ez.Length < 1e-9:
+            ey = _perp(t)
+            ez = t.cross(ey)
+        ez.normalize()
+        ey = ez.cross(t)
+        ey.normalize()
+        frames.append((t, ey, ez))
+        prev_tan, prev_up = t, ey
+    return frames
+
+
+def single_rail_sweep(rail, profiles, n_rail=40, n_prof=20):
+    """Classic pipe/spine sweep: one profile transported along ONE rail.
+
+    The other sweeps here need >= 2 rails because the second rail supplies
+    the section's orientation. This one uses the rail itself as the spine
+    and a rotation-minimizing frame (Wang et al. double reflection -- the
+    same transport the C++ FeatureMultiRailSweep belongs to) for the
+    orientation, so an arbitrary profile rides the curve the way
+    Part Sweep / makePipeShell(RMF) would: every station rebuilds the
+    profile's ORIGINAL offsets from the spine in the transported frame --
+    the offset lengths are preserved exactly, section transitions ease
+    with arc-length stations, and a closed profile closes the tube.
+
+    stations: uniform n_rail grid refined by the same measured midpoint
+    vs bracket-average chord-deviation subdivision the N-rail spine
+    fallback uses (same sag budget/constants). Multiple profiles are
+    accepted: each is pinned at its first sample's nearest-arc station on
+    the rail and the offsets morph linearly between them (two_rail_sweep's
+    description blending), so sections change shape along the spine.
+    """
+    n_prof = max(2, int(n_prof))
+    n_rail = max(2, int(n_rail))
+    if not profiles:
+        raise ValueError("single-rail sweep: no profiles")
+    arc = _ArcRail(rail)
+    if float(arc.total) <= 1e-9:
+        raise ValueError("single-rail sweep: rail is degenerate (zero "
+                         "length) -- nothing to sweep along")
+    cache = _NearestTCache()
+    cols = [k / float(n_prof - 1) for k in range(n_prof)]
+
+    descs = []
+    up0 = None
+    for pro in profiles:
+        samp = [_eval01(pro, q) for q in cols]
+        # degeneracy: a collapsed profile.  For a CLOSED profile the
+        # first and last samples coincide BY construction (param 0 == 1),
+        # so measure against the mid-parameter sample instead.
+        mid = samp[len(samp) // 2]
+        if mid.sub(samp[0]).Length < 1e-9:
+            continue
+        s_i = arc.fraction_of(cache.param(rail, samp[0]))
+        spine_i = arc.point_at(s_i)
+        # orientation reference for the transported frame start: the
+        # profile's own plane normal, projected perpendicular to the rail's
+        # tangent at the frame's start
+        t0 = _rail_tangent(arc, s_i)
+        if up0 is None:
+            nrm = _polygon_normal(samp)
+            nrm = nrm.sub(t0 * (nrm.dot(t0)))
+            if nrm.Length > 1e-9:
+                nrm.normalize()
+                up0 = nrm
+            else:
+                up0 = _perp(t0)
+        # the offsets ride in the TRANSPORT frame at this profile's own
+        # station, NOT in world axes -- rows rebuild spine + frame*offset,
+        # so world-coordinate offsets would re-express the profile in a
+        # wrongly rotated basis the moment the frame turns along the spine.
+        # A single-station RMF chain measures the frame directly (exactly
+        # for the first desc and on straight spines; interior profiles on
+        # curved spines get the closest practical anchor frame).
+        _t, _ey0, _ez0 = _rmf_frames(arc, [s_i], up0)[0]
+        off = []
+        for p in samp:
+            d = p.sub(spine_i)
+            off.append((d.dot(_t), d.dot(_ey0), d.dot(_ez0)))
+        descs.append((s_i, samp, off))
+    if not descs:
+        raise ValueError("single-rail sweep: profiles are degenerate "
+                         "(zero chord)")
+    descs.sort(key=lambda d: d[0])
+    # A CLOSED profile closes here natively: its param 0 == param 1 (the
+    # cols grid runs 0..1 inclusive and _eval01(1.0) repeats the first
+    # point), so the last column IS the seam -- adding a wrap column would
+    # put two identical points a param nudge apart, which OCC's
+    # interpolator rejects outright (Standard_ConstructionError, and the
+    # grid_to_surface fallback then re-parametrizes away the alignment).
+    # OPEN profiles sweep with a gap at the seam, exactly like the other
+    # sweeps' open sections.
+    m = n_prof
+
+    def desc_at(s):
+        if len(descs) == 1 or s <= descs[0][0]:
+            return descs[0], descs[0], 0.0
+        if s >= descs[-1][0]:
+            return descs[-1], descs[-1], 0.0
+        k = 0
+        while k < len(descs) - 1 and descs[k + 1][0] < s:
+            k += 1
+        lo, hi = descs[k], descs[k + 1]
+        span = hi[0] - lo[0]
+        return lo, hi, 0.0 if span < 1e-12 else (s - lo[0]) / span
+
+    def rows_for(stations):
+        """Grid rows at the given ordered arc stations. The RMF chain spans
+        the station list, so adaptive insertions re-walk it (cheap, and it
+        keeps the frames anchored to up0 regardless of station count)."""
+        frames = _rmf_frames(arc, stations, up0)
+        grid = []
+        for i, s in enumerate(stations):
+            t, ey, ez = frames[i]
+            spine = arc.point_at(s)
+            lo, hi, w = desc_at(s)
+            row = []
+            for j in range(m):
+                a0, b0, c0 = lo[2][j]
+                a1, b1, c1 = hi[2][j]
+                ex_a = a0 * (1.0 - w) + a1 * w
+                ey_b = b0 * (1.0 - w) + b1 * w
+                ez_c = c0 * (1.0 - w) + c1 * w
+                row.append(spine + t * ex_a + ey * ey_b + ez * ez_c)
+            grid.append(row)
+        return grid
+
+    # adaptive refinement: same measured sag probe as the N-rail fallback
+    station_list = [i / float(n_rail - 1) for i in range(n_rail)]
+    max_stations = _MULTIRAIL_STATION_FACTOR * n_rail
+    for _pass in range(_MULTIRAIL_STATION_PASSES):
+        room = max_stations - len(station_list)
+        if room <= 0:
+            break
+        grid = rows_for(station_list)
+        inserts = set()
+        for k in range(len(station_list) - 1):
+            if room <= 0:
+                break
+            row_a, row_b = grid[k], grid[k + 1]
+            sm = 0.5 * (station_list[k] + station_list[k + 1])
+            row_m = rows_for([sm])[0]
+            dev = 0.0
+            for j in range(m):
+                chord_mid = Vector((row_a[j].x + row_b[j].x) / 2.0,
+                                   (row_a[j].y + row_b[j].y) / 2.0,
+                                   (row_a[j].z + row_b[j].z) / 2.0)
+                dev = max(dev, row_m[j].distanceToPoint(chord_mid))
+            if dev > _MULTIRAIL_STATION_SAG * _MULTIRAIL_SPINE_TOL:
+                inserts.add(0.5 * (station_list[k] + station_list[k + 1]))
+                room -= 1
+        if not inserts:
+            break
+        grown = sorted(set(station_list) | inserts)
+        station_list = _dedupe_stations(grown)
+    grid = rows_for(station_list)
+
+    # finish like the other sweeps: explicit-parameter interpolation with
+    # the profile's own uniform column params (the rows reconstruct the
+    # profile's samples at every station), grid_to_surface on failure.
+    # v_vals == cols: for closed profiles the last column repeats col 0's
+    # point at param 1.0, which closes the row curve natively.
+    v_vals = _strictly_increasing(list(cols))
+    try:
+        shape = _grid_interpolation_surface(
+            grid, station_list, v_vals).toShape()
+    except Exception:
+        shape = grid_to_surface(grid)
+    return shape
+
+
 
 # --- N-sided fill (GeomPlate G0) ----------------------------------------- #
 def plate_fill(edges, tol=0.001):
@@ -2109,5 +2333,8 @@ __all__ = [
     '_try_gordon_route',
     'two_rail_sweep',
     'multi_rail_sweep',
+    'single_rail_sweep',
+    '_rail_tangent',
+    '_rmf_frames',
     'plate_fill',
 ]

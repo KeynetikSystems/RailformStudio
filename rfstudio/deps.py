@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
 """Engine dependency detection + lazy registration.
 
-Railform Studio is a DEPEND-AND-WRAP workbench: it does not contain Curves' or
-Silk's geometry, it drives them. So at startup we (a) detect whether each engine
-is installed, and (b) provide a way to force an engine's commands to register,
-because FreeCAD only runs a workbench's Initialize() (which calls addCommand)
-the first time that workbench is activated -- so a freshly-started session won't
-have Curves'/Silk's command ids registered until the user visits them once.
+Railform Studio is NATIVE-FIRST: every curated action ships its own OCCT
+implementation in rfstudio.core, so the workbench is fully self-contained.
+The optional Curves workbench is kept only as a FALLBACK engine for a
+handful of actions whose native path may still refuse an awkward selection
+(see engines.NATIVE_OVERRIDES). Silk was removed entirely -- every Silk
+action has a native replacement.
+
+So at startup we (a) detect whether that optional engine is installed, and
+(b) provide a way to force its commands to register, because FreeCAD only
+runs a workbench's Initialize() (which calls addCommand) the first time
+that workbench is activated -- so a freshly-started session won't have
+Curves' command ids registered until the user visits it once.
 """
 
 import os
@@ -15,7 +21,6 @@ import FreeCAD
 # Mod folder name -> (workbench registration name used by activateWorkbench)
 ENGINES = {
     "Curves": "CurvesWorkbench",
-    "Silk": "Silk",
 }
 
 
@@ -38,7 +43,7 @@ def installed(mod_name):
 
 
 def status():
-    """{'Curves': bool, 'Silk': bool} -- which engines are present."""
+    """{'Curves': bool} -- which optional engines are present."""
     return {name: installed(name) for name in ENGINES}
 
 
@@ -119,9 +124,10 @@ def verify_delegations(delegations):
 
 def report_single_points_of_failure(providers):
     """Curated actions whose ENTIRE provider chain (engines.PROVIDERS) is
-    engine-only, with no native fallback -- i.e. if Curves or Silk drops
-    or renames that command, the button is permanently dead until someone
-    writes a native replacement, not just until the addon is reinstalled.
+    engine-only, with no native fallback -- i.e. if the optional Curves
+    engine drops or renames that command, the button is permanently dead
+    until someone writes a native replacement, not just until the addon
+    is reinstalled.
 
     ProviderCommand (commands.py) already survives a single broken
     delegation by falling through its chain; this is the visibility
@@ -140,7 +146,7 @@ def report_single_points_of_failure(providers):
     if single_point:
         FreeCAD.Console.PrintMessage(
             "Railform Studio: %d curated command(s) rely ENTIRELY on an "
-            "installed engine (Curves/Silk) with no native fallback -- "
+            "installed engine (Curves) with no native fallback -- "
             "if that engine drops or renames the command, these stay "
             "broken until a native replacement is written: %s\n"
             % (len(single_point), ", ".join(single_point)))

@@ -54,7 +54,14 @@ class SurfacePanel(_EditPanelBase):
         lim_map = parametric.LIMITS.get(self.kind, {})
         for prop, title, hint in parametric.GROUPS[self.kind]:
             max_items = lim_map.get(prop, (None, None))[1]
-            g = _CurveGroup(self, prop, title, hint, max_items=max_items)
+            # SweepN's Rails list is order-sensitive (rail 0 and rail N-1
+            # bound the sweep; the spine fallback walks the rails in list
+            # order), so expose the reorder buttons for it specifically.
+            # Other link lists don't care about order, and the extra
+            # buttons would just invite meaningless reordering.
+            draggable = (self.kind == "SweepN" and prop == "Rails")
+            g = _CurveGroup(self, prop, title, hint, max_items=max_items,
+                            draggable=draggable)
             self.groups.append(g)
             self._lay.addWidget(g.box)
 
@@ -681,7 +688,7 @@ class SurfacePanel(_EditPanelBase):
         convert_layout.addWidget(QtWidgets.QLabel("Convert To:"))
         self.convert_type_combo = QtWidgets.QComboBox()
         # Add all surface types except the current one to avoid redundancy
-        surface_types = ["Loft", "Gordon", "Coons", "Sweep", "Fill", "Match", "BlendSurf", "ExtendSurf"]
+        surface_types = ["Loft", "Gordon", "Coons", "Sweep", "SweepN", "Fill", "Match", "BlendSurf", "ExtendSurf"]
         # Remove current type from the list to avoid redundancy in conversion
         if self.kind in surface_types:
             surface_types.remove(self.kind)
@@ -903,6 +910,28 @@ class SurfacePanel(_EditPanelBase):
                         new_obj.Rail1 = profiles
                         new_obj.Rail2 = profiles
 
+        elif target_type == "SweepN":
+            # Multi-rail sweep: one ordered Rails list + Profiles
+            if hasattr(new_obj, "Profiles"):
+                if "Profiles" in current_inputs:
+                    new_obj.Profiles = current_inputs["Profiles"]
+                elif "UCurves" in current_inputs and len(current_inputs["UCurves"]) >= 1:
+                    new_obj.Profiles = current_inputs["UCurves"]
+                elif "VCurves" in current_inputs and len(current_inputs["VCurves"]) >= 1:
+                    new_obj.Profiles = current_inputs["VCurves"]
+                elif "Boundaries" in current_inputs and len(current_inputs["Boundaries"]) >= 1:
+                    new_obj.Profiles = current_inputs["Boundaries"]
+            if hasattr(new_obj, "Rails"):
+                if "Rails" in current_inputs:
+                    new_obj.Rails = current_inputs["Rails"]
+                elif "GuideRails" in current_inputs:
+                    new_obj.Rails = current_inputs["GuideRails"]
+                elif ("Rail1" in current_inputs and "Rail2" in current_inputs
+                      and current_inputs["Rail1"] and current_inputs["Rail2"]):
+                    # two_rail_sweep's split rails -> one ordered list
+                    new_obj.Rails = list(current_inputs["Rail1"]) + \
+                                    list(current_inputs["Rail2"])
+
         elif target_type == "Fill":
             # Fill needs boundaries (>= 3)
             if hasattr(new_obj, "Boundaries"):
@@ -998,6 +1027,11 @@ class SurfacePanel(_EditPanelBase):
                 obj.Continuity = "G1/G2 (smooth)"
             if not hasattr(obj, "MaxDegree") or not obj.MaxDegree:
                 obj.MaxDegree = 5
+        elif surface_type == "SweepN":
+            # No Closed/Solid/Continuity/MaxDegree on SweepN -- only
+            # ProfileSamples/RailSamples, which already carry their own
+            # defaults. Nothing to force here.
+            pass
         elif surface_type == "Fill":
             if not hasattr(obj, "Samples") or not obj.Samples:
                 obj.Samples = (30, 8, 100, 1)

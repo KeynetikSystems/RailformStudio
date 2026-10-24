@@ -132,11 +132,18 @@ class LoftFP(_BaseFP):
                     if e]
         if len(profiles) < 1:
             return
-        if len(rails) >= 2 and profiles:
+        if rails and profiles:
             try:
-                obj.Shape = core.two_rail_sweep(
-                    rails[0], rails[1], profiles,
-                    n_rail=40, n_prof=20)
+                if len(rails) == 1:
+                    obj.Shape = core.single_rail_sweep(
+                        rails[0], profiles, n_rail=40, n_prof=20)
+                elif len(rails) == 2:
+                    obj.Shape = core.two_rail_sweep(
+                        rails[0], rails[1], profiles,
+                        n_rail=40, n_prof=20)
+                else:
+                    obj.Shape = core.multi_rail_sweep(
+                        rails, profiles, n_rail=40, n_prof=20)
                 groups.apply_input_visibility(obj, ["Profiles", "GuideRails"])
                 return
             except Exception as exc:
@@ -254,6 +261,51 @@ class Sweep2RailFP(_BaseFP):
             groups.apply_input_visibility(obj, ["Rail1", "Rail2", "Profiles"])
         except Exception as exc:
             FreeCAD.Console.PrintError("Railform Sweep: %s\n" % exc)
+
+
+class SweepNFP(_BaseFP):
+    """Multi-rail sweep: N >= 2 rails, interior rails anchor the surface too.
+
+    Reuses the same Profiles / ProfileSamples / RailSamples knobs as the
+    two-rail Sweep; the only structural difference is a single ordered
+    Rails link list (rail 0 and rail N-1 bound it, the ones between pin
+    intermediate sections exactly).
+    """
+    Kind = "SweepN"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        obj.addProperty("App::PropertyLinkList", "Rails", "SweepN",
+                        "Rail curves in order (>= 2); the first and last "
+                        "bound the sweep, intermediate rails anchor it")
+        obj.addProperty("App::PropertyLinkList", "Profiles", "SweepN",
+                        "Cross-section curves (at least one)")
+        obj.addProperty("App::PropertyIntegerConstraint", "ProfileSamples",
+                        "SweepN", "Cross-section sample count")
+        obj.ProfileSamples = (20, 2, 200, 1)
+        obj.addProperty("App::PropertyIntegerConstraint", "RailSamples",
+                        "SweepN", "Rail sample count")
+        obj.RailSamples = (40, 2, 500, 1)
+        obj.addProperty("App::PropertyBool", "ShowInputs", "SweepN",
+                        "Keep the source Rails/Profiles visible instead "
+                        "of auto-hiding them once the sweep builds")
+        obj.ShowInputs = False
+
+    def execute(self, obj):
+        rails = [e for e in (_first_edge(o) for o in (obj.Rails or [])) if e]
+        if len(rails) < 2:
+            return
+        profiles = [e for e in (_first_edge(o) for o in obj.Profiles or []) if e]
+        if not profiles:
+            return
+        try:
+            obj.Shape = core.multi_rail_sweep(
+                rails, profiles,
+                n_rail=int(obj.RailSamples),
+                n_prof=int(obj.ProfileSamples))
+            groups.apply_input_visibility(obj, ["Rails", "Profiles"])
+        except Exception as exc:
+            FreeCAD.Console.PrintError("Railform Multi-rail sweep: %s\n" % exc)
 
 
 class PlateFillFP(_BaseFP):
@@ -1132,7 +1184,8 @@ class MirrorGroupFP(_BaseFP):
 
 # --------------------------------------------------------------------------- #
 _FP = {"Loft": LoftFP, "Gordon": GordonFP, "Coons": CoonsFP,
-       "Sweep": Sweep2RailFP, "Fill": PlateFillFP, "Match": MatchSurfaceFP,
+       "Sweep": Sweep2RailFP, "SweepN": SweepNFP, "Fill": PlateFillFP,
+       "Match": MatchSurfaceFP,
        "Offset": OffsetFP, "Thicken": ThickenFP, "Shell": ShellFP,
        "ExtendSurf": ExtendSurfFP, "BlendSurf": BlendSurfFP, "N_sidedPatch": N_sidedPatchFP,
        "InterpCurve": InterpCurveFP, "ControlCurve": ControlCurveFP,
@@ -1142,6 +1195,7 @@ _FP = {"Loft": LoftFP, "Gordon": GordonFP, "Coons": CoonsFP,
        "MirrorGroup": MirrorGroupFP}
 _LABEL = {"Loft": "RailformLoft", "Gordon": "RailformGordon",
           "Coons": "RailformCoons", "Sweep": "RailformSweep",
+          "SweepN": "RailformSweepN",
           "ExtendSurf": "RailformExtendSurf",
           "Fill": "RailformFill", "Match": "RailformMatch",
           "Offset": "RailformOffset", "Thicken": "RailformThicken",
@@ -1164,6 +1218,11 @@ GROUPS = {
     "Sweep":  [("Rail1",    "Rail 1",    "Spine rail — one curve"),
                ("Rail2",    "Rail 2",    "Guide rail — one curve"),
                ("Profiles", "Profiles",  "Cross-section curves (≥ 1)")],
+    "SweepN": [("Rails",    "Rails",     "Rail curves in order (>= 2; "
+                                           "reorder with the arrows -- "
+                                           "the first and last bound the "
+                                           "sweep)"),
+               ("Profiles", "Profiles",  "Cross-section curves (≥ 1)")],
     "ExtendSurf": [("BaseSurface", "Base Surface", "Surface to extend")],
     "Fill":   [("Boundaries", "Boundaries", "Boundary curves (>= 3)")],
     "Match":  [("Reference", "Reference surfaces (one or more)"),
@@ -1184,6 +1243,7 @@ LIMITS = {"Loft":   {"Profiles": (2, None), "GuideRails": (0, None)},
           "Gordon": {},
           "Coons":  {"Boundaries": (4, 4)},
           "Sweep":  {"Rail1": (1, 1), "Rail2": (1, 1), "Profiles": (1, None)},
+          "SweepN": {"Rails": (2, None), "Profiles": (1, None)},
           "ExtendSurf": {"BaseSurface": (1, 1)},
           "Fill":   {"Boundaries": (3, None)},
           "Match":  {"Reference": (1, None), "Target": (1, 1)},

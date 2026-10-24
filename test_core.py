@@ -543,6 +543,136 @@ def test_multi_rail_sweep_spine_rejects_collapsed_rails():
     out("  multi-rail spine collapsed rails rejected OK")
 
 
+def test_single_rail_sweep_straight_pipe_closed_profile():
+    """The single-rail (pipe) sweep: a closed circular profile on a straight
+    spine produces a round tube -- every surface point sits at the offset
+    radius from the spine, the profile-sampled ring is ON the surface
+    (grid columns are exact), and between-columns sags are bounded by the
+    column count (the surface is the interpolant through them)."""
+    rail = spline([Vector(0, 0, 0), Vector(10, 0, 0)])
+    profile = Part.makeCircle(1.0, Vector(0, 0, 0), Vector(1, 0, 0))
+    assert profile.isClosed()
+    n_prof = 64
+    s = core.single_rail_sweep(rail, [profile], n_rail=21, n_prof=n_prof)
+    assert s.Faces, "pipe sweep produced no faces"
+    # radius hold: sample the face; every sample sits at offset radius 1
+    face = s.Faces[0]
+    surf = face.Surface
+    _u0, _u1, v0, v1 = face.ParameterRange
+    for k in range(7):
+        for j in range(7):
+            p = surf.value(_u0 + (k / 6.0) * (_u1 - _u0),
+                           v0 + (j / 6.0) * (v1 - v0))
+            r_off = math.sqrt(p.y * p.y + p.z * p.z)
+            assert abs(r_off - 1.0) < 5e-3, (
+                "tube leaks off radius: %g at (%g, %g, %g)"
+                % (r_off, p.x, p.y, p.z))
+            assert -1e-9 <= p.x <= 10.0 + 1e-9, p.x
+    # profile hold at the start: grid columns reconstruct the ring exactly
+    # (column params are k/(n_prof-1), the same spacing the sweep samples)
+    worst = 0.0
+    fp, lp = profile.FirstParameter, profile.LastParameter
+    for k in range(n_prof):
+        q = (k % n_prof) / float(n_prof - 1)
+        p = profile.valueAt(fp + q * (lp - fp))
+        worst = max(worst, Part.Vertex(p).distToShape(s)[0])
+    assert worst < 1e-9, "profile ring off the tube: %g" % worst
+    out("  single-rail straight pipe OK  dev=%.3e" % worst)
+
+
+def test_single_rail_sweep_preserves_offsets_on_curved_rail():
+    """RMF transport preserves each offset's LENGTH exactly (rotation only);
+    on a curved inflected spine the surface must therefore sit at a
+    CONSTANT normal distance from the rail -- any frame twist/flip shows
+    up as radius drift."""
+    rail = spline([Vector(0, 0, 0), Vector(5, 0, 2.0),
+                   Vector(10, 0, -1.0)])
+    profile = Part.makeCircle(0.5, Vector(0, 0, 0), _rail_start_axis(rail))
+    s = core.single_rail_sweep(rail, [profile], n_rail=25, n_prof=64)
+    face = s.Faces[0]
+    surf = face.Surface
+    _u0, _u1, _v0, _v1 = face.ParameterRange
+    worst = 0.0
+    for k in range(9):
+        for j in range(6):
+            p = surf.value(_u0 + (k / 8.0) * (_u1 - _u0),
+                           _v0 + (j / 5.0) * (_v1 - _v0))
+            d = Part.Vertex(p).distToShape(rail)[0]
+            worst = max(worst, abs(d - 0.5))
+    assert worst < 5e-3, "offset radius drifts on the curved spine: %g" % worst
+    out("  single-rail curved spine offsets OK  dev=%.3e" % worst)
+
+
+def _rail_start_axis(rail):
+    """Unit tangent at the rail START (not the chord), for planting a
+    profile perpendicular to it at the origin -- an oblique ring carries
+    large along-tangent offset components, and the RMF transport correctly
+    keeps that lean forever (rigid pipe behaviour), which would defeat a
+    radius probe."""
+    a, b = rail.FirstParameter, rail.LastParameter
+    eps = (b - a) * 1e-3
+    t = rail.valueAt(a + eps).sub(rail.valueAt(a))
+    t.normalize()
+    return t
+
+
+def test_rmf_frames_no_twist_flip_on_inflected_spine():
+    """_rmf_frames (double reflection) must NOT flip its up vector across an
+    inflection (Frenet flips there) and must keep the frames orthonormal
+    throughout -- an S-curve is the canonical case."""
+    arc = core._ArcRail(spline([Vector(0, 0, 0), Vector(5, 0, 2.0),
+                                Vector(10, 0, -1.0)]))
+    stations = [i / 32.0 for i in range(33)]
+    frames = core._rmf_frames(arc, stations, Vector(0, 1, 0))
+    worst_ortho = 0.0
+    for i in range(len(frames) - 1):
+        t_i, ey_i, ez_i = frames[i]
+        t_j, ey_j, _ez_j = frames[i + 1]
+        assert ey_i.dot(ey_j) > 0.0, "up vector flipped at station %d" % i
+        worst_ortho = max(worst_ortho, abs(t_i.dot(ey_i) - 0.0),
+                          abs(t_i.dot(ez_i) - 0.0), abs(ey_i.dot(ez_i) - 0.0))
+    assert worst_ortho < 1e-9, "frames lost orthonormality: %g" % worst_ortho
+    out("  single-rail RMF no-flip inflection OK")
+
+
+def test_single_rail_sweep_morphs_multiple_profiles():
+    """Two profiles pinned at different arc stations: the surface passes
+    through BOTH rings at their own stations (grid columns are exact,
+    per-profile sampling aligned to the column params) while the sections
+    morph between them."""
+    rail = spline([Vector(0, 0, 0), Vector(10, 0, 0)])
+    n_prof = 16
+    pro_a = Part.makeCircle(1.0, Vector(0, 0, 0), Vector(1, 0, 0))
+    pro_b = Part.makeCircle(0.5, Vector(5, 0, 0), Vector(1, 0, 0))
+    s = core.single_rail_sweep(rail, [pro_a, pro_b], n_rail=21,
+                               n_prof=n_prof)
+    assert s.Faces, "morph sweep produced no faces"
+    worst = 0.0
+    for pro in (pro_a, pro_b):
+        fp, lp = pro.FirstParameter, pro.LastParameter
+        for k in range(n_prof):
+            q = (k % n_prof) / float(n_prof - 1)
+            p = pro.valueAt(fp + q * (lp - fp))
+            worst = max(worst, Part.Vertex(p).distToShape(s)[0])
+    assert worst < 1e-9, "pinned profiles off the morph sweep: %g" % worst
+    out("  single-rail multi-profile morph OK  dev=%.3e" % worst)
+
+
+def test_single_rail_sweep_rejects_degenerate_rail():
+    """A zero-length rail has nothing to sweep along -- refuse with a
+    message instead of producing garbage. (A tiny circle edge constructs
+    fine; an interpolated spline segment that short already fails down in
+    BSplineCurve.interpolate, so a circle exercises OUR guard.)"""
+    rail = Part.makeCircle(1e-10, Vector(0, 0, 0), Vector(0, 0, 1))
+    profile = Part.makeCircle(1.0, Vector(0, 0, 0), Vector(1, 0, 0))
+    try:
+        core.single_rail_sweep(rail, [profile], n_rail=5)
+        raise AssertionError("expected ValueError for degenerate rail")
+    except ValueError as exc:
+        assert "degenerate" in str(exc) or "zero length" in str(exc), exc
+    out("  single-rail degenerate rail rejected OK")
+
+
 def test_spine_invert_first_crossing_on_swaying_profile():
     """_spine_invert must return the FIRST profile-param crossing, not the
     last one a monotone-bisection assumption happens to land on: a profile
@@ -3650,6 +3780,11 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_multi_rail_sweep_spine_profiles_exact_at_stations,
               test_multi_rail_sweep_spine_adaptive_bounds_rail_sag,
               test_multi_rail_sweep_spine_rejects_collapsed_rails,
+              test_single_rail_sweep_straight_pipe_closed_profile,
+              test_single_rail_sweep_preserves_offsets_on_curved_rail,
+              test_rmf_frames_no_twist_flip_on_inflected_spine,
+              test_single_rail_sweep_morphs_multiple_profiles,
+              test_single_rail_sweep_rejects_degenerate_rail,
               test_spine_invert_first_crossing_on_swaying_profile,
               test_rail_order_warning_flags_zigzag,
               test_try_gordon_route_gates,

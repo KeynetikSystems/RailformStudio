@@ -181,7 +181,7 @@ _PANEL_NEEDS_SELECTION = {
     "RFS_NetworkAudit", "RFS_SurfaceReview", "RFS_GaussianCurvature",
     "RFS_BlendSurf", "RFS_BlendSurfClosed", "RFS_TrimByIntersection",
     "RFS_MeshToSurface", "RFS_HiddenLineExport", "RFS_Mirror",
-    "RFS_Sweep2Rail", "RFS_Fill",
+    "RFS_Sweep2Rail", "RFS_SweepN", "RFS_Fill",
 }
 
 # Commands that modify/destroy geometry -- require explicit confirmation.
@@ -329,7 +329,8 @@ class HealthResetCommand:
 class PanelCommand:
     """Opens one of our curated task panels."""
 
-    def __init__(self, factory, menu, tip, icon):
+    def __init__(self, cmd_id, factory, menu, tip, icon):
+        self._id = cmd_id  # used by IsActive (selection gating) / Activated
         self._factory = factory     # callable -> task-panel instance
         self._res = {"MenuText": menu, "ToolTip": tip, "Pixmap": _icon(icon)}
 
@@ -512,6 +513,12 @@ _PANEL_COMMANDS = {
                         "Two-rail sweep",
                         "Sweep profiles along two rail curves — select Rail 1, Rail 2, Profiles.",
                         "rfs_sweep.svg"),
+    # Multi-rail sweep: interior rails pin intermediate sections exactly
+    "RFS_SweepN":      (_surface_panel("SweepN"),
+                        "Multi-rail sweep",
+                        "Sweep profiles along 2 or more rail curves — every rail "
+                        "(not just the outer two) anchors the surface. Select Rails, Profiles.",
+                        "rfs_sweep.svg"),
     # N-sided fill via OCCT GeomPlate
     "RFS_Fill":        (_surface_panel("Fill"),
                         "N-sided fill",
@@ -609,9 +616,9 @@ _DELEGATE_META = {
     "RFS_BlendSurf":    ("Blend surface", "G1/G2 blend strip between two edges (Curves).", "rfs_blend.svg"),
     "RFS_Trim":         ("Trim surface", "Trim a face with a curve (native; falls back to Curves).", "rfs_trim.svg"),
     "RFS_SketchOnSurf": ("Sketch on surface", "Project a curve onto a surface (native; falls back to Curves).", "rfs_sos.svg"),
-    "RFS_CleanPatch44": ("Clean patch 4x4", "Low-CP bicubic patch from a control grid (native; falls back to Silk).", "rfs_patch44.svg"),
-    "RFS_CleanPatch66": ("Clean patch 6x6", "Low-CP bi-quintic patch (native; falls back to Silk).", "rfs_patch66.svg"),
-    "RFS_ControlPoly4": ("Control poly (cubic)", "Cubic control polygon from 4 points (native; falls back to Silk).", "rfs_poly.svg"),
+    "RFS_CleanPatch44": ("Clean patch 4x4", "Low-CP bicubic patch from a control grid (native).", "rfs_patch44.svg"),
+    "RFS_CleanPatch66": ("Clean patch 6x6", "Low-CP bi-quintic patch (native).", "rfs_patch66.svg"),
+    "RFS_ControlPoly4": ("Control poly (cubic)", "Cubic control polygon from 4 points (native).", "rfs_poly.svg"),
     "RFS_StarPatch":    ("Star-point patch", "N-sided patch (native; exact "
                        "G0 / tangent-plane G1 continuity).",
                        "rfs_star.svg"),
@@ -670,7 +677,7 @@ TOOLBARS = [
                           "RFS_FilletPolyline", "RFS_JoinCurve", "RFS_DrawFreehand",
                           "RFS_Sketch3D"]),
     ("Railform Surface", ["RFS_Loft", "RFS_Gordon", "RFS_Coons",
-                          "RFS_MultiLoft", "RFS_Sweep2Rail", "RFS_Fill",
+                          "RFS_MultiLoft", "RFS_Sweep2Rail", "RFS_SweepN", "RFS_Fill",
                           "RFS_MatchSurf", "RFS_BlendSurf",
                           "RFS_BlendSurfClosed", "RFS_Trim",
                           "RFS_TrimByIntersection", "RFS_SketchOnSurf",
@@ -709,7 +716,7 @@ def command_info(cmd_id):
 def register():
     """Instantiate + addCommand every curated command. Called from Initialize."""
     for cmd_id, (panel, menu, tip, icon) in _PANEL_COMMANDS.items():
-        FreeCADGui.addCommand(cmd_id, PanelCommand(panel, menu, tip, icon))
+        FreeCADGui.addCommand(cmd_id, PanelCommand(cmd_id, panel, menu, tip, icon))
     for cmd_id, (menu, tip, icon) in _DELEGATE_META.items():
         if cmd_id == "RFS_ResetHealth":
             continue   # registered below as a plain command, not a provider

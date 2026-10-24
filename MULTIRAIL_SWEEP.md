@@ -110,9 +110,12 @@ profile to ~1e-15 (e.g. `test_multi_rail_sweep_gordon_route_holds_rails_continuo
 `Railform Loft` execute path:
 
 ```python
-if len(rails) >= 2 and profiles:
+if rails and profiles:
     try:
-        if len(rails) >= 3:
+        if len(rails) == 1:
+            obj.Shape = core.single_rail_sweep(
+                rails[0], profiles, n_rail=40, n_prof=20)
+        elif len(rails) >= 3:
             obj.Shape = core.multi_rail_sweep(
                 rails, profiles, n_rail=40, n_prof=20)
         else:
@@ -124,6 +127,15 @@ if len(rails) >= 2 and profiles:
     except Exception as exc:
         ...fall back to plain loft...
 ```
+
+The 1-rail branch is the single-rail pipe sweep (`single_rail_sweep`,
+`_rmf_frames`, `_rail_tangent` live next to the multi-rail helpers in
+`patches.py`): the rail itself is the spine and a rotation-minimizing
+frame (Wang double reflection) supplies the orientation the second rail
+would have. It reuses this document's fallback machinery for everything
+downstream of the frames — `_ArcRail` stations, adaptive midpoint sag
+subdivision, `_NearestTCache`, the interpolation finisher with the
+`grid_to_surface` fallback — so see the sections above for those parts.
 
 Previously any number of guide rails silently used only `rails[0]`/`rails[1]`; now 3+ actually use all rails.
 
@@ -150,8 +162,15 @@ Registered in the headless test list:
 17. `test_multi_rail_sweep_spine_profiles_exact_at_stations` — the spine fallback's anchor stations reconstruct each profile curve (~9e-12 vs a 1e-3 gate).
 18. `test_multi_rail_sweep_spine_adaptive_bounds_rail_sag` — adaptive station subdivision holds the boundary rail to ~8e-8 (5e-3 gate).
 19. `test_multi_rail_sweep_spine_rejects_collapsed_rails` — rails that touch mid-sweep raise instead of skinning garbage.
+20. `test_single_rail_sweep_straight_pipe_closed_profile` — 1-rail pipe sweep over a straight spine holds tube radius (~2.4e-16 at the anchor ring; radius within 5e-3 everywhere).
+21. `test_single_rail_sweep_preserves_offsets_on_curved_rail` — RMF transport on an inflected S-spine keeps the offset radius within 5e-3 (~3.6e-4 measured).
+22. `test_rmf_frames_no_twist_flip_on_inflected_spine` — `_rmf_frames` up vector never flips across the inflection, frames stay orthonormal.
+23. `test_single_rail_sweep_morphs_multiple_profiles` — two pinned profiles land exactly on the morph sweep (~9.2e-16), sections morph between anchors.
+24. `test_single_rail_sweep_rejects_degenerate_rail` — zero-length rail raises `ValueError` instead of sweeping garbage.
 
 Fixtures use `_rails_profiles()`: two X-aligned boundary rails (y=0, y=5), optional middle rail (y=2.5), three cross profiles spanning rail1→rail2 at x=0/5/10 with a central bump; `_consistent_rails_profiles()` is the well-formed variant whose profiles genuinely run through all three rails.
+
+Single-rail fixtures plant the profile perpendicular to the rail's START TANGENT (`_rail_start_axis`), not the chord — an oblique ring carries large along-tangent offset components and RMF transport correctly keeps that lean forever (rigid pipe behaviour), which would defeat a radius probe.
 
 ## How to run
 
