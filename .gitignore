@@ -13,6 +13,11 @@ gui_commands_probe.FCStd
 Refined_Grant_Proposal.md
 test_gui_commands.py
 
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+
 # OS
 Thumbs.db
 .DS_Store
