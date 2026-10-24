@@ -1,21 +1,28 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
   <name>Railform Studio</name>
-  <description>Curated curve-to-surface workbench: depends on Curves + Silk, presents them under one workflow-ordered UX, adds Blender Railform rail import.</description>
+  <description>Curated curve-to-surface workbench for automotive-grade modeling. Ships native OCCT implementations of every curated action, so it runs fully standalone; the Curves workbench is an optional fallback engine for a few selections. Adds a workflow-ordered UX and Blender Railform rail import.</description>
   <version>0.1.0</version>
-  <date>2026-10-05</date>
+  <date>2026-10-24</date>
   <maintainer email="fkemuntoh@gmail.com">Kelvin</maintainer>
   <license file="LICENSE">GPL-3.0-or-later</license>
+  <!-- TODO before publishing: no git remote is configured yet. Create the
+       GitHub repository, add it as a remote, and replace REPLACE-ME below
+       with the real owner/repo in all three URLs. The Addon Manager reads
+       the repository URL. -->
+  <url type="repository" branch="main">https://github.com/REPLACE-ME/RailformStudio</url>
+  <url type="readme">https://github.com/REPLACE-ME/RailformStudio/blob/main/README.md</url>
+  <url type="bugtracker">https://github.com/REPLACE-ME/RailformStudio/issues</url>
+  <!-- freecadmin is the declared minimum. The APIs used are all 1.0-era, but
+       this has only been exercised against FreeCAD 1.1; test on 1.0 before
+       relying on that floor, or raise it to 1.1. -->
   <freecadmin>1.0</freecadmin>
   <content>
     <workbench>
       <classname>RailformStudioWorkbench</classname>
       <subdirectory>./</subdirectory>
-      <description>Curated surfacing over Curves + Silk</description>
+      <icon>rfstudio/resources/rfstudio.svg</icon>
+      <description>Curated native OCCT surfacing, with an optional Curves fallback engine.</description>
     </workbench>
   </content>
-  <!-- depend-and-wrap: Curves + Silk are OPTIONAL runtime fallbacks.
-       Railform Studio ships native OCCT implementations of every curated
-       action, so it operates fully standalone. Install Curves/Silk only for
-       the engine-first path on RFS_StarPatch (true G2 vs native near-G2). -->
 </package>

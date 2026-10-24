@@ -10,6 +10,50 @@ fresh `Unreleased` section above it.
 
 ## Unreleased
 
+## 0.1.0 — 2026-10-24
+
+First packaged release (GPL-3.0 LICENSE added; package.xml/README updated to
+the native-first, Silk-free architecture).
+
+### Added
+- UIX — left **tool shelf**: filter box, collapsible sections with remembered
+  state, and buttons greyed when their only engine is missing
+  (`engines.missing_engine_for`).
+- UIX — **snap feedback**: ranked snapping now shows which kind engaged, as
+  FreeCAD Draft-matching markers (filled circle for vertex/intersection, hollow
+  for on-curve; shape + size follow Draft's `snapStyle`/`MarkerSize` prefs)
+  coloured per kind; Vertex/Edge/Intersection on/off toggles; a live ΔXYZ /
+  distance readout on the status bar during a drag; failed tool-shelf clicks
+  flash on the status bar instead of only printing to the Report view.
+- UIX — **B-spline knots** are shown as cyan diamonds on the curve throughout
+  authoring/editing, updating live.
+- UIX — the points table now **inherits the active FreeCAD theme** (no
+  hard-coded colours); flat hover-red delete button.
+- Single-rail pipe sweep: `core.single_rail_sweep(rail, profiles, n_rail,
+  n_prof)` -- the classic ONE-profile/ONE-rail sweep the other sweeps
+  couldn't do (they all need >= 2 rails because the second rail supplied
+  the section's orientation). The rail is the spine; orientation comes
+  from a rotation-minimizing frame transported by Wang et al. double
+  reflection (`_rmf_frames`, `_rail_tangent`), so the profile rides the
+  curve the way makePipeShell(RMF) does: each station rebuilds the
+  profile's original offsets in the transported frame (offset lengths
+  preserved exactly, sections keep their frame-relative lean instead of
+  shearing with world axes), closed profiles close the tube (their own
+  param-0 == param-1 seam supplies the wrap column -- an extra duplicate
+  col would put two identical points a param nudge apart, which OCC's
+  interpolator rejects outright), multiple profiles pin at their own
+  nearest-arc station and morph linearly between anchors (the
+  two_rail_sweep description-blending mechanism). Stations reuse the
+  N-rail fallback's measured midpoint-sag adaptive subdivision (same
+  4x-station budget / sag constants), and the finish runs the
+  explicit-parameter interpolation grid with a grid_to_surface fallback.
+  Railform Loft routes: 1 rail -> single_rail_sweep, 2 -> two_rail_sweep,
+  3+ -> multi_rail_sweep, all with the plain-loft fallback on failure.
+  New headless tests: straight closed-pipe radius hold (~2.4e-16), curved
+  S-spine offset-radius hold (~3.6e-4), RMF no-flip across inflection,
+  multi-profile morph (profiles exact to ~9.2e-16), degenerate-rail
+  rejection.
+
 ### Fixed
 - Multi-rail sweep spine fallback desynced stations when rails carried RAW
   edge parameters: `_ArcRail`, the port of the C++ transport's ArcCurve

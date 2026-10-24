@@ -1,91 +1,95 @@
 # Railform Studio (FreeCAD workbench)
 
-A **curated, depend-and-wrap** curve→surface workbench. It does **not** contain
-its own surfacing kernel code — it drives two engines you already have:
+A curated **curve → surface** workbench for automotive-grade modeling. It ships
+**native OCCT implementations of every curated action**, so it runs fully
+standalone — no mandatory third-party workbench. The optional **Curves**
+workbench (Grellier) is used only as a *fallback engine* for a handful of
+selections the native path doesn't yet resolve. (Earlier versions depended on
+Curves + **Silk**; Silk has been removed entirely and every Silk-backed action
+now has a native OCCT replacement.)
 
-- **Curves** (Grellier) — curve tools, engineering surfaces (sweep/loft/gordon/
-  blend), diagnostics (combs, zebra, reflect-lines, surface analysis).
-- **Silk** (Mills) — clean low-control-point patches + n-sided G2 star points.
-
-…and presents them under one small, workflow-ordered UX, plus **Blender
-Railform rail import**.
+Railform Studio presents these tools under one small, workflow-ordered UX
+(a docked tool shelf grouped Draw → Surface → Clean → Solids → Inspect →
+Exchange), adds viewport authoring/editing aids (Blender-style point editing,
+kind-coloured snapping, in-view knot display), and imports **Blender Railform
+rails**.
 
 See [CHANGELOG.md](CHANGELOG.md) for what's changed recently.
 
-## Why depend-and-wrap
-Curves + Silk already do the geometry (well). Their weakness is UX:
-~130 flat commands, most tuned via the Property editor, no workflow guidance.
-Railform Studio adds the missing curated layer + orchestration without
-inheriting their maintenance or forking their code.
+## Dependencies
+- **Required:** none beyond FreeCAD itself (geometry is pure OCCT via `Part`).
+- **Optional:** the **Curves** workbench — install it only for the engine-first
+  fallback path on a few actions (e.g. `RFS_StarPatch`: Curves' true-G2 star
+  vs. the native near-G2 Gregory construction). Everything works without it;
+  the workbench reports at activation which optional engine, if any, it found.
+
+Every curated action has an ordered **provider chain** (`engines.PROVIDERS`):
+a native implementation first, the Curves command as a fallback where one
+exists. `deps.report_single_points_of_failure` therefore reports an empty list
+— no curated action depends on a single external engine any more.
+`engines.validate_providers()` statically checks every chain (typo'd native
+names, unknown provider kinds, DELEGATIONS/PROVIDERS drift) at workbench
+activation and in `test_core.py`.
 
 ## Layout
-| File | Role | Testable headless? |
+| Path | Role | Testable headless? |
 |------|------|--------------------|
-| `rfstudio/core.py` | **Gui-free** geometry: OCCT loft fallback + Blender rail interchange (JSON → exact NURBS) | ✅ `test_core.py` |
-| `rfstudio/deps.py` | Engine detection + lazy command registration | partial |
-| `rfstudio/engines.py` | Delegation map (curated action → engine command id) | no |
-| `rfstudio/panel_base.py` | Shared panel scaffolding: selection helpers, `_CurveGroup` widget, `_EditPanelBase`/`_ReportPanelBase` (open/commit/abort-transaction + resetEdit/closeDialog teardown, once) | ❌ GUI only |
-| `rfstudio/panel_curve.py` | `CurvePanel`, `BlendPanel` | ❌ GUI only |
-| `rfstudio/panel_surface.py` | `SurfacePanel`, `LoftPanel`, `OffsetThickenPanel`, `ShellPanel`, `BlendSurfPanel` | ❌ GUI only |
-| `rfstudio/panel_qa.py` | `ContinuityCheckPanel`, `NetworkAuditPanel`, `SurfaceReviewPanel`, `WorkflowGuidePanel` | ❌ GUI only |
-| `rfstudio/panel_import.py` | `ImportRailsPanel` | ❌ GUI only |
-| `rfstudio/taskpanels.py` | Re-export shim over the `panel_*` modules above, kept for backward-compatible imports | ❌ GUI only |
+| `rfstudio/core/` | **Gui-free** geometry package: OCCT surfacing, curves, trimming, manufacturing, QA, Blender rail interchange (JSON → exact NURBS) | ✅ `test_core.py` |
+| `rfstudio/parametric.py` | Parametric FeaturePython objects (Loft, Gordon, Coons, sweeps, mirror, …) | partial |
+| `rfstudio/engines.py` | Provider chains (native-first) + the Curves fallback map | partial |
+| `rfstudio/deps.py` | Optional-engine detection + lazy command registration | partial |
+| `rfstudio/panel_base.py` | Shared panel scaffolding: selection helpers, `_CurveGroup`, `_EditPanelBase`/`_ReportPanelBase` (open/commit/abort-transaction + teardown) | ❌ GUI only |
+| `rfstudio/panel_*.py` | Task panels: curve, surface, solids, QA, import, sketch3d, nurbspull, lawcurve | ❌ GUI only |
+| `rfstudio/editmode.py` | In-viewport editors (control points, knots, Bezier handles) + snapping | ❌ GUI only |
+| `rfstudio/toolshelf.py` | Left-docked tool shelf (filter, collapsible sections, engine-aware greying) | ❌ GUI only |
+| `rfstudio/snaputil.py` · `snapsettings.py` · `statusbar.py` | Ranked snapping, snap on/off settings, status-bar messaging | snaputil ✅ |
 | `rfstudio/commands.py` | `ProviderCommand` + `PanelCommand` + curated toolbars | ❌ GUI only |
-| `InitGui.py` | Workbench registration | ❌ GUI only |
+| `InitGui.py` · `rfstudio/workbench.py` | Workbench registration | ❌ GUI only |
 
-> **Design rule:** Silk/Curves import `FreeCAD.Gui` at load, so they can't run
-> under `freecadcmd`, and neither can anything that imports them (which
-> includes every `rfstudio.panel_*` module, transitively via `FreeCADGui`
-> itself). Anything we want to verify headlessly therefore lives in
-> `core.py` (geometry) or `panel_logic.py` (panel decision logic, no
-> FreeCADGui/PySide dependency); the rest -- widget layout, dialogs opening,
-> viewport overlays -- is GUI-tested by hand.
-
-**Provider chains:** every curated action in the "delegation" toolbar
-has an ordered provider chain (`engines.PROVIDERS`): a native
-implementation first where one exists, the original Curves/Silk command
-as fallback. `deps.report_single_points_of_failure` therefore reports
-an empty list — no curated action depends on a single engine any more.
-`engines.validate_providers()` statically checks every chain (typo'd
-native names, unknown provider kinds, DELEGATIONS/PROVIDERS drift) at
-workbench activation and in `test_core.py`.
+> **Design rule:** Curves imports `FreeCAD.Gui` at load, and so does anything
+> that imports a `rfstudio.panel_*` module (transitively via `FreeCADGui`), so
+> those can't run under `freecadcmd`. Everything we verify headlessly therefore
+> lives in `rfstudio/core/` (geometry) or `panel_logic.py` (panel decision
+> logic, no FreeCADGui/PySide dependency); the rest — widget layout, dialogs,
+> viewport overlays — is GUI-tested by hand.
 
 ## Verify headlessly
 ```powershell
 & "C:\Program Files\FreeCAD 1.1\bin\freecadcmd.exe" test_core.py
 & "C:\Program Files\FreeCAD 1.1\bin\freecadcmd.exe" test_panel_logic.py
 python rfstudio\test_gui_imports.py        # GUI static smoke (<1s, no FreeCAD)
-python test_gui_checks_selftest.py         # mutation-tests the harness itself
 python test_panel_base.py                  # panel scaffolding (mocked Qt)
 ```
-Expect `core tests done` / `panel_logic tests done` with no `FAIL` lines,
-and `All checks passed (25 modules, ...)` from the GUI harness. The GUI
-harness fakes FreeCAD/Qt/Coin and statically checks the whole panel
-layer: mocked imports, undefined self-calls, bare undefined names,
-cross-module references, import-time Qt class bases, and event-callback
-add/remove/null symmetry — it has caught real shipped bugs (deleted
-class headers, a stranded widget block in the sketch panel).
-(`test_panel_logic.py` has no FreeCAD dependency at all -- `python
-test_panel_logic.py` also works.)
+Expect `core tests done` / `panel_logic tests done` with no `FAIL` lines, and
+`All checks passed (27 modules, ...)` from the GUI harness. That harness fakes
+FreeCAD/Qt/Coin and statically checks the whole panel layer — mocked imports,
+undefined self-calls, bare undefined names, cross-module references,
+import-time Qt class bases, and event-callback add/remove/null symmetry. It has
+caught real shipped bugs (deleted class headers, a stranded widget block in the
+sketch panel). It cannot verify runtime behavior — that needs a live FreeCAD
+session (see below).
 
 ## GUI smoke test (what only real Qt/Coin can show)
 1. Restart FreeCAD → pick **Railform Studio** in the workbench dropdown.
-2. Report panel should say "Curves + Silk detected" (or warn what's missing).
-3. Toolbars appear: **Rails / Surface / Clean / Inspect / Exchange**.
-4. **Delegation:** draw 2 sketches, click *Two-rail sweep* → it should bounce
-   into the Curves command. (Tests `deps.ensure_engine_commands` + `runCommand`.)
-5. **Custom panel:** draw 3 spline rails, click *Loft through rails* → a task
-   panel opens → "Set rails from selection" → OK → a surface is built.
-6. **Silk delegation:** click *Clean patch 4x4* → should fire Silk's command.
+2. The Report view should say which optional engine was detected, or that it's
+   running standalone (no Curves).
+3. The left **Railform Tools** shelf appears, grouped Draw / Surface / Clean /
+   Solids / Inspect / Exchange; the filter box and collapsible sections work.
+4. **Native action:** draw ≥ 3 spline points, create a curve, open it for
+   editing — control points, knots (cyan diamonds) and axis arrows show in the
+   viewport; dragging a point updates the curve live.
+5. **Surface:** build a loft/sweep from profiles → a surface is created and
+   re-editable.
+6. **Fallback (optional):** with Curves installed, an action whose native path
+   refuses a selection should bounce into the Curves command.
 
 ### Most likely things to break (and where to look)
-- Workbench doesn't appear → `InitGui.py` import error; check the Report view.
-- Delegating command does nothing → engine command id mismatch or the
-  workbench-bounce in `deps.ensure_engine_commands` failed; check the warning.
-- Task panel doesn't open → PySide import form (`from PySide import QtGui`);
-  on some 1.1 builds widgets are under `QtWidgets`.
+- Workbench doesn't appear → `InitGui.py`/`workbench.py` import error; check the
+  Report view.
+- A toolbar button errors → provider-chain failure; it now also flashes on the
+  status bar (see `statusbar.flash`), with detail in the Report view.
+- Task panel doesn't open → PySide import form; on some 1.1 builds widgets are
+  under `QtWidgets` (handled by `compat.get_qt_widgets`).
 
 ## License
-GPL-3.0-or-later (conservative: chosen so Silk code could later be vendored).
-Pure runtime delegation doesn't strictly require it — relax if you never bundle
-Silk.
+[GPL-3.0-or-later](LICENSE).
