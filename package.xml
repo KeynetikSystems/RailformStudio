@@ -6,16 +6,12 @@
   <date>2026-10-24</date>
   <maintainer email="fkemuntoh@gmail.com">Kelvin</maintainer>
   <license file="LICENSE">GPL-3.0-or-later</license>
-  <!-- TODO before publishing: no git remote is configured yet. Create the
-       GitHub repository, add it as a remote, and replace REPLACE-ME below
-       with the real owner/repo in all three URLs. The Addon Manager reads
-       the repository URL. -->
-  <url type="repository" branch="main">https://github.com/REPLACE-ME/RailformStudio</url>
-  <url type="readme">https://github.com/REPLACE-ME/RailformStudio/blob/main/README.md</url>
-  <url type="bugtracker">https://github.com/REPLACE-ME/RailformStudio/issues</url>
-  <!-- freecadmin is the declared minimum. The APIs used are all 1.0-era, but
-       this has only been exercised against FreeCAD 1.1; test on 1.0 before
-       relying on that floor, or raise it to 1.1. -->
+  <url type="repository" branch="main">https://github.com/KeynetikSystems/RailformStudio</url>
+  <url type="readme">https://github.com/KeynetikSystems/RailformStudio/blob/main/README.md</url>
+  <url type="bugtracker">https://github.com/KeynetikSystems/RailformStudio/issues</url>
+  <!-- The APIs used are all 1.0-era; freecadmin is kept at 1.0 as the
+       declared floor. This has only been exercised against FreeCAD 1.1 —
+       if an issue surfaces on 1.0, raise the floor instead. -->
   <freecadmin>1.0</freecadmin>
   <content>
     <workbench>
