@@ -10,6 +10,22 @@ fresh `Unreleased` section above it.
 
 ## Unreleased
 
+### Fixed (GUI)
+- **Viewpanel freeze/crash (multiloft repro): task panels no longer pump the
+  Qt event loop from inside signal handlers.** Every panel change funnels
+  through `recompute()` → `obj.recompute()` + `FreeCADGui.updateGui()`
+  (`panel_base._CurveGroup._commit`, each panel's `_set`) — and a synchronous
+  `updateGui()` while a `valueChanged`/`clicked` stack is live lets the next
+  input event fire on top of it. A Degree-slider drag fires dozens of
+  `_set` calls per pixel, each pumping events: re-entrant recomputes of the
+  SAME parametric shape. New shared `_RecomputeGuard` mixin in
+  `panel_base.py` shared by both panel bases: `_recompute_obj()` (nested
+  re-entrant recomputes are skipped) and `_defer_gui_update()` (the event
+  pump moves to a zero-shot `QTimer.singleShot(0, ...)` tick, coalesced —
+  a burst of `_set` calls schedules exactly one redraw after the stack
+  unwinds). All 43 call sites across panel_surface/panel_curve/panel_solids
+  converted.
+
 ## 0.1.0 — 2026-10-24
 
 First packaged release (GPL-3.0 LICENSE added; package.xml/README updated to

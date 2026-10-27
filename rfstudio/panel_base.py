@@ -124,9 +124,73 @@ def _notify_overlay_unavailable(panel, feature_name, exc):
 
 
 # ---------------------------------------------------------------------- #
+# Signal-safe recompute / gui-update helpers.
+# ---------------------------------------------------------------------- #
+class _RecomputeGuard(object):
+    """Mixin for task panels: re-entrancy-guarded recompute +
+    a COALESCED, DEFERRED FreeCADGui.updateGui().
+
+    Panels drive geometry changes from Qt signal handlers (slider/spinner
+    valueChanged, button clicked). Pumping the Qt event loop SYNCHRONOUSLY
+    from inside such a handler (a bare FreeCADGui.updateGui() does exactly
+    that) lets the next queued input event fire on top of the live handler
+    stack. A Degree-slider drag fires dozens of _set calls per pixel, each
+    ending in updateGui() => re-entrant recomputes of the SAME parametric
+    shape: the recipe behind the observed multiloft freeze-then-crash
+    (Report-view recompute bar never drains = freeze; the OCC shape of a
+    half-finished recompute gets pushed while the renderer still holds
+    it = native access violation).
+
+    Two defences, shared by every panel:
+    * _recompute_obj()      -- a re-entrant call while one recompute is
+      already on the stack is skipped (the pending property write has
+      already landed; the newest state gets the next tick's recompute).
+    * _defer_gui_update()   -- the event pump moves to a zero-shot Qt
+      timer tick, coalesced: any burst of _set calls inside one handler
+      schedules exactly ONE redraw after the stack unwinds.
+    """
+
+    _recompute_depth = 0
+    _gui_update_scheduled = False
+
+    def _recompute_obj(self):
+        """self.obj.recompute(); nested (re-entrant) calls are no-ops."""
+        if self._recompute_depth:
+            return
+        self._recompute_depth += 1
+        try:
+            self.obj.recompute()
+        finally:
+            self._recompute_depth -= 1
+
+    def _defer_gui_update(self):
+        """Schedule ONE coalesced FreeCADGui.updateGui() on a zero-shot Qt
+        timer -- never pump the event loop synchronously from a signal
+        handler. Fire-and-forget; falls back to a direct (non-pumping)
+        call only if Qt timers are unavailable."""
+        if self._gui_update_scheduled:
+            return
+        self._gui_update_scheduled = True
+
+        def _tick():
+            self._gui_update_scheduled = False
+            try:
+                _ensure_freecadgui()
+                FreeCADGui.updateGui()
+            except Exception:
+                pass
+
+        try:
+            from PySide import QtCore
+            QtCore.QTimer.singleShot(0, _tick)
+        except Exception:
+            _tick()
+
+
+# ---------------------------------------------------------------------- #
 # _EditPanelBase -- parametric-object task panels (commit/abort transaction)
 # ---------------------------------------------------------------------- #
-class _EditPanelBase(object):
+class _EditPanelBase(_RecomputeGuard):
     """Shared open/commit/abort-transaction + resetEdit/closeDialog
     scaffolding for every parametric-object task panel (CurvePanel,
     BlendPanel, SurfacePanel, LoftPanel, OffsetThickenPanel, ShellPanel,
@@ -170,7 +234,7 @@ class _EditPanelBase(object):
             FreeCAD.Console.PrintWarning(
                 "Railform: pre-accept hook failed (%s)\n" % exc)
         try:
-            self.obj.recompute()
+            self._recompute_obj()
         except Exception:
             pass
         try:
@@ -450,7 +514,7 @@ def drop_callbacks(view, specs):
 # ---------------------------------------------------------------------- #
 # _ReportPanelBase -- run-and-report QA panels (no doc-object, Close only)
 # ---------------------------------------------------------------------- #
-class _ReportPanelBase(object):
+class _ReportPanelBase(_RecomputeGuard):
     """Shared scaffolding for run-and-report QA panels
     (ContinuityCheckPanel, NetworkAuditPanel, SurfaceReviewPanel,
     WorkflowGuidePanel, GaussianCurvaturePanel). These measure and display

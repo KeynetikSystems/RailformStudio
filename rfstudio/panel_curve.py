@@ -1434,9 +1434,9 @@ class CurvePanel(_EditPanelBase):
 
     def recompute(self, gui=True):
         if getattr(self, "live", None) is None or self.live.isChecked():
-            self.obj.recompute()
+            self._recompute_obj()
             if gui:
-                FreeCADGui.updateGui()
+                self._defer_gui_update()
 
     # ---- commit/abort hooks (see _EditPanelBase) ---- #
     def _pre_accept(self):
@@ -1535,7 +1535,7 @@ class CurvePanel(_EditPanelBase):
             # are populated; the proxy seeds Knots on first execute().
             if not getattr(self.obj, "Knots", None):
                 try:
-                    self.obj.recompute()
+                    self._recompute_obj()
                 except Exception:
                     pass
             self._editor = editmode.KnotEditor(vobj)
@@ -2055,8 +2055,8 @@ class BlendPanel(_EditPanelBase):
         self.recompute()
 
     def recompute(self):
-        self.obj.recompute()
-        FreeCADGui.updateGui()
+        self._recompute_obj()
+        self._defer_gui_update()
 
     # ---- UI ---- #
     def _add_converter_controls(self):

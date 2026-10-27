@@ -312,9 +312,9 @@ class SurfacePanel(_EditPanelBase):
 
     def recompute(self, gui=True):
         if getattr(self, "live", None) is None or self.live.isChecked():
-            self.obj.recompute()
+            self._recompute_obj()
             if gui:
-                FreeCADGui.updateGui()
+                self._defer_gui_update()
         self._update_status()
         if self.kind == "Match" and getattr(self, "_match_diag", None) is not None:
             self._update_match_diagnostics()
@@ -1202,8 +1202,8 @@ class LoftPanel(_EditPanelBase):
 
     def recompute(self):
         if self._live is None or self._live.isChecked():
-            self.obj.recompute()
-            FreeCADGui.updateGui()
+            self._recompute_obj()
+            self._defer_gui_update()
         self._update_status()
 
     def _update_status(self):
@@ -1318,14 +1318,14 @@ class OffsetThickenPanel(_EditPanelBase):
     def recompute(self):
         if self.live is None or self.live.isChecked():
             try:
-                self.obj.recompute()
+                self._recompute_obj()
             except Exception as exc:
                 self._status.setText("Failed: %s" % exc)
                 self._status.setStyleSheet(
                     "color:#c0392b;font-size:11px;padding:4px 0;")
-                FreeCADGui.updateGui()
+                self._defer_gui_update()
                 return
-            FreeCADGui.updateGui()
+            self._defer_gui_update()
         has_src = bool(getattr(self.obj, "Source", None))
         shp = getattr(self.obj, "Shape", None)
         shape_ok = shp is not None and not shp.isNull()
@@ -1433,14 +1433,14 @@ class ShellPanel(_EditPanelBase):
     def recompute(self):
         if self.live is None or self.live.isChecked():
             try:
-                self.obj.recompute()
+                self._recompute_obj()
             except Exception as exc:
                 self._status.setText("Failed: %s" % exc)
                 self._status.setStyleSheet(
                     "color:#c0392b;font-size:11px;padding:4px 0;")
-                FreeCADGui.updateGui()
+                self._defer_gui_update()
                 return
-            FreeCADGui.updateGui()
+            self._defer_gui_update()
         self._update_status()
 
     def _update_status(self):
@@ -1732,14 +1732,14 @@ class BlendSurfPanel(_EditPanelBase):
 
     def recompute(self):
         try:
-            self.obj.recompute()
+            self._recompute_obj()
         except Exception as exc:
             self._status.setText("Failed: %s" % exc)
             self._status.setStyleSheet(
                 "color:#c0392b;font-size:11px;padding:4px 0;")
-            FreeCADGui.updateGui()
+            self._defer_gui_update()
             return
-        FreeCADGui.updateGui()
+        self._defer_gui_update()
         ok, msg = panel_logic.blend_readiness(
             bool(self.obj.FaceA) and bool(self.obj.FaceB))
         self._status.setText(msg)
@@ -1852,14 +1852,14 @@ class FilletPanel(_EditPanelBase):
     def recompute(self):
         if self.live is None or self.live.isChecked():
             try:
-                self.obj.recompute()
+                self._recompute_obj()
             except Exception as exc:
                 self._status.setText("Failed: %s" % exc)
                 self._status.setStyleSheet(
                     "color:#c0392b;font-size:11px;padding:4px 0;")
-                FreeCADGui.updateGui()
+                self._defer_gui_update()
                 return
-            FreeCADGui.updateGui()
+            self._defer_gui_update()
         self._update_status()
 
     def _update_status(self):
@@ -2109,12 +2109,12 @@ class PolylineFilletPanel(_EditPanelBase):
     def recompute(self, *_a):
         if self.live is None or self.live.isChecked():
             try:
-                self.obj.recompute()
+                self._recompute_obj()
             except Exception as exc:
                 self._status.setText("Failed: %s" % exc)
-                FreeCADGui.updateGui()
+                self._defer_gui_update()
                 return
-            FreeCADGui.updateGui()
+            self._defer_gui_update()
         if getattr(self, "_corner_editor", None) is not None:
             try:
                 self._corner_editor._refresh_markers()
@@ -2246,12 +2246,12 @@ class JoinCurvePanel(_EditPanelBase):
     def recompute(self, *_a):
         if self.live is None or self.live.isChecked():
             try:
-                self.obj.recompute()
+                self._recompute_obj()
             except Exception as exc:
                 self._status.setText("Failed: %s" % exc)
-                FreeCADGui.updateGui()
+                self._defer_gui_update()
                 return
-            FreeCADGui.updateGui()
+            self._defer_gui_update()
         self._update_status()
 
     def _update_status(self):
@@ -2469,14 +2469,14 @@ class BlendSurfClosedPanel(_EditPanelBase):
     def recompute(self):
         if self.live is None or self.live.isChecked():
             try:
-                self.obj.recompute()
+                self._recompute_obj()
             except Exception as exc:
                 self._status.setText("Failed: %s" % exc)
                 self._status.setStyleSheet(
                     "color:#c0392b;font-size:11px;padding:4px 0;")
-                FreeCADGui.updateGui()
+                self._defer_gui_update()
                 return
-            FreeCADGui.updateGui()
+            self._defer_gui_update()
         n = len(list(getattr(self.obj, "Faces", []) or []))
         if n < 3:
             self._status.setText(
@@ -2771,14 +2771,14 @@ class VariableFilletPanel(_EditPanelBase):
     def recompute(self, *args):
         if self.live is None or self.live.isChecked():
             try:
-                self.obj.recompute()
+                self._recompute_obj()
             except Exception as exc:
                 self._status.setText("Failed: %s" % exc)
                 self._status.setStyleSheet(
                     "color:#c0392b;font-size:11px;padding:4px 0;")
-                FreeCADGui.updateGui()
+                self._defer_gui_update()
                 return
-            FreeCADGui.updateGui()
+            self._defer_gui_update()
         self._update_status()
 
     def _update_status(self):
@@ -3076,14 +3076,14 @@ class RollingBallFilletPanel(_EditPanelBase):
     def recompute(self, *args):
         if self.live is None or self.live.isChecked():
             try:
-                self.obj.recompute()
+                self._recompute_obj()
             except Exception as exc:
                 self._status.setText("Failed: %s" % exc)
                 self._status.setStyleSheet(
                     "color:#c0392b;font-size:11px;padding:4px 0;")
-                FreeCADGui.updateGui()
+                self._defer_gui_update()
                 return
-            FreeCADGui.updateGui()
+            self._defer_gui_update()
         ok = bool(self.obj.FaceA) and bool(self.obj.FaceB)
         mode = ("tapered (%d stations)" % self.table.rowCount()
                if self.taper_toggle.isChecked() else
@@ -3183,13 +3183,13 @@ class GlobalFairPanel(_EditPanelBase):
 
     def recompute(self, *args):
         try:
-            self.obj.recompute()
+            self._recompute_obj()
         except Exception as exc:
             self.result.setText("Failed: %s" % exc)
             self.result.setStyleSheet("color:#c0392b;padding:6px 0;")
-            FreeCADGui.updateGui()
+            self._defer_gui_update()
             return
-        FreeCADGui.updateGui()
+        self._defer_gui_update()
         n = len(list(getattr(self.obj, "Faces", []) or []))
         if n == 0:
             self.result.setText("Select >= 1 face first.")
@@ -3290,14 +3290,14 @@ class TrimByIntersectionPanel(_EditPanelBase):
     def recompute(self):
         if self.live is None or self.live.isChecked():
             try:
-                self.obj.recompute()
+                self._recompute_obj()
             except Exception as exc:
                 self._status.setText("Failed: %s" % exc)
                 self._status.setStyleSheet(
                     "color:#c0392b;font-size:11px;padding:4px 0;")
-                FreeCADGui.updateGui()
+                self._defer_gui_update()
                 return
-            FreeCADGui.updateGui()
+            self._defer_gui_update()
         ok = bool(self.obj.FaceA) and bool(self.obj.FaceB)
         self._status.setText(
             "Ready." if ok else "Pick two faces to intersect and trim.")

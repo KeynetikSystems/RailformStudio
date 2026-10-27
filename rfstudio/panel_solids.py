@@ -161,14 +161,14 @@ class BooleanPanel(_EditPanelBase):
     def recompute(self, *args):
         if self.live is None or self.live.isChecked():
             try:
-                self.obj.recompute()
+                self._recompute_obj()
             except Exception as exc:
                 self._status.setText("Failed: %s" % exc)
                 self._status.setStyleSheet(
                     "color:#c0392b;font-size:11px;padding:4px 0;")
-                FreeCADGui.updateGui()
+                self._defer_gui_update()
                 return
-            FreeCADGui.updateGui()
+            self._defer_gui_update()
         has_base = bool(getattr(self.obj, "Base", None))
         has_tools = bool(getattr(self.obj, "Tools", None))
         shp = getattr(self.obj, "Shape", None)
@@ -297,14 +297,14 @@ class MeshToSurfacePanel(_EditPanelBase):
     def recompute(self, *args):
         if self.live is None or self.live.isChecked():
             try:
-                self.obj.recompute()
+                self._recompute_obj()
             except Exception as exc:
                 self._status.setText("Failed: %s" % exc)
                 self._status.setStyleSheet(
                     "color:#c0392b;font-size:11px;padding:4px 0;")
-                FreeCADGui.updateGui()
+                self._defer_gui_update()
                 return
-            FreeCADGui.updateGui()
+            self._defer_gui_update()
         has_source = bool(getattr(self.obj, "Source", None))
         shp = getattr(self.obj, "Shape", None)
         shape_ok = shp is not None and not shp.isNull() and shp.Faces
@@ -447,14 +447,14 @@ class HiddenLineExportPanel(_EditPanelBase):
     def recompute(self, *args):
         if self.live is None or self.live.isChecked():
             try:
-                self.obj.recompute()
+                self._recompute_obj()
             except Exception as exc:
                 self._status.setText("Failed: %s" % exc)
                 self._status.setStyleSheet(
                     "color:#c0392b;font-size:11px;padding:4px 0;")
-                FreeCADGui.updateGui()
+                self._defer_gui_update()
                 return
-            FreeCADGui.updateGui()
+            self._defer_gui_update()
         has_sources = bool(getattr(self.obj, "Sources", None))
         shp = getattr(self.obj, "Shape", None)
         shape_ok = shp is not None and not shp.isNull() and shp.Edges
@@ -790,14 +790,14 @@ class MirrorPanel(_EditPanelBase):
     def recompute(self, *args):
         if self.live is None or self.live.isChecked():
             try:
-                self.obj.recompute()
+                self._recompute_obj()
             except Exception as exc:
                 self._status.setText("Failed: %s" % exc)
                 self._status.setStyleSheet(
                     "color:#c0392b;font-size:11px;padding:4px 0;")
-                FreeCADGui.updateGui()
+                self._defer_gui_update()
                 return
-            FreeCADGui.updateGui()
+            self._defer_gui_update()
         has_source = bool(getattr(self.obj, "Source", None))
         shp = getattr(self.obj, "Shape", None)
         shape_ok = shp is not None and not shp.isNull()
