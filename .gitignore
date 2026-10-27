@@ -31,3 +31,7 @@ rfstudio/rfsources/
 # OS
 Thumbs.db
 .DS_Store
+
+# Design working documents (kept local-only, not published)
+issues.md
+MULTIRAIL_SWEEP.md
