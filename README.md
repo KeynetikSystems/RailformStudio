@@ -8,11 +8,59 @@ selections the native path doesn't yet resolve. (Earlier versions depended on
 Curves + **Silk**; Silk has been removed entirely and every Silk-backed action
 now has a native OCCT replacement.)
 
-Railform Studio presents these tools under one small, workflow-ordered UX
-(a docked tool shelf grouped Draw → Surface → Clean → Solids → Inspect →
-Exchange), adds viewport authoring/editing aids (Blender-style point editing,
-kind-coloured snapping, in-view knot display), and imports **Blender Railform
-rails**.
+<!-- TODO before release: add a screenshot here, e.g.
+     ![Railform Studio tool shelf and a surfaced model](docs/screenshot-workbench.png) -->
+
+## Install
+
+**Via the Addon Manager (recommended)** — in FreeCAD, open *Tools → Addon
+Manager*, search for **Railform Studio**, install, then restart FreeCAD and
+pick **Railform Studio** in the workbench dropdown.
+
+**Manually** — clone or download this repository into your FreeCAD user `Mod`
+folder (shown in *Preferences → General → Paths*, e.g. on Windows
+`%APPDATA%\FreeCAD\Mod\`) so that `InitGui.py` sits directly under
+`Mod/RailformStudio/`. Restart FreeCAD and select the workbench.
+
+**Requirements:** FreeCAD 1.0 or newer (developed and exercised on FreeCAD
+1.1). Geometry is pure OCCT via `Part` — no mandatory third-party workbench;
+the optional Curves workbench enables a few fallback engines only.
+
+## Quick start
+
+1. Switch to the **Railform Studio** workbench. The Report view names the
+   engine detected (or confirms standalone mode).
+2. **Draw** (tool shelf, left): author points — on a construction plane, snapped
+   to 3D, or typed into the X/Y/Z table — and create a curve from them
+   (interpolated, control-point, approximated, polyline, or Bezier).
+3. **Surface**: build a Loft, Gordon / network surface, Coons patch, or sweep
+   (two-rail or multi-rail; a single rail gives a pipe sweep). Results are
+   re-editable parametric objects.
+4. **Clean / Solids**: offset, trim (by curve or intersection), extend, match
+   (G1/G2), blend, close up into solids — thicken, shell, stitch, fillet,
+   chamfer, booleans, mirror (optionally welding the seam).
+5. **Inspect**: numeric seam/network continuity audits, surface review, Gaussian
+   curvature, zebra/reflect-line analysis.
+6. **Exchange**: import Blender Railform rails (JSON → exact NURBS curves),
+   fit a mesh/scan to a surface, or export hidden-line drawings as SVG.
+
+## Features
+
+The tool shelf groups every curated action in workflow order (filter box,
+collapsible sections whose state is remembered):
+
+| Group | Tools |
+|---|---|
+| **Draw** | Interpolate curve · control-point curve · approximate curve · polyline · Bezier curve (tangent handles) · freehand draw tool · 3D sketch · blend curve (G1/G2) · fillet polyline · join curves · mirror · mirror group |
+| **Surface** | Loft (with guide rails) · multi loft · Gordon / network surface · Coons patch · two-rail sweep · multi-rail sweep (every rail anchors the surface; exact Gordon route where the network allows) · N-sided fill · surface match (G2) · star-point patch · sketch on surface · trim surface · import Blender rails |
+| **Clean** | Offset surface · thicken · shell · extend surface · trim by intersection · closed-loop blend (G1/G2) · clean patch 4×4 / 6×6 · global fairing |
+| **Solids** | Radius fillet · variable-radius fillet · rolling-ball fillet · chamfer · boolean union / subtract / intersect · stitch shell · balance network continuity |
+| **Inspect** | Seam continuity check (G0/G1/G2) · patch-network audit · surface review (continuity + draft) · Gaussian curvature · curvature combs · zebra · reflect lines · draft analysis · workflow guide |
+| **Exchange** | Hidden-line drawing export (SVG) · mesh/scan to surface · Blender Railform rail import |
+
+Viewport aids: kind-coloured snapping with Draft-style markers, toggles and a
+live ΔXYZ readout; in-viewport editing of control points, B-spline knots and
+Bezier handles with live updates; NURBS push/pull via double-click.
 
 See [CHANGELOG.md](CHANGELOG.md) for what's changed recently.
 
@@ -31,7 +79,9 @@ exists. `deps.report_single_points_of_failure` therefore reports an empty list
 names, unknown provider kinds, DELEGATIONS/PROVIDERS drift) at workbench
 activation and in `test_core.py`.
 
-## Layout
+## For developers
+
+### Layout
 | Path | Role | Testable headless? |
 |------|------|--------------------|
 | `rfstudio/core/` | **Gui-free** geometry package: OCCT surfacing, curves, trimming, manufacturing, QA, Blender rail interchange (JSON → exact NURBS) | ✅ `test_core.py` |
@@ -54,6 +104,10 @@ activation and in `test_core.py`.
 > viewport overlays — is GUI-tested by hand.
 
 ## Verify headlessly
+
+With FreeCAD's `freecadcmd` (or `freecad.exe`) on your machine — shown here via
+a typical Windows install path, adjust to yours:
+
 ```powershell
 & "C:\Program Files\FreeCAD 1.1\bin\freecadcmd.exe" test_core.py
 & "C:\Program Files\FreeCAD 1.1\bin\freecadcmd.exe" test_panel_logic.py
