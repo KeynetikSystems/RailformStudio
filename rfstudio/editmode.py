@@ -230,6 +230,61 @@ def _draft_square_style():
         return False
 
 
+# --------------------------------------------------------------------- #
+# Single live viewport editor per lock group.
+#
+# Nothing in FreeCAD arbitrates manual (addEventCallback) editors: our
+# ViewProviders return False from setEdit on purpose (native draggers are
+# unusable here), so FreeCAD neither starts nor tears these sessions down.
+# Until 2026-10 the only thing keeping "one edit session at a time" was an
+# incidental FreeCADGui.Control.activeDialog() check inside the tree
+# double-click path -- any panel-less editor path, or any finish() that
+# failed midway, left a second pair of viewport event callbacks alive and
+# one drag drove two editors at once.
+#
+# The invariant is now enforced here: the newest live editor in a lock
+# group steals the session -- the holder's finish() runs (idempotent,
+# step-guarded) before the new one registers its callbacks. Lock groups
+# keep the ONE designed coexistence intact: CornerFilletEditor manages
+# only fillet-radius handles and runs *alongside* the polyline's own
+# PointEditor, so it locks against other CornerFilletEditors only.
+# --------------------------------------------------------------------- #
+_EDITOR_LOCK_GROUPS = {
+    "PointEditor": "viewport-edit",
+    "KnotEditor": "viewport-edit",
+    "SurfaceEditor": "viewport-edit",
+    "CornerFilletEditor": "corner-fillet",
+}
+_LIVE_EDITORS = {}
+
+
+def _claim_editor(editor):
+    """Register a live viewport editor; finish any previous editor that
+    holds the same lock group ("newest session wins"). Called by every
+    editor's __init__ once construction succeeded (self.ok); pair it with
+    _release_editor() in finish()."""
+    group = _EDITOR_LOCK_GROUPS.get(type(editor).__name__)
+    if group is None:
+        return
+    previous = _LIVE_EDITORS.pop(group, None)
+    if previous is not None and previous is not editor:
+        try:
+            previous.finish()
+        except Exception as exc:
+            FreeCAD.Console.PrintWarning(
+                "Railform: previous %s session teardown failed (%s); "
+                "its viewport callbacks were force-dropped.\n"
+                % (type(previous).__name__, exc))
+    _LIVE_EDITORS[group] = editor
+
+
+def _release_editor(editor):
+    """Remove `editor` from the live registry (finish() calls this)."""
+    for group, current in list(_LIVE_EDITORS.items()):
+        if current is editor:
+            del _LIVE_EDITORS[group]
+
+
 class PointEditor(object):
 
     def __init__(self, vobj):
@@ -296,6 +351,9 @@ class PointEditor(object):
         except Exception as exc:
             FreeCAD.Console.PrintWarning(
                 "Railform: point editor unavailable (%s)\n" % exc)
+        # Enforce the single-live-editor invariant (newest session wins).
+        if getattr(self, "ok", False):
+            _claim_editor(self)
 
     # ---- symmetry preview during creation ---- #
     def set_creating(self, creating):
@@ -1882,7 +1940,15 @@ class PointEditor(object):
         and the Bezier handle Coin overlay; the one that never ran was
         missing the _cb_key keyboard-callback removal and
         _hide_input_field(). This single version does all of it.
+
+        Idempotent: the lock (or a panel swap) may call finish() on an
+        already-finishing editor; _finished short-circuits the second
+        pass so the whole teardown runs exactly once.
         """
+        if getattr(self, "_finished", False):
+            return
+        self._finished = True
+        _release_editor(self)
         self._stop_watchdog()
         self._destroy_symmetry_preview()
         self._destroy_bezier_handles()
@@ -2344,6 +2410,8 @@ class KnotEditor(object):
         except Exception as exc:
             FreeCAD.Console.PrintWarning(
                 "Railform: knot editor unavailable (%s)\n" % exc)
+        if getattr(self, "ok", False):
+            _claim_editor(self)
 
     # ---- helpers ---- #
     def _knots(self):
@@ -3184,6 +3252,12 @@ class KnotEditor(object):
 
     # ---- teardown ---- #
     def finish(self):
+        """Tear down; idempotent (steal/swap may call it after the
+        panel's own finish) and releases the editor lock."""
+        if getattr(self, "_finished", False):
+            return
+        self._finished = True
+        _release_editor(self)
         self._stop_watchdog()
         drop_callbacks(self.view, (
             ("SoMouseButtonEvent", self, "_cb_btn"),
@@ -3262,6 +3336,8 @@ class CornerFilletEditor(object):
         except Exception as exc:
             FreeCAD.Console.PrintWarning(
                 "Railform: corner fillet handles unavailable (%s)\n" % exc)
+        if getattr(self, "ok", False):
+            _claim_editor(self)
 
     # ---- geometry (mirrors core.polyline_corner_fillet's per-corner math) --
     def _source_points(self):
@@ -3529,6 +3605,10 @@ class CornerFilletEditor(object):
 
     # ---- teardown ---- #
     def finish(self):
+        if getattr(self, "_finished", False):
+            return
+        self._finished = True
+        _release_editor(self)
         self._stop_watchdog()
         drop_callbacks(self.view, (
             ("SoMouseButtonEvent", self, "_cb_btn"),
@@ -3583,6 +3663,8 @@ class SurfaceEditor(object):
         except Exception as exc:
             FreeCAD.Console.PrintWarning(
                 "Railform: surface editor unavailable (%s)\n" % exc)
+        if getattr(self, "ok", False):
+            _claim_editor(self)
 
     # ---- helpers ---- #
     def _update_surface_cache(self):
@@ -3884,6 +3966,10 @@ class SurfaceEditor(object):
 
     # ---- teardown ---- #
     def finish(self):
+        if getattr(self, "_finished", False):
+            return
+        self._finished = True
+        _release_editor(self)
         self._stop_watchdog()
         drop_callbacks(self.view, (
             ("SoMouseButtonEvent", self, "_cb_btn"),
