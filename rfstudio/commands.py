@@ -683,19 +683,13 @@ TOOLBARS = [
                           "RFS_TrimByIntersection", "RFS_SketchOnSurf",
                           "RFS_Offset", "RFS_Thicken", "RFS_Shell",
                           "RFS_StitchShell"]),
-    ("Railform Clean",   ["RFS_ControlPoly4", "RFS_CleanPatch44",
-                          "RFS_CleanPatch66", "RFS_StarPatch",
-                          "RFS_Fillet", "RFS_Chamfer",
-                          "RFS_VariableFillet", "RFS_RollingBallFillet"]),
     ("Railform Solids",  ["RFS_BooleanUnion", "RFS_BooleanSubtract",
                           "RFS_BooleanIntersect", "RFS_MeshToSurface",
                           "RFS_Mirror", "RFS_MirrorGroup"]),
-    ("Railform Inspect", ["RFS_Combs", "RFS_Zebra", "RFS_Reflect",
-                          "RFS_Analysis", "RFS_DraftAnalysis",
-                          "RFS_GaussianCurvature",
-                          "RFS_ContinuityCheck", "RFS_NetworkAudit",
-                          "RFS_BalanceNetwork", "RFS_GlobalFair",
-                          "RFS_SurfaceReview", "RFS_WorkflowGuide",
+    # NOTE: demo build -- Clean and Inspect (surface-analysis) toolbars are
+    # intentionally omitted. The commands stay registered and functional
+    # (runnable ::C or by restoring these entries); they are just not shown.
+    ("Railform Inspect", ["RFS_SurfaceReview", "RFS_WorkflowGuide",
                           "RFS_ResetHealth"]),
     ("Railform Exchange",["RFS_ImportRails", "RFS_HiddenLineExport"]),
 ]
