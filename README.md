@@ -36,27 +36,27 @@ the optional Curves workbench enables a few fallback engines only.
 3. **Surface**: build a Loft, Gordon / network surface, Coons patch, or sweep
    (two-rail or multi-rail; a single rail gives a pipe sweep). Results are
    re-editable parametric objects.
-4. **Clean / Solids**: offset, trim (by curve or intersection), extend, match
-   (G1/G2), blend, close up into solids — thicken, shell, stitch, fillet,
-   chamfer, booleans, mirror (optionally welding the seam).
-5. **Inspect**: numeric seam/network continuity audits, surface review, Gaussian
-   curvature, zebra/reflect-line analysis.
-6. **Exchange**: import Blender Railform rails (JSON → exact NURBS curves),
-   fit a mesh/scan to a surface, or export hidden-line drawings as SVG.
+4. **Surface / Solids**: offset, trim (by curve or intersection), match
+   (G1/G2), blend, stitch, thicken or shell a surface into solids — then
+   booleans, mirroring (optionally with seam welding), and mesh/scan-to-surface
+   fitting.
+5. **Inspect**: surface review (numeric continuity report) and the workflow
+   guide.
+6. **Exchange**: import Blender Railform rails (JSON → exact NURBS curves) or
+   export hidden-line drawings as SVG.
 
 ## Features
 
-The tool shelf groups every curated action in workflow order (filter box,
+The tool shelf groups the curated actions in workflow order (filter box,
 collapsible sections whose state is remembered):
 
 | Group | Tools |
 |---|---|
-| **Draw** | Interpolate curve · control-point curve · approximate curve · polyline · Bezier curve (tangent handles) · freehand draw tool · 3D sketch · blend curve (G1/G2) · fillet polyline · join curves · mirror · mirror group |
-| **Surface** | Loft (with guide rails) · multi loft · Gordon / network surface · Coons patch · two-rail sweep · multi-rail sweep (every rail anchors the surface; exact Gordon route where the network allows) · N-sided fill · surface match (G2) · star-point patch · sketch on surface · trim surface · import Blender rails |
-| **Clean** | Offset surface · thicken · shell · extend surface · trim by intersection · closed-loop blend (G1/G2) · clean patch 4×4 / 6×6 · global fairing |
-| **Solids** | Radius fillet · variable-radius fillet · rolling-ball fillet · chamfer · boolean union / subtract / intersect · stitch shell · balance network continuity |
-| **Inspect** | Seam continuity check (G0/G1/G2) · patch-network audit · surface review (continuity + draft) · Gaussian curvature · curvature combs · zebra · reflect lines · draft analysis · workflow guide |
-| **Exchange** | Hidden-line drawing export (SVG) · mesh/scan to surface · Blender Railform rail import |
+| **Draw** | Interpolate curve · control-point curve · approximate curve · polyline · Bezier curve (tangent handles) · 3D sketch · blend curve (G1/G2) · fillet polyline · join curves · freehand draw tool |
+| **Surface** | Loft (with guide rails) · multi loft · Gordon / network surface · Coons patch · two-rail sweep · multi-rail sweep (every rail anchors the surface; exact Gordon route where the network allows) · N-sided fill · surface match (G2) · closed-loop blend (G1/G2) · sketch on surface · trim surface · trim by intersection · offset · thicken · shell · stitch shell |
+| **Solids** | Boolean union / subtract / intersect · mesh/scan to surface · mirror · mirror group |
+| **Inspect** | Surface review (continuity + draft report) · workflow guide |
+| **Exchange** | Blender Railform rail import (JSON → exact NURBS curves) · hidden-line drawing export (SVG) |
 
 Viewport aids: kind-coloured snapping with Draft-style markers, toggles and a
 live ΔXYZ readout; in-viewport editing of control points, B-spline knots and
@@ -67,9 +67,10 @@ See [CHANGELOG.md](CHANGELOG.md) for what's changed recently.
 ## Dependencies
 - **Required:** none beyond FreeCAD itself (geometry is pure OCCT via `Part`).
 - **Optional:** the **Curves** workbench — install it only for the engine-first
-  fallback path on a few actions (e.g. `RFS_StarPatch`: Curves' true-G2 star
-  vs. the native near-G2 Gregory construction). Everything works without it;
-  the workbench reports at activation which optional engine, if any, it found.
+  fallback path on a few actions (e.g. `RFS_BlendSurf` falls back to Curves'
+  `BlendSurf2` for selections its native path refuses). Everything works
+  without it; the workbench reports at activation which optional engine,
+  if any, it found.
 
 Every curated action has an ordered **provider chain** (`engines.PROVIDERS`):
 a native implementation first, the Curves command as a fallback where one
@@ -127,8 +128,9 @@ session (see below).
 1. Restart FreeCAD → pick **Railform Studio** in the workbench dropdown.
 2. The Report view should say which optional engine was detected, or that it's
    running standalone (no Curves).
-3. The left **Railform Tools** shelf appears, grouped Draw / Surface / Clean /
-   Solids / Inspect / Exchange; the filter box and collapsible sections work.
+3. The left **Railform Tools** shelf appears, grouped Draw /
+   Surface / Solids / Inspect / Exchange; the filter box and collapsible
+   sections work.
 4. **Native action:** draw ≥ 3 spline points, create a curve, open it for
    editing — control points, knots (cyan diamonds) and axis arrows show in the
    viewport; dragging a point updates the curve live.
