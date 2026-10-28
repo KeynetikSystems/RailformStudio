@@ -4,9 +4,7 @@ A curated **curve → surface** workbench for automotive-grade modeling. It ship
 **native OCCT implementations of every curated action**, so it runs fully
 standalone — no mandatory third-party workbench. The optional **Curves**
 workbench (Grellier) is used only as a *fallback engine* for a handful of
-selections the native path doesn't yet resolve. (Earlier versions depended on
-Curves + **Silk**; Silk has been removed entirely and every Silk-backed action
-now has a native OCCT replacement.)
+selections the native path doesn't yet resolve.
 
 <!-- TODO before release: add a screenshot here, e.g.
      ![Railform Studio tool shelf and a surfaced model](docs/screenshot-workbench.png) -->
