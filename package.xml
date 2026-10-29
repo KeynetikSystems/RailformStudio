@@ -3,12 +3,18 @@
   <name>Railform Studio</name>
   <description>Curated curve-to-surface workbench for automotive-grade modeling. Ships native OCCT implementations of every curated action, so it runs fully standalone; the Curves workbench is an optional fallback engine for a few selections. Adds a workflow-ordered UX and Blender Railform rail import.</description>
   <version>0.1.0</version>
-  <date>2026-10-24</date>
+  <date>2026-10-28</date>
   <maintainer email="fkemuntoh@gmail.com">Kelvin</maintainer>
   <license file="LICENSE">GPL-3.0-or-later</license>
   <url type="repository" branch="main">https://github.com/KeynetikSystems/RailformStudio</url>
   <url type="readme">https://github.com/KeynetikSystems/RailformStudio/blob/main/README.md</url>
   <url type="bugtracker">https://github.com/KeynetikSystems/RailformStudio/issues</url>
+  <icon>rfstudio/resources/rfstudio.svg</icon>
+  <tag>surfacing</tag>
+  <tag>NURBS</tag>
+  <tag>curve</tag>
+  <tag>automotive</tag>
+  <tag>class-a</tag>
   <!-- The APIs used are all 1.0-era; freecadmin is kept at 1.0 as the
        declared floor. This has only been exercised against FreeCAD 1.1 —
        if an issue surfaces on 1.0, raise the floor instead. -->

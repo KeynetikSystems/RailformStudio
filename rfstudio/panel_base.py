@@ -516,8 +516,7 @@ def drop_callbacks(view, specs):
 # ---------------------------------------------------------------------- #
 class _ReportPanelBase(_RecomputeGuard):
     """Shared scaffolding for run-and-report QA panels
-    (ContinuityCheckPanel, NetworkAuditPanel, SurfaceReviewPanel,
-    WorkflowGuidePanel, GaussianCurvaturePanel). These measure and display
+    (SurfaceReviewPanel, WorkflowGuidePanel). These measure and display
     something on demand -- no parametric doc object to keep re-editable,
     so they only need a Close button, no transaction."""
 

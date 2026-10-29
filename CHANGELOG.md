@@ -25,6 +25,11 @@ fresh `Unreleased` section above it.
   a burst of `_set` calls schedules exactly one redraw after the stack
   unwinds). All 43 call sites across panel_surface/panel_curve/panel_solids
   converted.
+- UIX — **"Pick in 3D" defaults ON for authoring**: a NEW curve panel
+  (creating=True) now engages 3D viewport picking immediately, so points
+  can be placed by clicking in the 3D view without hunting for the toggle
+  first. Editing an existing curve keeps picking OFF (a stray viewport
+  click into an edit session must not silently insert/move points).
 
 ## 0.1.0 — 2026-10-24
 

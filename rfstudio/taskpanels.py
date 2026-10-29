@@ -11,11 +11,8 @@ implementations now live in a handful of focused modules:
                               reimplementing.
   * rfstudio.panel_curve   -- CurvePanel, BlendPanel.
   * rfstudio.panel_surface -- SurfacePanel, LoftPanel, OffsetThickenPanel,
-                              ShellPanel, BlendSurfPanel,
-                              VariableFilletPanel, RollingBallFilletPanel,
-                              GlobalFairPanel.
-  * rfstudio.panel_qa      -- ContinuityCheckPanel, NetworkAuditPanel,
-                              SurfaceReviewPanel, WorkflowGuidePanel.
+                              ShellPanel, BlendSurfPanel.
+  * rfstudio.panel_qa      -- SurfaceReviewPanel, WorkflowGuidePanel.
   * rfstudio.panel_import  -- ImportRailsPanel.
   * rfstudio.panel_solids  -- BooleanPanel, MeshToSurfacePanel,
                               HiddenLineExportPanel, MirrorPanel.
@@ -36,14 +33,13 @@ from rfstudio.panel_base import (  # noqa: F401
 from rfstudio.panel_curve import _CoordSpin, CurvePanel, BlendPanel  # noqa: F401
 from rfstudio.panel_surface import (  # noqa: F401
     SurfacePanel, LoftPanel, OffsetThickenPanel, ShellPanel, BlendSurfPanel,
-    StitchShellPanel, FilletPanel, ChamferPanel, PolylineFilletPanel,
+    StitchShellPanel, PolylineFilletPanel,
     JoinCurvePanel, BlendSurfClosedPanel,
-    TrimByIntersectionPanel, VariableFilletPanel, RollingBallFilletPanel,
-    GlobalFairPanel,
+    TrimByIntersectionPanel,
 )
 from rfstudio.panel_qa import (  # noqa: F401
-    ContinuityCheckPanel, NetworkAuditPanel, SurfaceReviewPanel,
-    WorkflowGuidePanel, GaussianCurvaturePanel, BalanceNetworkPanel,
+    SurfaceReviewPanel,
+    WorkflowGuidePanel,
 )
 from rfstudio.panel_import import ImportRailsPanel  # noqa: F401
 from rfstudio.panel_solids import (  # noqa: F401

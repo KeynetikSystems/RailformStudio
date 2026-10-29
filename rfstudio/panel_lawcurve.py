@@ -4,10 +4,7 @@
 Plasticity (and most serious CAD packages -- Rhino's `_EditPointsOn` radius
 graph, Fusion 360's variable-radius handles, etc.) let you shape a
 variable-radius fillet by dragging POINTS ON A 2D GRAPH: parameter along the
-edge on X, radius on Y. Before this module, RailformStudio's
-VariableFilletPanel / RollingBallFilletPanel only offered a bare
-(param, radius) QTableWidget -- numerically complete, but nothing to look
-at and nothing to drag. This widget is that graph, built as a plain
+edge on X, radius on Y. This widget is that graph, built as a plain
 QWidget + paintEvent/mouse-event pair (no QGraphicsView/QGraphicsScene --
 consistent with this codebase's existing preference for direct
 addEventCallback-style interaction over heavier Qt machinery, see

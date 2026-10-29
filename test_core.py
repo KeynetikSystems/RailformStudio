@@ -1359,7 +1359,6 @@ def test_network_aware_match_selects_best_reference():
 def test_curated_commands_expose_manufacturability_and_qa():
     from rfstudio import commands
     for cmd_id in ("RFS_Offset", "RFS_Thicken", "RFS_Shell",
-                   "RFS_ContinuityCheck", "RFS_NetworkAudit",
                    "RFS_SurfaceReview", "RFS_WorkflowGuide",
                    "RFS_StitchShell"):
         assert cmd_id in commands._PANEL_COMMANDS, cmd_id
@@ -2260,39 +2259,15 @@ def test_draft_angle_analysis_vertical_wall_is_zero_draft():
     out("  draft vertical wall OK  max|angle|=%.2e" % max(abs(v) for v in flat))
 
 
-def test_native_qa_providers_registered():
-    """RFS_Combs/Zebra/Reflect/DraftAnalysis must each have a native-first
-    provider chain (fix for the 'pure Curves delegation, no native
-    fallback' gap), mirroring test_providers_multiloft_is_native_only's
-    check for RFS_MultiLoft."""
-    from rfstudio import engines
-    expected_native = {
-        "RFS_Combs": "native_combs",
-        "RFS_Zebra": "native_zebra",
-        "RFS_Reflect": "native_reflect",
-        "RFS_DraftAnalysis": "native_draft_analysis",
-    }
-    for cmd_id, fn_name in expected_native.items():
-        chain = engines.PROVIDERS[cmd_id]
-        assert chain[0] == ("native", fn_name), (cmd_id, chain)
-        assert hasattr(engines, fn_name)
-        # engine fallback must still be present (not a full cutover)
-        assert any(p[0] == "engine" for p in chain), (cmd_id, chain)
-    out("  native QA providers OK  n=%d" % len(expected_native))
-
-
 def test_report_single_points_of_failure():
     """deps.report_single_points_of_failure must flag exactly the curated
-    actions whose provider chain has NO native entry. After the last
-    three gaps were closed (RFS_Analysis/RFS_ControlPoly4/RFS_StarPatch
-    got native providers), EVERY curated action must have a native
-    fallback -- flagged must be empty. If a future action regresses to
-    engine-only, this test fails and says which one."""
+    actions whose provider chain has NO native entry. Every curated
+    action must have a native fallback -- flagged must be empty. If a
+    future action regresses to engine-only, this test fails and says
+    which one."""
     from rfstudio import deps, engines
     flagged = deps.report_single_points_of_failure(engines.PROVIDERS)
-    assert "RFS_StarPatch" not in flagged
     assert "RFS_MultiLoft" not in flagged
-    assert "RFS_Combs" not in flagged
     assert flagged == [], (
         "engine-only curated actions regressed: %s" % flagged)
     for cmd_id in flagged:
@@ -2365,30 +2340,11 @@ def test_engines_validate_providers_catches_typos():
     from rfstudio import engines
     bad = dict(engines.PROVIDERS)
     bad["RFS_MultiLoft"] = [("native", "native_multiloft_TYPO")]
-    bad["RFS_Zebra"] = [("bogus", "x")]
+    bad["RFS_Loft"] = [("bogus", "x")]
     problems = engines.validate_providers(bad)
     assert any("TYPO" in p for p in problems), problems
     assert any("unknown provider kind" in p for p in problems), problems
     out("  validate_providers catches problems OK  n=%d" % len(problems))
-
-
-def test_last_three_actions_have_native_fallbacks():
-    """RFS_Analysis is native-first with the Curves engine kept as a
-    fallback; RFS_ControlPoly4 and RFS_StarPatch are native-only now
-    (their old Silk engines are gone with the Silk dependency). No
-    action is left without a provider either way."""
-    from rfstudio import engines
-    a = engines.PROVIDERS["RFS_Analysis"]
-    assert a[0] == ("native", "native_analysis"), a
-    assert any(p[0] == "engine" for p in a), a
-    c = engines.PROVIDERS["RFS_ControlPoly4"]
-    assert c == [("native", "native_control_poly4")], c
-    s = engines.PROVIDERS["RFS_StarPatch"]
-    assert s == [("native", "native_star_patch")], s
-    for fn in ("native_analysis", "native_control_poly4",
-               "native_star_patch"):
-        assert hasattr(engines, fn), fn
-    out("  last-three native fallbacks OK")
 
 
 def test_n_sided_patch_square_smoke():
@@ -3687,7 +3643,6 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_providers_cover_every_delegated_action,
               test_engines_validate_providers_healthy,
               test_engines_validate_providers_catches_typos,
-              test_last_three_actions_have_native_fallbacks,
               test_n_sided_patch_square_smoke,
               test_n_sided_patch_shared_center_accel,
               test_n_sided_patch_septic_spokes_curved,
@@ -3755,7 +3710,6 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_zebra_stripes_on_flat_plane_is_uniform,
               test_zebra_stripes_on_curved_face_has_contours,
               test_draft_angle_analysis_vertical_wall_is_zero_draft,
-              test_native_qa_providers_registered,
               test_variable_fillet_solid_box_edge,
               test_variable_fillet_solid_rejects_single_station,
               test_variable_fillet_solid_rejects_non_solid,

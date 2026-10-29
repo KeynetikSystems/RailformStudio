@@ -160,25 +160,14 @@ def _selection_ok_for(cmd_id):
             "select two surfaces"
     if cmd_id == "RFS_BlendSurfClosed":
         return _selection_count() >= 3, "select >= 3 faces"
-    if cmd_id in ("RFS_Combs", "RFS_Zebra", "RFS_Reflect",
-                  "RFS_DraftAnalysis", "RFS_Analysis"):
-        return _selection_has_face(), "select one face/surface"
-    if cmd_id == "RFS_ContinuityCheck":
-        return _selection_count() >= 2, "select two adjacent faces"
-    if cmd_id == "RFS_NetworkAudit":
-        return _selection_has_face(), "select a patch network"
-    if cmd_id == "RFS_GaussianCurvature":
-        return _selection_has_face(), "select faces"
     return True, ""
 
 
 # --- command sets for behaviour gating -------------------------------------- #
 # Panel commands that need at least one object selected before they can run.
 _PANEL_NEEDS_SELECTION = {
-    "RFS_Fillet", "RFS_Chamfer", "RFS_Shell", "RFS_Offset", "RFS_Thicken",
-    "RFS_MirrorGroup", "RFS_Combs", "RFS_Zebra", "RFS_Reflect",
-    "RFS_Analysis", "RFS_DraftAnalysis", "RFS_ContinuityCheck",
-    "RFS_NetworkAudit", "RFS_SurfaceReview", "RFS_GaussianCurvature",
+    "RFS_Shell", "RFS_Offset", "RFS_Thicken",
+    "RFS_MirrorGroup", "RFS_SurfaceReview",
     "RFS_BlendSurf", "RFS_BlendSurfClosed", "RFS_TrimByIntersection",
     "RFS_MeshToSurface", "RFS_HiddenLineExport", "RFS_Mirror",
     "RFS_Sweep2Rail", "RFS_SweepN", "RFS_Fill",
@@ -187,8 +176,7 @@ _PANEL_NEEDS_SELECTION = {
 # Commands that modify/destroy geometry -- require explicit confirmation.
 _DESTRUCTIVE = {
     "RFS_BooleanSubtract", "RFS_BooleanUnion", "RFS_BooleanIntersect",
-    "RFS_Trim", "RFS_TrimByIntersection", "RFS_Shell", "RFS_Fillet",
-    "RFS_Chamfer",
+    "RFS_Trim", "RFS_TrimByIntersection", "RFS_Shell",
 }
 
 # Commands that must not run while another object is being edited.
@@ -546,15 +534,6 @@ _PANEL_COMMANDS = {
                         "Extend surface",
                         "Extend a surface in U and V parametric directions (re-editable).",
                         "rfs_extend.svg"),
-    # Class-A QA: numeric seam and network continuity checks
-    "RFS_ContinuityCheck": (lambda: taskpanels.ContinuityCheckPanel(),
-                            "Check seam continuity",
-                            "Measure G0/G1/G2 continuity numerically across two adjacent faces.",
-                            "rfs_continuity.svg"),
-    "RFS_NetworkAudit": (lambda: taskpanels.NetworkAuditPanel(),
-                         "Audit patch network",
-                         "Audit continuity across every adjacent face pair in a patch network.",
-                         "rfs_network_audit.svg"),
     "RFS_SurfaceReview": (lambda: taskpanels.SurfaceReviewPanel(),
                           "Review surfaces",
                           "Roll continuity and draft analysis into a single surface-review summary.",
@@ -563,25 +542,10 @@ _PANEL_COMMANDS = {
                           "Workflow guide",
                           "Show a guided surfacing checklist for patch creation, review, and manufacture.",
                           "rfs_workflow.svg"),
-    "RFS_GaussianCurvature": (lambda: taskpanels.GaussianCurvaturePanel(),
-                              "Gaussian curvature",
-                              "Color-coded Gaussian curvature classification (saddle / flat / patch) over selected faces.",
-                              "rfs_gaussian.svg"),
     "RFS_StitchShell": (lambda: taskpanels.StitchShellPanel(),
                         "Stitch shell",
                         "Sew a finished network of surface objects into one continuous shell/solid.",
                         "rfs_stitch.svg"),
-    # ---- New in 2026-07: four gaps from issues.md closed in one batch -----
-    # Radius-driven fillet + chamfer on solids (the RFS_Fillet / RFS_Chamfer
-    # entries close the "no radius-driven fillet" gap).
-    "RFS_Fillet": (lambda: taskpanels.FilletPanel(),
-                   "Fillet (radius)",
-                   "Constant-radius fillet on a solid's picked edges (radius in world units).",
-                   "rfs_fillet.svg"),
-    "RFS_Chamfer": (lambda: taskpanels.ChamferPanel(),
-                    "Chamfer",
-                    "Constant-distance chamfer on a solid's picked edges.",
-                    "rfs_chamfer.svg"),
     # Closed-loop G1/G2 blend around an N-sided face ring
     # (closes the "no closed-loop blend" gap).
     "RFS_BlendSurfClosed": (lambda: taskpanels.BlendSurfClosedPanel(),
@@ -594,12 +558,6 @@ _PANEL_COMMANDS = {
                                "Trim by intersection",
                                "Intersect two faces and trim both to the intersection curve.",
                                "rfs_trim_intersect.svg"),
-    # Iterative local-relaxation continuity solver
-    # (closes the "no simultaneous multi-neighbor continuity solving" gap).
-    "RFS_BalanceNetwork": (lambda: taskpanels.BalanceNetworkPanel(),
-                           "Balance network continuity",
-                           "Iteratively rebuild the worst seam's worse face to drive the network toward a target continuity.",
-                           "rfs_balance.svg"),
     # NURBS push/pull direct manipulation
     # Removed from curated toolbar -- only accessible via double-click in the
     # tree browser (SurfaceVP.doubleClicked), so direct manipulation is
@@ -616,30 +574,6 @@ _DELEGATE_META = {
     "RFS_BlendSurf":    ("Blend surface", "G1/G2 blend strip between two edges (Curves).", "rfs_blend.svg"),
     "RFS_Trim":         ("Trim surface", "Trim a face with a curve (native; falls back to Curves).", "rfs_trim.svg"),
     "RFS_SketchOnSurf": ("Sketch on surface", "Project a curve onto a surface (native; falls back to Curves).", "rfs_sos.svg"),
-    "RFS_CleanPatch44": ("Clean patch 4x4", "Low-CP bicubic patch from a control grid (native).", "rfs_patch44.svg"),
-    "RFS_CleanPatch66": ("Clean patch 6x6", "Low-CP bi-quintic patch (native).", "rfs_patch66.svg"),
-    "RFS_ControlPoly4": ("Control poly (cubic)", "Cubic control polygon from 4 points (native).", "rfs_poly.svg"),
-    "RFS_StarPatch":    ("Star-point patch", "N-sided patch (native; exact "
-                       "G0 / tangent-plane G1 continuity).",
-                       "rfs_star.svg"),
-    "RFS_Combs":        ("Curvature combs", "Parametric curvature comb (Curves).", "rfs_comb.svg"),
-    "RFS_Zebra":        ("Zebra", "Zebra stripe analysis (Curves).", "rfs_zebra.svg"),
-    "RFS_Reflect":      ("Reflect lines", "Reflection line analysis (Curves).", "rfs_reflect.svg"),
-    "RFS_Analysis":     ("Surface analysis", "Continuity/draft review over selected faces (native; falls back to Curves).", "rfs_analysis.svg"),
-    "RFS_DraftAnalysis":("Draft analysis", "Draft-angle analysis (Curves).", "rfs_draft.svg"),
-    # ---- Native-only additions: variable-radius fillets + global fairing --
-    "RFS_VariableFillet": ("Variable-radius fillet",
-                          "Multi-station variable-radius fillet on a solid "
-                          "edge (native; e.g. R3 tapering to R8).",
-                          "rfs_fillet_variable.svg"),
-    "RFS_RollingBallFillet": ("Rolling-ball fillet",
-                             "Real-world-radius fillet between two surfaces, "
-                             "with an optional multi-section taper (native).",
-                             "rfs_rollingball.svg"),
-    "RFS_GlobalFair": ("Global fairing",
-                       "Network-wide Laplacian fairing pass over a patch "
-                       "network's control nets (native).",
-                       "rfs_global_fair.svg"),
     # ---- Native-only additions: booleans, mesh-to-surface, hidden-line
     # drafting export. None of these had any prior engine delegation --
     # Curves/Silk never offered booleans, mesh import, or drafting output,

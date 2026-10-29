@@ -367,6 +367,14 @@ class CurvePanel(_EditPanelBase):
         # Viewport grid (XY, YZ, XZ planes)
         self._setup_viewport_grid()
 
+        # Authoring default: 3D viewport picking engages immediately for a
+        # NEW curve (creating=True) so points can be placed by clicking in
+        # the 3D view without hunting for the toggle first. Editing an
+        # existing curve keeps pick OFF -- a stray viewport click into an
+        # edit session must not silently insert or move points.
+        if self.creating:
+            self.pick_btn.setChecked(True)
+
     def _on_handle_type_changed(self, htype):
         """Handle handle type selection change."""
         if self._editor and hasattr(self._editor, "set_bezier_handle_type"):
