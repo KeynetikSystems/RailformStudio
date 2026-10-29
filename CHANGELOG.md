@@ -31,6 +31,39 @@ fresh `Unreleased` section above it.
   first. Editing an existing curve keeps picking OFF (a stray viewport
   click into an edit session must not silently insert/move points).
 
+### Changed (core geometry)
+- **Merged the external `surfaces_fixes.py` rewrite of the sweep / Gordon
+  layer** into `rfstudio/core/patches.py` (17 functions/classes spliced:
+  gordon_network, multi/two/single_rail_sweep, _try_gordon_route,
+  _intersect_grid/_intersect_pair, _to_bspline, _NearestTCache, _ArcRail,
+  _harmonize_surface_knots, _gregory_triangle_grid, plate_fill,
+  _smootherstep, _order_open_loop, _corner_boundary_accel,
+  _deviation_of_curves). New shared helpers `_norm_param`, `_monotone`,
+  `_anchor_map`, `_network_scale` moved into `core/util.py`.
+  - multi-rail station skinning: each profile's reference spine now passes
+    through where it actually contacts every interior rail (closest
+    approach), and every rail k is sampled at
+    `arc_k(map_k(s))` through `_anchor_map` piecewise-linear contact
+    fractions, so interior rails are on the surface at each profile's own
+    station; all rails are deviation-measured against the finished surface.
+  - single-rail sweep: offsets are measured in ONE RMF frame chain built
+    over the whole station list (profile stations always included), rows
+    rebuild from the same frames, and the sag probe sees geometry, not
+    frame mismatch.
+  - two-rail/Coons/Gordon internals updated (trimmed-range `_to_bspline`
+    via `toNurbs().segment`, `_intersect_grid` simplified, Gordon
+    3-curve knot harmonization de-duplicated).
+- **Fix in the merged rewrite: `_NearestTCache.param` no longer reports a
+  bogus minimum ~2e-9 for points lying ON an edge boundary.** Golden-
+  section refinement is only valid on a truly unimodal objective; on the
+  flat zone beside an edge end it chased fp noise, stationing a profile
+  start at 1.819e-9 instead of exactly 0 — which then sat beside station
+  0 in the station list (dedupe gap 1e-9 keeps both) and the
+  near-duplicate rows wrecked the surface interpolation (measured: pipe
+  surface dipping to x = -0.014). Refinement is now accepted only when it
+  is measurably better than the best sample, so boundary projections are
+  exact again while sub-sample station refinement is kept.
+
 ## 0.1.0 — 2026-10-24
 
 First packaged release (GPL-3.0 LICENSE added; package.xml/README updated to

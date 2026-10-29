@@ -2,11 +2,14 @@
 """Coons, Gordon-network and N-sided (star-point) surface patches."""
 
 import math
+import bisect
 import Part
 import FreeCAD                      # Console only -- not Gui, works headless
 from FreeCAD import Vector
 
-from .util import (_chain_loop, _eval01, _hermite5, _hermite7, _pt, grid_to_surface)
+from .util import (_anchor_map, _chain_loop, _eval01, _hermite5, _hermite7,
+                   _monotone, _network_scale, _norm_param, _pt,
+                   grid_to_surface)
 
 
 
@@ -53,11 +56,26 @@ def _closest_approach_pair(c1, c2, samples=24):
 
 
 def _to_bspline(edge):
-    """Return the BSplineCurve underlying `edge`, or refit a non-BSpline edge
-    to a fresh BSpline (lossy but always works)."""
-    c = getattr(edge, "Curve", None)
-    if isinstance(c, Part.BSplineCurve):
-        return c
+    """BSplineCurve covering exactly the TRIMMED range of `edge`.
+
+    edge.Curve is the full underlying geometry (a Part.Line spans ~+-1e100),
+    so it is never used directly. Orientation is NOT applied: FreeCAD's
+    valueAt/parameter ignore Edge.Orientation, which is what the spine path's
+    _eval01 sees, so both routes now see the same curve. Falls back to a
+    50-point interpolation."""
+    if isinstance(edge, Part.BSplineCurve):
+        return edge
+    try:
+        e = edge.toNurbs().Edges[0]
+        c = e.Curve
+        if isinstance(c, Part.BSplineCurve):
+            c = c.copy()
+            fp, lp = e.FirstParameter, e.LastParameter
+            if fp > c.FirstParameter + 1e-12 or lp < c.LastParameter - 1e-12:
+                c.segment(fp, lp)
+            return c
+    except Exception:
+        pass
     try:
         fp, lp = edge.FirstParameter, edge.LastParameter
         pts = [edge.valueAt(fp + k / 49.0 * (lp - fp)) for k in range(50)]
@@ -70,10 +88,7 @@ def _to_bspline(edge):
 
 
 def _intersect_pair(c1, c2):
-    """Return [(tu, tv), ...] -- parameter pairs at which the two curves
-    actually cross. Uses OCCT `intersectCC` (the real intersection, not
-    closest approach). Falls back to closest-approach when the curves
-    don't actually cross, so the caller always gets at least one pair."""
+    """[(tu, tv, gap), ...] for real crossings, else closest approach."""
     pts = []
     try:
         pts = c1.intersectCC(c2)
@@ -87,12 +102,12 @@ def _intersect_pair(c1, c2):
             tv = c2.parameter(v)
             if c1.FirstParameter <= tu <= c1.LastParameter and \
                c2.FirstParameter <= tv <= c2.LastParameter:
-                out.append((float(tu), float(tv), float(v.distanceToPoint(v))))
+                gap = c1.value(tu).distanceToPoint(c2.value(tv))
+                out.append((float(tu), float(tv), float(gap)))
         except Exception:
             continue
     if out:
         return out
-    # Fallback: closest approach (handles tangent / near-miss / parallel).
     t1, t2, d = _closest_approach_pair(c1, c2)
     return [(float(t1), float(t2), float(d))]
 
@@ -114,16 +129,11 @@ _GORDON_CROSS_TOL = 0.02
 
 
 def _intersect_grid(bs_profiles, bs_guides):
-    """For every (profile, guide) pair, return the best intersection
-    parameter pair (tu, tv) and the geometric distance. Prefers real
-    OCCT intersections; falls back to closest-approach for non-crossing
-    pairs (so a near-miss doesn't kill the skinning step).
-
-    Returns:
-      intersection_params_u: list[list[float]], len nu x nv -- tu for (i, j)
-      intersection_params_v: list[list[float]], len nu x nv -- tv for (i, j)
-      distances: list[list[float]], len nu x nv
-    """
+    """Best (tu, tv, gap) per (profile, guide). Ties on gap (all exact
+    crossings) break on the smallest tu so the choice is deterministic.
+    NOTE: multi-crossing pairs still take the first crossing along the
+    profile; a network where that is the wrong one needs ordering by the
+    caller."""
     nu, nv = len(bs_profiles), len(bs_guides)
     pu = [[0.0] * nv for _ in range(nu)]
     pv = [[0.0] * nv for _ in range(nu)]
@@ -131,13 +141,8 @@ def _intersect_grid(bs_profiles, bs_guides):
     for i in range(nu):
         for j in range(nv):
             pairs = _intersect_pair(bs_profiles[i], bs_guides[j])
-            # Pick the intersection with the smallest distance. Real
-            # intersections are exact (distance 0) so this just enforces
-            # a deterministic choice for multi-intersection pairs.
-            best = min(pairs, key=lambda t: t[2])
-            pu[i][j] = best[0]
-            pv[i][j] = best[1]
-            dd[i][j] = best[2]
+            best = min(pairs, key=lambda t: (round(t[2], 9), t[0]))
+            pu[i][j], pv[i][j], dd[i][j] = best
     return pu, pv, dd
 
 
@@ -314,31 +319,32 @@ def _grid_interpolation_surface(grid_pts, u_vals, v_vals):
 def _harmonize_surface_knots(s1, s2, s3, tol=1e-9):
     """Force s1, s2, s3 onto a common knot vector in both directions.
 
-    Strategy: collect the per-direction (knots, mults) pairs from each
-    surface, take the per-knot *max* multiplicity, and `insertUKnots` any
-    knot that's in one but not the others.
-
-    We pass `bool_add=False` to `insertUKnots` -- OCCT's default `True`
-    would *add* the given multiplicities to the existing ones, growing
-    the surface past the target. With `False`, OCCT only raises the
-    multiplicity to (not by) the given value, matching the others.
-    """
+    Union of knots is built by CLUSTERING within `tol` (not exact-float dict
+    keys), max multiplicity per cluster, then inserted into EACH surface.
+    bool_add=False so OCCT raises multiplicity TO the value, not BY it."""
     for axis in ("U", "V"):
-        get_knots = getattr(s1, "get" + axis + "Knots")
-        get_mults = getattr(s1, "get" + axis + "Multiplicities")
-        # Build the union (knot, max_mult) from all three.
-        merged = {}
+        items = []
         for s in (s1, s2, s3):
-            for k, m in zip(get_knots(), get_mults()):
-                merged[k] = max(merged.get(k, 0), m)
-        ks = sorted(merged.keys())
-        ms = [merged[k] for k in ks]
-        insert = getattr(s1, "insert" + axis + "Knots")
+            ks = getattr(s, "get" + axis + "Knots")()
+            ms = getattr(s, "get" + axis + "Multiplicities")()
+            items.extend(zip(ks, ms))
+        items.sort()
+        clusters = []
+        for k, m in items:
+            if clusters and k - clusters[-1][0] <= tol:
+                clusters[-1][1] = max(clusters[-1][1], m)
+            else:
+                clusters.append([k, m])
+        ks = [c[0] for c in clusters]
+        ms = [c[1] for c in clusters]
         for s in (s1, s2, s3):
+            insert = getattr(s, "insert" + axis + "Knots")
             try:
                 insert(ks, ms, tol, False)
-            except Exception:
-                pass
+            except Exception as exc:
+                FreeCAD.Console.PrintWarning(
+                    "Railform Gordon: knot harmonisation (%s) failed: %s\n"
+                    % (axis, exc))
 
 
 
@@ -358,75 +364,36 @@ def _match_degrees(s1, s2, s3):
 
 
 
-def gordon_network(profiles, guides, samples_per_curve=24, extra_per_gap=4):
-    """Gordon surface from a network of U- and V-curves (TiGL 1969).
+def gordon_network(profiles, guides, samples_per_curve=24, extra_per_gap=4,
+                   _network=None):
+    """Gordon surface S = S1 + S2 - S3 from a curve network.
 
-    Implements `S = S1 + S2 - S3` (control-point-wise sum), the standard
-    Gordon formulation used by Curves/TiGL/Rhino _NetworkSrf:
-      S1 = surface skinning the guides, built on a shared (u_bar, v_bar)
-           parameter grid so it passes through every guide's FULL shape,
-           not just the crossings.
-      S2 = surface skinning the profiles, built the same way then
-           axis-flipped to align with S1.
-      S3 = tensor-product interpolating surface through the (nu x nv)
-           intersection grid, on that SAME shared parameter grid
-           (subtracts the S1+S2 double-counting).
-
-    All three surfaces are built via the standard two-pass "global
-    surface interpolation" construction (Piegl & Tiller, The NURBS Book,
-    9.2.5; see _skin_through_family / _grid_interpolation_surface) on one
-    shared, averaged parameter grid -- u_bar[i] is the representative
-    "across-profiles" position for profile i (averaged over its nv
-    crossing parameters), v_bar[j] likewise for guide j. This is what
-    makes summing S1/S2/S3's poles pointwise geometrically meaningful: a
-    prior version built S1/S2 via a plain Part.makeLoft through the raw
-    curves and DISCARDED the intersection parameters entirely, so S1, S2
-    and S3 each had their own unrelated parametrization and the sum did
-    not reconstruct a surface through the rails (measured worst-case
-    passthrough error ~0.93 units on a 4x4 network, against the 0.01
-    tolerance the invariant requires).
-
-    The result touches every input rail at every crossing -- this is the
-    invariant the user reported as broken in the prior simplified
-    implementation, and the headless test `test_gordon_rails_pass_through`
-    enforces it.
-
-    User-drawn directions are honoured; curves drawn backwards will
-    produce a localised Z-fold in the surface at that curve, visible in
-    the viewport as feedback.
-
-    Parameters:
-      profiles, guides  : iterables of Part.Edge or Part.BSplineCurve.
-      samples_per_curve : refinement samples for the closest-approach
-                          fallback when two curves don't actually cross.
-      extra_per_gap     : extra samples inserted between crossings on each
-                          family's continuous axis (shape-fidelity knob;
-                          the multi-rail sweep raises it when it solves
-                          through this function).
+    Changes vs. previous version:
+      * u_bar/v_bar average each curve's crossing parameter NORMALISED to
+        its own [0,1] domain (raw parameters let the longest-domain curve
+        dominate the spacing).
+      * warns when a curve's crossing parameters are not monotone along the
+        sorted shared axis (the curve would double back).
+      * `_network=(bs_profiles, bs_guides, (params_u, params_v, gaps))` lets
+        _try_gordon_route hand over the intersection grid it already has.
+    See the module history for the construction notes (Piegl & Tiller 9.2.5).
     """
-    bs_profiles = [_to_bspline(e) for e in profiles]
-    bs_guides = [_to_bspline(e) for e in guides]
-    bs_profiles = [b for b in bs_profiles if b is not None]
-    bs_guides = [b for b in bs_guides if b is not None]
+    if _network is not None:
+        bs_profiles, bs_guides, (params_u, params_v, gaps) = _network
+        bs_profiles, bs_guides = list(bs_profiles), list(bs_guides)
+    else:
+        bs_profiles = [b for b in (_to_bspline(e) for e in profiles)
+                       if b is not None]
+        bs_guides = [b for b in (_to_bspline(e) for e in guides)
+                     if b is not None]
+        if len(bs_profiles) >= 2 and len(bs_guides) >= 2:
+            params_u, params_v, gaps = _intersect_grid(bs_profiles, bs_guides)
     if len(bs_profiles) < 2 or len(bs_guides) < 2:
         raise ValueError(
             "gordon_network needs >= 2 profiles and >= 2 guides (got "
             "%d profiles, %d guides)" % (len(bs_profiles), len(bs_guides)))
-
     nu, nv = len(bs_profiles), len(bs_guides)
 
-    # 1) Compute the (nu x nv) intersection parameter matrix per family.
-    #    Each entry is the parameter where this curve meets the other
-    #    curve AT THAT PAIR -- not an average.
-    params_u, params_v, gaps = _intersect_grid(bs_profiles, bs_guides)
-
-    # A Gordon surface can only pass through the WHOLE network if that network
-    # is COMPATIBLE: every profile must genuinely cross every guide. Where a
-    # pair merely comes close, _intersect_grid falls back to closest approach
-    # and the surface necessarily splits the difference -- no boolean-sum
-    # construction (this one or any other) can pass within t of two rails that
-    # are themselves more than t apart. That used to be discarded silently and
-    # showed up as "the surface doesn't touch its boundary curves", so report it.
     worst, worst_ij = 0.0, None
     for i in range(nu):
         for j in range(nv):
@@ -434,45 +401,19 @@ def gordon_network(profiles, guides, samples_per_curve=24, extra_per_gap=4):
                 worst, worst_ij = gaps[i][j], (i, j)
     if worst_ij is not None and worst > _GORDON_CROSS_TOL:
         FreeCAD.Console.PrintWarning(
-            "Railform Gordon: the curve network is not compatible -- profile %d "
-            "and guide %d never actually cross (closest approach %.4g). The "
-            "surface will pass BETWEEN the rails there rather than through "
-            "them. Make every profile genuinely intersect every guide (snap "
-            "their crossings together) for a surface that touches all of "
-            "them.\n" % (worst_ij[0] + 1, worst_ij[1] + 1, worst))
+            "Railform Gordon: the curve network is not compatible -- profile "
+            "%d and guide %d never actually cross (closest approach %.4g). "
+            "The surface will pass BETWEEN the rails there rather than "
+            "through them. Make every profile genuinely intersect every "
+            "guide for a surface that touches all of them.\n"
+            % (worst_ij[0] + 1, worst_ij[1] + 1, worst))
 
-    # 2) Representative ("compatible network") parameter per index -- the
-    #    shared axis every one of S1/S2/S3 is built on.
-    #
-    #    u_bar[i] is profile i's position on the shared "across-profiles"
-    #    axis. It comes from params_v (each GUIDE's OWN parameter at its
-    #    crossing with profile i), NOT params_u -- a profile's own
-    #    arc-parameter at its crossings with the various guides is a
-    #    "along-this-profile" quantity (roughly start/mid/end of ITS OWN
-    #    arc for any evenly-spaced network, however i varies), so
-    #    averaging params_u by row does NOT vary meaningfully with i.
-    #    It's the GUIDES -- which run across every profile in turn --
-    #    whose own parametrization naturally increases with profile
-    #    index; averaging their crossing parameter over j gives a value
-    #    that actually separates profile 0 from profile 1 from profile 2.
-    #    v_bar[j] is the mirror image, from params_u averaged over i.
-    u_bar_raw = [sum(params_v[i][j] for j in range(nv)) / nv for i in range(nu)]
-    v_bar_raw = [sum(params_u[i][j] for i in range(nu)) / nu for j in range(nv)]
+    # shared axes from NORMALISED crossing parameters
+    u_bar_raw = [sum(_norm_param(bs_guides[j], params_v[i][j])
+                     for j in range(nv)) / nv for i in range(nu)]
+    v_bar_raw = [sum(_norm_param(bs_profiles[i], params_u[i][j])
+                     for i in range(nu)) / nu for j in range(nv)]
 
-    # 2b) The natural INPUT order for one family isn't guaranteed to be
-    #     monotonic in the shared axis above -- e.g. a guide family drawn
-    #     "backwards" relative to increasing profile index makes u_bar
-    #     come out DECREASING even though the profiles themselves were
-    #     given in a sensible order (drawn curve DIRECTION is honoured
-    #     throughout this module, see test_gordon_preserves_user_direction,
-    #     so this isn't something we can just normalize away upstream).
-    #     BSplineCurve.interpolate(Parameters=...) requires a strictly
-    #     increasing list, so re-sort the shared-axis index order by the
-    #     computed u_bar/v_bar and carry every per-index array (curves,
-    #     both parameter matrices) along with it. This only relabels
-    #     which internal row/column corresponds to which input curve --
-    #     the resulting surface's geometry doesn't depend on that label
-    #     order, only that it stays internally consistent.
     order_i = sorted(range(nu), key=lambda i: u_bar_raw[i])
     order_j = sorted(range(nv), key=lambda j: v_bar_raw[j])
     bs_profiles = [bs_profiles[i] for i in order_i]
@@ -482,84 +423,62 @@ def gordon_network(profiles, guides, samples_per_curve=24, extra_per_gap=4):
     u_bar = _strictly_increasing([u_bar_raw[i] for i in order_i])
     v_bar = _strictly_increasing([v_bar_raw[j] for j in order_j])
 
-    # 3) S1: skin through guides -- continuous (exact shape) along each
-    #    guide's own arc (u_bar anchors), discrete across the nv guides
-    #    (v_bar). No exchangeUV needed: built directly in the (u_bar,
-    #    v_bar) orientation S1 needs for the final sum.
+    # monotonicity of each curve's own crossing parameters on the shared axis
+    bad = None
+    for j in range(nv):
+        if not _monotone([params_v[i][j] for i in range(nu)]):
+            bad = "guide %d" % (j + 1)
+            break
+    if bad is None:
+        for i in range(nu):
+            if not _monotone(params_u[i]):
+                bad = "profile %d" % (i + 1)
+                break
+    if bad is not None:
+        FreeCAD.Console.PrintWarning(
+            "Railform Gordon: %s meets the other family in an order that "
+            "disagrees with the shared axis (it would double back). The "
+            "network is mis-ordered or has a stray extra crossing; expect a "
+            "fold in the surface.\n" % bad)
+
     own_v_per_guide = [[params_v[i][j] for i in range(nu)] for j in range(nv)]
     s1, u_ref = _skin_through_family(bs_guides, own_v_per_guide, u_bar, v_bar,
                                      extra_per_gap=extra_per_gap)
-
-    # 4) S2: skin through profiles -- continuous along each profile's own
-    #    arc (v_bar anchors), discrete across the nu profiles (u_bar).
-    #    Built axis-swapped relative to S1's convention, then
-    #    exchangeUV()'d to align -- mirrors the original algorithm's use
-    #    of exchangeUV for the same reason.
-    own_u_per_profile = [[params_u[i][j] for j in range(nv)] for i in range(nu)]
+    own_u_per_profile = [[params_u[i][j] for j in range(nv)]
+                         for i in range(nu)]
     s2, v_ref = _skin_through_family(bs_profiles, own_u_per_profile, v_bar,
                                      u_bar, extra_per_gap=extra_per_gap)
     s2.exchangeUV()
 
-    # 5) S3 = tensor interpolation through the (nu x nv) intersection
-    #    grid, at the SAME (u_bar, v_bar) parametrization S1/S2 use.
     grid_pts = [[bs_profiles[i].value(params_u[i][j]) for j in range(nv)]
                 for i in range(nu)]
     s3 = _grid_interpolation_surface(grid_pts, u_bar, v_bar)
 
-    # 6) Match degree FIRST. A family with few members (e.g. 3 guides)
-    #    only has enough poles for a degree-2 interpolation, while u_ref/
-    #    v_ref (built from many dense master samples) are degree 3 -- and
-    #    the explicit knot insertion in step 7 requires matching degrees
-    #    (inserting a degree-3 multiplicity into a degree-2 curve is
-    #    invalid and hangs OCCT's insertion routine rather than raising).
     _match_degrees(s1, s2, s3)
-
-    # 7) Every surface has ONE densely-sampled axis (S1's U, from u_ref;
-    #    S2(exchanged)'s V, from v_ref) and axes built directly from the
-    #    sparse nu/nv anchor values (S1's V, S2(exchanged)'s U, and BOTH
-    #    of S3's axes) -- those sparse axes are consistent in VALUE with
-    #    the dense ones (same underlying u_bar/v_bar anchors) but not in
-    #    KNOT COUNT, since the dense pass adds extra interior knots at
-    #    the fill samples between anchors. Bring every sparse axis up to
-    #    the dense reference's exact knot structure via pure knot
-    #    insertion -- lossless (doesn't change the surface's shape, only
-    #    its representation) -- so the three surfaces are guaranteed
-    #    pole-count-compatible before the sum, rather than hoping a
-    #    generic post-hoc knot-union reconciliation happens to converge.
     for s in (s1, s3):
-        s.insertVKnots(v_ref.getKnots(), v_ref.getMultiplicities(), 1e-9, False)
+        s.insertVKnots(v_ref.getKnots(), v_ref.getMultiplicities(), 1e-9,
+                       False)
     for s in (s2, s3):
-        s.insertUKnots(u_ref.getKnots(), u_ref.getMultiplicities(), 1e-9, False)
-
-    # 8) A final defensive knot-union pass to mop up any residual (e.g.
-    #    floating-point) mismatch the explicit insertion above didn't
-    #    already cover.
+        s.insertUKnots(u_ref.getKnots(), u_ref.getMultiplicities(), 1e-9,
+                       False)
     _harmonize_surface_knots(s1, s2, s3)
 
-    # 9) S = S1 + S2 - S3 (control-point-wise).
     out = s1.copy()
     nu_p, nv_p = out.NbUPoles, out.NbVPoles
     if (s2.NbUPoles, s2.NbVPoles) != (nu_p, nv_p) or \
        (s3.NbUPoles, s3.NbVPoles) != (nu_p, nv_p):
-        # Pole counts diverged. Fall back to the S3 interpolation -- it
-        # still passes through every intersection point even if the
-        # resulting surface doesn't pass through every rail. This used to
-        # return silently, so a degraded surface was indistinguishable from a
-        # correct one; say so instead.
         FreeCAD.Console.PrintWarning(
             "Railform Gordon: pole counts diverged after knot harmonisation "
             "(S1 %dx%d, S2 %dx%d, S3 %dx%d) -- falling back to the crossing-"
             "grid interpolation. The surface will pass through the curve "
-            "CROSSINGS but will NOT follow the rails between them, so it may "
-            "visibly pull away from its boundary curves.\n"
-            % (nu_p, nv_p, s2.NbUPoles, s2.NbVPoles, s3.NbUPoles, s3.NbVPoles))
+            "CROSSINGS but will NOT follow the rails between them.\n"
+            % (nu_p, nv_p, s2.NbUPoles, s2.NbVPoles, s3.NbUPoles,
+               s3.NbVPoles))
         return s3.toShape()
     for i in range(1, nu_p + 1):
         for j in range(1, nv_p + 1):
-            cp = (out.getPole(i, j)
-                  + s2.getPole(i, j)
-                  - s3.getPole(i, j))
-            out.setPole(i, j, cp)
+            out.setPole(i, j, out.getPole(i, j) + s2.getPole(i, j)
+                        - s3.getPole(i, j))
     return out.toShape()
 
 
@@ -799,117 +718,81 @@ def _cross_dir_in_plane(edge_tangent, plane_n, length=1.0):
 
 def _gregory_triangle_grid(O, A, B, edge_AB, spoke_OA, spoke_OB,
                            data_A, data_B, samples=16):
-    """Grid of points for one Gregory triangular sub-patch (O, A, B).
+    """Grid for one triangular sub-patch (O, A, B), (s, t) layout identical
+    to _triangular_coons_grid: s runs A->B, t runs O->boundary, row t=0
+    collapses to O.
 
-    O = star center, A and B = adjacent corners, edge_AB = boundary curve
-    from A to B.  spoke_OA / spoke_OB are the quintic/septic Hermite spoke
-    callables from _star_spoke.  data_A / data_B are corner tangent dicts.
+    A cubic Bezier triangle supplies the interior shape (control points as
+    before). Its three sides generally differ from the real boundary and
+    spokes, so a Coons-style correction
 
-    Builds a cubic Gregory triangle: 10 control points (3 corners, 6 edge
-    Gregory points, 1 interior).  Evaluated on a samples x samples grid over
-    the triangle domain and converted to a BSpline surface via
-    grid_to_surface.  Boundary match on edge AB is exact; spoke match on OA
-    and OB is exact; G1 at O, A, B is exact by construction.
-    """
+        P = Bez + (1-s)*dA(t) + s*dB(t) + t*dE(s)
+
+    (dA/dB/dE = real side minus Bezier side) makes all three sides EXACT:
+    G0 to the boundary curve and to the shared spokes, so adjacent
+    sub-patches sew. The corner deltas are zero, so the correction is
+    consistent. G1 across spokes is NOT guaranteed by this construction."""
     n = samples
-    grid = []
-
-    # --- Gregory control points ------------------------------------------ #
-    # Edge OA (spoke from center to corner A)
-    # Cross-boundary at O: in center plane, perpendicular to spoke OA
+    # ---- control points (unchanged) ------------------------------------ #
     spoke_OA_dir = (A - O)
     spoke_OA_dir.normalize()
-    center_n = data_A["plane_n"]  # use center's plane (shared across corners)
+    center_n = data_A["plane_n"]
     w_OA_O = _cross_dir_in_plane(spoke_OA_dir, center_n)
-    # Cross-boundary at A: in corner A's tangent plane, perpendicular to spoke AO
     spoke_AO_dir = (O - A)
     spoke_AO_dir.normalize()
     w_OA_A = _cross_dir_in_plane(spoke_AO_dir, data_A["plane_n"])
-
     L_OA = (A - O).Length
+    zero = Vector(0, 0, 0)
     b210 = O + spoke_OA_dir * (L_OA / 3.0) \
-        + (w_OA_O * (L_OA / 3.0) if w_OA_O is not None else Vector(0, 0, 0))
+        + (w_OA_O * (L_OA / 3.0) if w_OA_O is not None else zero)
     b120 = A + spoke_AO_dir * (L_OA / 3.0) \
-        + (w_OA_A * (L_OA / 3.0) if w_OA_A is not None else Vector(0, 0, 0))
+        + (w_OA_A * (L_OA / 3.0) if w_OA_A is not None else zero)
 
-    # Edge OB (spoke from center to corner B)
     spoke_OB_dir = (B - O)
     spoke_OB_dir.normalize()
     w_OB_O = _cross_dir_in_plane(spoke_OB_dir, center_n)
     spoke_BO_dir = (O - B)
     spoke_BO_dir.normalize()
     w_OB_B = _cross_dir_in_plane(spoke_BO_dir, data_B["plane_n"])
-
     L_OB = (B - O).Length
     b201 = O + spoke_OB_dir * (L_OB / 3.0) \
-        + (w_OB_O * (L_OB / 3.0) if w_OB_O is not None else Vector(0, 0, 0))
+        + (w_OB_O * (L_OB / 3.0) if w_OB_O is not None else zero)
     b102 = B + spoke_BO_dir * (L_OB / 3.0) \
-        + (w_OB_B * (L_OB / 3.0) if w_OB_B is not None else Vector(0, 0, 0))
+        + (w_OB_B * (L_OB / 3.0) if w_OB_B is not None else zero)
 
-    # Edge AB (boundary curve)
-    # Cross-boundary at A: in corner A's tangent plane, perpendicular to
-    # boundary tangent at A, pointing into the triangle.
     t_AB_A = data_A["t_out"] if data_A["t_out"] is not None else spoke_OA_dir
     w_AB_A = _cross_dir_in_plane(t_AB_A, data_A["plane_n"])
-    # Make sure it points into the triangle (toward center side)
-    if w_AB_A is not None:
-        to_center = O - A
-        if w_AB_A.dot(to_center) < 0:
-            w_AB_A = w_AB_A.negative()
-
+    if w_AB_A is not None and w_AB_A.dot(O - A) < 0:
+        w_AB_A = w_AB_A.negative()
     t_AB_B = data_B["t_in"] if data_B["t_in"] is not None else spoke_OB_dir
     w_AB_B = _cross_dir_in_plane(t_AB_B, data_B["plane_n"])
-    if w_AB_B is not None:
-        to_center = O - B
-        if w_AB_B.dot(to_center) < 0:
-            w_AB_B = w_AB_B.negative()
-
+    if w_AB_B is not None and w_AB_B.dot(O - B) < 0:
+        w_AB_B = w_AB_B.negative()
     L_AB = max((B - A).Length, 1e-9)
     b021 = A + (B - A) * (1.0 / 3.0) \
-        + (w_AB_A * (L_AB / 3.0) if w_AB_A is not None else Vector(0, 0, 0))
+        + (w_AB_A * (L_AB / 3.0) if w_AB_A is not None else zero)
     b012 = B + (A - B) * (1.0 / 3.0) \
-        + (w_AB_B * (L_AB / 3.0) if w_AB_B is not None else Vector(0, 0, 0))
-
-    # Interior control point: average of edge Gregory points, pulled toward
-    # center to keep the patch well-shaped.  This is the standard Gregory
-    # interior-point choice that gives G1 continuity across seams.
+        + (w_AB_B * (L_AB / 3.0) if w_AB_B is not None else zero)
     b111 = (b210 + b120 + b021 + b012 + b102 + b201) * (1.0 / 6.0)
 
-    # --- Evaluate on triangle domain ------------------------------------- #
-    # Cubic Bézier triangle: P(u,v,w) with u+v+w=1, u,v,w>=0.
-    # We sample u (O->A direction) and v (O->B direction), w = 1-u-v.
-    for i in range(n):
-        row = []
-        u = i / (n - 1.0) if n > 1 else 0.0
-        for j in range(n):
-            v = j / (n - 1.0) if n > 1 else 0.0
-            w = 1.0 - u - v
-            if w < 0:
-                # Outside the triangle: clamp to boundary
-                w = 0.0
-                if u + v > 1.0:
-                    scale = 1.0 / (u + v)
-                    u *= scale
-                    v *= scale
-                    w = 0.0
-            # Bernstein basis for cubic triangle (degree 3):
-            # P = sum_{i+j+k=3} b_ijk * B_ijk(u,v,w)
-            # B_ijk = 6 * u^i * v^j * w^k / (i! j! k!)
-            u2 = u * u; u3 = u2 * u
-            v2 = v * v; v3 = v2 * v
-            w2 = w * w; w3 = w2 * w
+    def bez(wO, wA, wB):
+        return (O * (wO ** 3) + A * (wA ** 3) + B * (wB ** 3)
+                + b210 * (3 * wO * wO * wA) + b120 * (3 * wO * wA * wA)
+                + b021 * (3 * wA * wA * wB) + b012 * (3 * wA * wB * wB)
+                + b102 * (3 * wO * wB * wB) + b201 * (3 * wO * wO * wB)
+                + b111 * (6 * wO * wA * wB))
 
-            p = (O * (u3)                      # b300 = O, i=3
-                 + A * (v3)                      # b030 = A, j=3
-                 + B * (w3)                      # b003 = B, k=3
-                 + b210 * (3 * u2 * v)           # i=2,j=1
-                 + b120 * (3 * u * v2)           # i=1,j=2
-                 + b021 * (3 * v2 * w)           # j=2,k=1
-                 + b012 * (3 * v * w2)           # j=1,k=2
-                 + b102 * (3 * u * w2)           # i=1,k=2
-                 + b201 * (3 * u2 * w)           # i=2,k=1
-                 + b111 * (6 * u * v * w))       # i=1,j=1,k=1
-            row.append(p)
+    grid = []
+    for i in range(n):
+        s = i / (n - 1.0) if n > 1 else 0.0
+        row = []
+        for j in range(n):
+            t = j / (n - 1.0) if n > 1 else 0.0
+            p = bez(1.0 - t, t * (1.0 - s), t * s)
+            dA = spoke_OA(t) - bez(1.0 - t, t, 0.0)
+            dB = spoke_OB(t) - bez(1.0 - t, 0.0, t)
+            dE = _pt(edge_AB, s) - bez(0.0, 1.0 - s, s)
+            row.append(p + dA * (1.0 - s) + dB * s + dE * t)
         grid.append(row)
     return grid
 
@@ -1019,14 +902,23 @@ def _average_point(pts):
 
 
 def _order_open_loop(edges, tol=1e-5):
-    """Like _chain_loop, but for any N (not just 4) and returns (edge, flip)
-    pairs ordered so consecutive sides share an endpoint -- the corner ring
-    n_sided_patch needs. Reimplemented separately from _chain_loop rather
-    than generalizing it, since coons_patch's 4-side assumption is baked
-    into its callers; duplicating the small chaining loop here is safer
-    than risking a subtle regression in the well-tested 4-side path."""
+    """Chain edges into a loop; returns [(edge, flip), ...].
+
+    Gap tolerance = tol * max(1, bounding-box diagonal of the edge endpoints)
+    (it used to scale with the tail's distance from the world origin), and the
+    last edge must close back onto the first start."""
     remaining = list(edges)
+    ends = []
+    for e in remaining:
+        ends += [_eval01(e, 0.0), _eval01(e, 1.0)]
+    lo = Vector(min(p.x for p in ends), min(p.y for p in ends),
+                min(p.z for p in ends))
+    hi = Vector(max(p.x for p in ends), max(p.y for p in ends),
+                max(p.z for p in ends))
+    tol_abs = tol * max(1.0, hi.sub(lo).Length)
+
     first = remaining.pop(0)
+    start = _eval01(first, 0.0)
     loop = [(first, False)]
     tail = _eval01(first, 1.0)
     while remaining:
@@ -1038,40 +930,42 @@ def _order_open_loop(edges, tol=1e-5):
                 best, best_d, best_flip = e, ds, False
             if de < best_d:
                 best, best_d, best_flip = e, de, True
-        if best_d > tol * max(1.0, tail.Length if hasattr(tail, "Length") else 1.0) \
-                and best_d > tol:
+        if best_d > tol_abs:
             raise ValueError(
                 "n_sided_patch: boundary curves don't form a closed loop "
                 "(gap of %.4g between consecutive corners)" % best_d)
         loop.append((best, best_flip))
         remaining.remove(best)
         tail = _eval01(best, 0.0 if best_flip else 1.0)
+    if tail.distanceToPoint(start) > tol_abs:
+        raise ValueError(
+            "n_sided_patch: boundary curves don't close (last edge ends "
+            "%.4g from the first edge's start)" % tail.distanceToPoint(start))
     return loop
 
 
 
 def _corner_boundary_accel(loop_item):
-    """Raw (unnormalized) 2nd derivative d2P/du2 of the boundary curve at
-    the corner where `loop_item` (an (edge, flip) pair from _order_open_loop)
-    starts -- i.e. the boundary's OWN curvature vector leaving that corner.
-    Used by _star_spoke to shape a spoke's curvature near the rim to agree
-    with the boundary it meets, instead of an arbitrary straight spoke.
+    """Curvature VECTOR of the boundary at the corner where `loop_item`
+    (an (edge, flip) pair) starts: (d2 - (d2.T)T) / |d1|^2.
 
-    No sign flip is needed for a reversed (flip=True) edge: d2P/dt2 =
-    d2P/du2 * (du/dt)^2, and (du/dt) = -1 for a reversed direction, so the
-    squared term keeps d2's sign unchanged regardless of orientation
-    (unlike the 1st derivative, which genuinely flips -- see _pt/_eval01).
+    Fixes: (1) a flipped edge starts at its LAST parameter, but the old code
+    always evaluated at FirstParameter; (2) the raw d2P/du2 depended on the
+    edge's parametrisation/length, this does not. Reversal leaves curvature
+    unchanged, so no sign flip. None if unavailable (callers fall back to
+    zero curvature).
 
-    Returns None (not an approximate zero) if the underlying curve has no
-    analytic 2nd derivative available -- callers (_star_spoke) then fall
-    back to a zero-curvature spoke end, the same behaviour this function's
-    introduction did not change.
-    """
-    edge, _flip = loop_item
-    fp = edge.FirstParameter
+    Check against your _hermite7 convention: the consumer (_star_spoke)
+    scales this by L^2/2 as a Taylor coefficient."""
+    edge, flip = loop_item
+    u = edge.LastParameter if flip else edge.FirstParameter
     try:
-        _p, _d1, d2 = edge.Curve.getD2(fp)
-        return d2
+        _p, d1, d2 = edge.Curve.getD2(u)
+        speed2 = d1.dot(d1)
+        if speed2 < 1e-24:
+            return None
+        T = d1 * (1.0 / speed2 ** 0.5)
+        return (d2 - T * d2.dot(T)) * (1.0 / speed2)
     except Exception:
         return None
 
@@ -1200,17 +1094,15 @@ def _nearest_t(edge, pt, samples=100):
 
 
 class _NearestTCache:
-    """One sweep call's worth of sampled edges for repeated _nearest_t queries.
+    """Sampled-edge cache for repeated nearest-parameter queries.
 
-    multi_rail_sweep / two_rail_sweep query their rails once per profile
-    (flip heuristics, stations), so the same rails were re-evaluated
-    through OCCT 101 times per profile per query site. The cache samples
-    each edge once and re-uses the point list; the returned parameters are
-    bit-identical to _nearest_t's (same samples, same distances).
+    param() refines the best coarse sample by golden-section search in its
+    neighbouring interval, so station positions are no longer quantised to
+    1/samples; where the objective is flat at fp roundoff (boundary zones)
+    it snaps back to the exact sample parameter instead (see param()).
+    Edges must stay referenced for the cache's life (keyed by id())."""
+    _GR = 0.6180339887498949
 
-    Lives only inside one sweep call, and only grips edges the caller
-    keeps referenced for that whole call, so id() recycling can never
-    poison a lookup."""
     def __init__(self, samples=100):
         self._samples = int(samples)
         self._by_edge = {}
@@ -1225,13 +1117,44 @@ class _NearestTCache:
 
     def param(self, edge, pt):
         pts = self.points(edge)
-        step = 1.0 / self._samples
-        best_t, best_d = 0.0, 1e18
-        for k in range(len(pts)):
-            d = pts[k].distanceToPoint(pt)
+        n = self._samples
+        best_k, best_d = 0, 1e18
+        for k, p in enumerate(pts):
+            d = p.distanceToPoint(pt)
             if d < best_d:
-                best_d, best_t = d, k * step
-        return best_t
+                best_d, best_k = d, k
+        a, b = max(0.0, (best_k - 1) / float(n)), min(1.0,
+                                                      (best_k + 1) / float(n))
+        gr = self._GR
+
+        def f(t):
+            return _eval01(edge, t).distanceToPoint(pt)
+        c, d = b - gr * (b - a), a + gr * (b - a)
+        fc, fd = f(c), f(d)
+        for _ in range(40):
+            if fc < fd:
+                b, d, fd = d, c, fc
+                c = b - gr * (b - a)
+                fc = f(c)
+            else:
+                a, c, fc = c, d, fd
+                d = a + gr * (b - a)
+                fd = f(d)
+        t = 0.5 * (a + b)
+        # Golden-section presumes a strictly unimodal objective. On the
+        # flat zone beside a boundary (or anywhere flatter than fp
+        # roundoff) it chases 1e-16 noise, reporting a bogus minimum at
+        # t ~= 2e-9 for a point that lies ON the edge end (measured: a
+        # profile start station of 0.0 came back as 1.819e-9, which then
+        # sat beside station 0 in the station list -- dedupe gap 1e-9
+        # keeps both -- and the near-duplicate rows wrecked the surface
+        # interpolation). Snap back to the discrete sample whenever the
+        # refinement is not MEASURABLY better than the best sample: true
+        # wells (depth far above noise) still refine to fp width, while
+        # boundary/flat projections return the exact sample parameter.
+        if f(t) < best_d - max(best_d, 1.0) * 1e-12:
+            return t
+        return best_k / float(n)
 
 
 
@@ -1258,27 +1181,25 @@ def _perp(v):
 
 
 def two_rail_sweep(rail1, rail2, profiles, n_rail=40, n_prof=20):
-    """Skin a set of profile curves between two rail curves.
+    """Skin profile curves between two rails.
 
-    Each profile is expected to span from rail1 to rail2. We express every
-    profile in a local frame anchored on rail1 (chord-to-rail2 as X, the
-    section's own normal as the up axis), interpolate those local coordinates
-    along the rails, then rebuild points in the live rail frame at each station.
-
-    No matrix inversion and no Curves/libS2R dependency -- robust (degenerate
-    only where the rails physically touch) and fully headless-testable.
+    Correspondence is now PROFILE-DRIVEN: stations are arc fractions of rail1
+    and rail2 is evaluated at the arc fraction where each profile actually
+    touches it (piecewise-linear map through those contacts). At a profile's
+    own station both rail points are therefore its endpoints, even when the
+    rails have different lengths/parametrisations. The profiles' own stations
+    are added to the row set so the profile is reproduced exactly there.
     """
     n_prof = max(2, int(n_prof))
     n_rail = max(2, int(n_rail))
     cols = [s / (n_prof - 1.0) for s in range(n_prof)]
     cache = _NearestTCache()
+    arc1, arc2 = _ArcRail(rail1), _ArcRail(rail2)
 
-    # --- per-profile local description ---------------------------------- #
-    descs = []          # (station_t, up_vector, [(cx, cy, cz), ...])
+    descs = []          # (station on rail1, up_vector, local, frac on rail2)
     prev_up = None
     for pro in profiles:
         e0, e1 = _eval01(pro, 0.0), _eval01(pro, 1.0)
-        # orient so sample param 0 lands on rail1, last sample on rail2
         flip = (cache.param(rail1, e1) + cache.param(rail2, e0)) < \
                (cache.param(rail1, e0) + cache.param(rail2, e1))
         samp = [_eval01(pro, (1.0 - s) if flip else s) for s in cols]
@@ -1306,21 +1227,30 @@ def two_rail_sweep(rail1, rail2, profiles, n_rail=40, n_prof=20):
         for p in samp:
             d = p.sub(a)
             local.append((d.dot(ex) / L, d.dot(ey), d.dot(ez)))
-        descs.append((cache.param(rail1, a), ey, local))
+        descs.append((arc1.fraction_of(cache.param(rail1, a)), ey, local,
+                      arc2.fraction_of(cache.param(rail2, b))))
     if not descs:
         raise ValueError("two-rail sweep: no usable profiles")
     descs.sort(key=lambda d: d[0])
 
-    # --- build the grid along the rails --------------------------------- #
+    map2 = _anchor_map([(d[0], d[3]) for d in descs])
+    if map2 is None:
+        FreeCAD.Console.PrintWarning(
+            "Railform two-rail sweep: the profiles do not meet rail 2 in the "
+            "same order as rail 1 (or the rails run in opposite directions) "
+            "-- using equal arc fractions on both rails.\n")
+        map2 = lambda x: x    # noqa: E731
+
+    stations = _dedupe_stations(sorted(
+        [i / (n_rail - 1.0) for i in range(n_rail)] + [d[0] for d in descs]))
+
     grid = []
-    for i in range(n_rail):
-        t = i / (n_rail - 1.0)
-        a, b = _eval01(rail1, t), _eval01(rail2, t)
+    for t in stations:
+        a, b = arc1.point_at(t), arc2.point_at(map2(t))
         chord = b.sub(a)
         L = max(chord.Length, 1e-9)
         ex = Vector(chord)
         ex.normalize()
-        # bracket the defining profiles by station parameter
         if len(descs) == 1 or t <= descs[0][0]:
             lo = hi = descs[0]
             w = 0.0
@@ -1534,31 +1464,17 @@ _MULTIRAIL_STATION_SAG = 4.0       # subdivide a gap whose midpoint row sags
 
 
 def _smootherstep(s):
-    """C2 quintic smootherstep s^3(6s-15s+10), clamped to [0,1] -- the weight
-    the C++ design uses for its phi_i partition of unity (zero slope AND zero
-    curvature at both ends, so a contact anchor is 'dwellable', not merely
-    passable)."""
+    """C2 quintic smootherstep 6s^5 - 15s^4 + 10s^3 (= s^3(6s^2 - 15s + 10)),
+    clamped to [0,1]."""
     s = min(max(s, 0.0), 1.0)
     return s * s * s * (s * (6.0 * s - 15.0) + 10.0)
 
 
 class _ArcRail:
-    """Cumulative chord-length table over one rail edge -- the Python port of
-    the C++ transport's ArcCurve.  Stations on the sweep axis are arc
-    FRACTIONS, and every rail is evaluated at its own arc-fraction-equivalent
-    point, so rails of different lengths or parametrizations stay in sync
-    (the normalized-parameter sampling the spine path used before silently
-    desynced them; on equal-length, evenly-parametrized fixtures this table
-    is the identity, on real rails it is not)."""
+    """Cumulative chord-length table over one rail edge (normalized-parameter
+    space end to end; see the original comments on raw edge parameters)."""
     def __init__(self, edge, samples=256):
         self.edge = edge
-        # The table lives in NORMALIZED-parameter space end to end:
-        # _NearestTCache.param and the station conventions feed normalized
-        # params in, and point_at feeds its own results through _eval01,
-        # which also expects [0,1]. Edges produced by interpolating
-        # BSplineCurve.toShape() often carry RAW geometric parameters
-        # (e.g. chord length), so anything that kept raw edge params here
-        # would double-scale by the rail length.
         self.params = [k / float(samples) for k in range(samples + 1)]
         pts = [_eval01(edge, k / float(samples)) for k in range(samples + 1)]
         acc = [0.0]
@@ -1568,32 +1484,25 @@ class _ArcRail:
         self.acc = [a / self.total for a in acc]
 
     def fraction_of(self, t_norm):
-        """Normalized parameter -> arc fraction in [0,1] (piecewise linear)."""
         params, acc = self.params, self.acc
         if t_norm <= params[0]:
             return 0.0
         if t_norm >= params[-1]:
             return 1.0
-        for k in range(len(params) - 1):
-            if params[k] <= t_norm <= params[k + 1]:
-                span = params[k + 1] - params[k]
-                w = 0.0 if span < 1e-15 else (t_norm - params[k]) / span
-                return acc[k] + w * (acc[k + 1] - acc[k])
-        return 1.0
+        k = min(bisect.bisect_right(params, t_norm) - 1, len(params) - 2)
+        span = params[k + 1] - params[k]
+        w = 0.0 if span < 1e-15 else (t_norm - params[k]) / span
+        return acc[k] + w * (acc[k + 1] - acc[k])
 
     def param_at(self, s):
-        """Arc fraction -> normalized parameter (piecewise linear inverse)."""
         acc = self.acc
         s = min(max(s, 0.0), 1.0)
-        for k in range(len(acc) - 1):
-            if acc[k] <= s <= acc[k + 1]:
-                span = acc[k + 1] - acc[k]
-                w = 0.0 if span < 1e-15 else (s - acc[k]) / span
-                return self.params[k] + w * (self.params[k + 1] - self.params[k])
-        return self.params[-1]
+        k = min(max(bisect.bisect_right(acc, s) - 1, 0), len(acc) - 2)
+        span = acc[k + 1] - acc[k]
+        w = 0.0 if span < 1e-15 else (s - acc[k]) / span
+        return self.params[k] + w * (self.params[k + 1] - self.params[k])
 
     def point_at(self, s):
-        """Point on the rail at arc fraction s."""
         return _eval01(self.edge, self.param_at(s))
 
 
@@ -1622,13 +1531,22 @@ def _dedupe_stations(stations, gap=1e-9):
 
 
 def _deviation_of_curves(curves, shape, samples):
-    """Worst distance from midpoints along each curve to `shape`."""
+    """Worst distance from points along each curve to `shape`: both ends
+    plus `samples` midpoints. Accepts edges or BSplineCurves (edges are
+    converted trim-aware). Cost is dominated by distToShape; keep `samples`
+    modest."""
     worst = 0.0
+    n = max(1, int(samples))
+    fracs = [0.0] + [(k + 0.5) / n for k in range(n)] + [1.0]
     for c in curves:
+        c = _to_bspline(c)
+        if c is None:
+            continue
         fp, lp = c.FirstParameter, c.LastParameter
-        for k in range(int(samples)):
-            t = fp + (k + 0.5) / float(samples) * (lp - fp)
-            worst = max(worst, Part.Vertex(c.value(t)).distToShape(shape)[0])
+        for f in fracs:
+            worst = max(worst,
+                        Part.Vertex(c.value(fp + f * (lp - fp))
+                                    ).distToShape(shape)[0])
     return worst
 
 
@@ -1657,26 +1575,18 @@ def _rail_order_warning(profile_params):
 
 
 def _try_gordon_route(rails, profiles):
-    """Exact continuous solve for a well-formed multi-rail sweep network.
+    """Exact continuous solve for a compatible multi-rail network, or None.
 
-    The compatibility preconditions are measured, not assumed: every
-    profile must genuinely cross every rail (within _GORDON_CROSS_TOL,
-    plain closest-approach otherwise -- the same test gordon_network's
-    own warning enforces). The result is then measured against both
-    input families and only shipped when it actually holds every rail
-    within _MULTIRAIL_GORDON_RAIL_TOL and every profile within
-    _MULTIRAIL_GORDON_PROFILE_TOL -- anything less falls back to the
-    station-skinned spine path, which lands ON every rail at every
-    station by construction.
-
-    Returns the Part shape, or None to signal "use the spine path".
-    The intersection grid is computed here for validation and again
-    inside gordon_network for the solve; the duplicate OCCT work buys
-    not having to restructure gordon_network's public signature.
-    """
+    Gates are RELATIVE: _MULTIRAIL_GORDON_*_TOL * max(1, network diagonal).
+    The intersection grid is computed once and handed to gordon_network.
+    Returns None (-> spine path) when a profile doesn't cross a rail or the
+    measured deviation exceeds the gates."""
     bs_rails = [_to_bspline(r) for r in rails]
     bs_prof = [_to_bspline(p) for p in profiles]
-    params_u, _params_v, gaps = _intersect_grid(bs_prof, bs_rails)
+    if any(b is None for b in bs_rails + bs_prof):
+        return None
+    grid = _intersect_grid(bs_prof, bs_rails)
+    gaps = grid[2]
     nu, nv = len(bs_prof), len(bs_rails)
     worst, worst_ij = 0.0, None
     for i in range(nu):
@@ -1690,14 +1600,19 @@ def _try_gordon_route(rails, profiles):
             "-- skinning across stations instead. The surface will pass "
             "BETWEEN those two rather than through both there.\n"
             % (worst_ij[0] + 1, worst_ij[1] + 1, worst))
-        order_msg = _rail_order_warning(params_u)
+        order_msg = _rail_order_warning(grid[0])
         if order_msg:
             FreeCAD.Console.PrintWarning(
                 "Railform Multi-rail sweep: %s\n" % order_msg)
         return None
+
+    scale = max(1.0, _network_scale(bs_rails))
+    rail_tol = _MULTIRAIL_GORDON_RAIL_TOL * scale
+    prof_tol = _MULTIRAIL_GORDON_PROFILE_TOL * scale
     try:
         shape = gordon_network(profiles, rails,
-                               extra_per_gap=_MULTIRAIL_GORDON_DENSIFY)
+                               extra_per_gap=_MULTIRAIL_GORDON_DENSIFY,
+                               _network=(bs_prof, bs_rails, grid))
     except Exception as exc:
         FreeCAD.Console.PrintWarning(
             "Railform Multi-rail sweep: Gordon solve failed (%s) -- "
@@ -1707,67 +1622,37 @@ def _try_gordon_route(rails, profiles):
                                     _MULTIRAIL_GORDON_RAIL_SAMPLES)
     prof_dev = _deviation_of_curves(bs_prof, shape,
                                     _MULTIRAIL_GORDON_PROFILE_SAMPLES)
-    if rail_dev <= _MULTIRAIL_GORDON_RAIL_TOL and \
-            prof_dev <= _MULTIRAIL_GORDON_PROFILE_TOL:
+    if rail_dev <= rail_tol and prof_dev <= prof_tol:
         return shape
+    hint = ""
+    if worst > rail_tol:
+        hint = (" The worst profile/rail crossing gap is %.3g, which alone "
+                "exceeds the rail tolerance %.3g -- snap the crossings "
+                "together for an exact solve." % (worst, rail_tol))
     FreeCAD.Console.PrintWarning(
         "Railform Multi-rail sweep: Gordon solve does not hold the input "
-        "(worst rail deviation %.3g, profile %.3g) -- skinning across "
-        "stations instead.\n" % (rail_dev, prof_dev))
+        "(worst rail deviation %.3g vs %.3g, profile %.3g vs %.3g) -- "
+        "skinning across stations instead.%s\n"
+        % (rail_dev, rail_tol, prof_dev, prof_tol, hint))
     return None
 
 
 def multi_rail_sweep(rails, profiles, n_rail=40, n_prof=20):
-    """Skin a set of profile curves across N >= 2 rail curves.
+    """Skin profile curves across N >= 2 rails.
 
-    With >= 3 rails and >= 2 profiles, and a COMPATIBLE network (every
-    profile genuinely crosses every rail), the surface comes from a
-    Gordon boolean-sum solve -- it passes through the FULL shape of every
-    rail and profile continuously, not just at the sample stations (see
-    _try_gordon_route for the measured acceptance gates and fallbacks).
+    Same structure as before (2 rails -> two_rail_sweep; compatible network
+    -> Gordon; otherwise adaptive station skinning) with these corrections to
+    the station-skinning path:
 
-    Everything else uses an adaptive station-skinning transport that ports
-    the C++ multi-rail sweep design's exact-facing machinery onto the
-    crossed-network spine idea:
-
-      * rails[0] and rails[-1] bound the sweep exactly as in
-        two_rail_sweep; every INTERMEDIATE rail anchors it too.  Each
-        station samples ALL rails and bases the section on the polyline
-        through those points, with each profile's transverse offsets
-        measured against its own reference spine.
-      * the stations live on an ARC-FRACTION axis shared by every rail
-        (_ArcRail): each rail is sampled at its own arc-fraction point,
-        so rails of different lengths or parametrizations stay in sync.
-      * each profile's own station is a HARD station (the C++ design's
-        contact-point breaks): at exactly that position the row is that
-        profile's reconstruction, so "the profile wins at its own
-        station" is exact, not an accident of where uniform stations
-        happened to fall.
-      * between stations the row count ADAPTS: a gap whose midpoint row
-        deviates from the average of its bracketing rows by more than
-        _MULTIRAIL_STATION_SAG x _MULTIRAIL_SPINE_TOL subdivides, within
-        a budget of _MULTIRAIL_STATION_FACTOR x n_rail rows and
-        _MULTIRAIL_STATION_PASSES rounds.
-      * the section's remap between pinned rail columns eases with a C2
-        smootherstep (_spine_map_c2, the C++ phi_i partition of unity),
-        and the template morph between adjacent profiles eases the same
-        way -- tangent dwell at every anchor instead of C0 kinks.
-      * a degenerate station (rails collapsing onto a common point) is
-        refused with a message, in the C++ spirit of "failures as text,
-        never a bad surface".
-      * the finished surface is MEASURED against the boundary rails (the
-        one guarantee profile-endpoint pinning always gives); when the
-        between-station hold misses the target a warning names the
-        number and the knob.  The station pins themselves are exact by
-        construction.
-
-    For exactly two rails the call delegates to two_rail_sweep directly:
-    the old spine remap was the identity and the columns j/(n_prof-1)
-    there, so both paths already produced the same surface to
-    floating-point noise -- the delegation now makes that exact instead
-    of approximate.
-
-    No Curves/libS2R dependency; robust and headless-testable.
+      * each profile's reference spine now passes through where it ACTUALLY
+        contacts every interior rail (closest approach), not through the
+        rail point at the profile's start fraction;
+      * every rail k is sampled at arc_k(map_k(s)), where map_k is the
+        piecewise-linear map through the profiles' contact fractions
+        (_anchor_map), so at a profile's own station every rail point is
+        its contact point -> interior rails are on the surface there;
+      * ALL rails (not only the two boundary rails) are measured against the
+        finished surface and reported.
     """
     rails = list(rails)
     n_rails = len(rails)
@@ -1777,10 +1662,6 @@ def multi_rail_sweep(rails, profiles, n_rail=40, n_prof=20):
     n_prof = max(2, int(n_prof), n_rails)
     n_rail = max(2, int(n_rail))
 
-    # Exactly two rails IS two_rail_sweep: there the spine remap is the
-    # identity and the columns spread j/(n_prof-1), so the old N=2
-    # reduction reproduced it to floating-point noise. Delegate directly --
-    # same numbers, zero reduction drift.
     if n_rails == 2:
         return two_rail_sweep(rails[0], rails[1], profiles, n_rail, n_prof)
 
@@ -1791,30 +1672,36 @@ def multi_rail_sweep(rails, profiles, n_rail=40, n_prof=20):
         if gordon is not None:
             return gordon
 
-    # --- arc-length rail tables (the shared sweep axis) ------------------ #
     arc = [_ArcRail(r) for r in rails]
-
+    bs_rails = [_to_bspline(r) for r in rails]
     cache = _NearestTCache()
     descs = []
     prev_up = None
     for pro in profiles:
         e0, e1 = _eval01(pro, 0.0), _eval01(pro, 1.0)
-        # orient so sample param 0 lands on rail 0, last sample on rail N-1
         flip = (cache.param(base, e1) + cache.param(far, e0)) < \
                (cache.param(base, e0) + cache.param(far, e1))
 
         def P(t, _pro=pro, _flip=flip):
             return _eval01(_pro, 1.0 - t if _flip else t)
 
-        # Reference spine for this profile: its own two ends (which is what
-        # two_rail_sweep measures against) plus every interior rail sampled
-        # at the arc-fraction-synced station of the profile's start.  Vertex
-        # i is therefore the point the sweep must sit on for rail i, and
-        # the profile's transverse coordinates are taken relative to it.
         s_p = arc[0].fraction_of(cache.param(base, P(0.0)))
-        ref = [P(0.0)]
-        ref += [arc[k].point_at(s_p) for k in range(1, n_rails - 1)]
-        ref.append(P(1.0))
+        fracs = [s_p] + [0.0] * (n_rails - 2) + \
+            [arc[-1].fraction_of(cache.param(far, P(1.0)))]
+        ref = [P(0.0)] + [None] * (n_rails - 2) + [P(1.0)]
+        bs_pro = _to_bspline(pro)
+        for k in range(1, n_rails - 1):
+            f_k = None
+            if bs_pro is not None and bs_rails[k] is not None:
+                try:
+                    _tp, tr, _d = _closest_approach_pair(bs_pro, bs_rails[k])
+                    f_k = arc[k].fraction_of(_norm_param(bs_rails[k], tr))
+                except Exception:
+                    f_k = None
+            if f_k is None:
+                f_k = s_p
+            fracs[k] = f_k
+            ref[k] = arc[k].point_at(f_k)
         zref = _spine_params(ref)
         qcols, ucols, _pinned = _sweep_columns(zref, ref, P, n_prof)
         samp = [P(q) for q in qcols]
@@ -1842,29 +1729,33 @@ def multi_rail_sweep(rails, profiles, n_rail=40, n_prof=20):
         for k, p in enumerate(samp):
             u = ucols[k]
             d = p.sub(_spine_eval(zref, ref, u))
-            # full 3-component offset in the profile's orthonormal frame --
-            # the along-chord piece matters whenever the profile bulges away
-            # from the polyline spine between rail points
             local.append((u, d.dot(ex), d.dot(ey), d.dot(ez)))
-        descs.append((s_p, ey, local, zref))
+        descs.append((s_p, ey, local, zref, fracs))
     if not descs:
         raise ValueError("multi-rail sweep: no usable profiles")
     descs.sort(key=lambda d: d[0])
 
-    # --- rows at sweep stations (cached; adaptive passes reuse them) ----- #
+    # per-rail correspondence maps (sweep axis = rail 0 arc fraction)
+    maps = [lambda x: x]
+    for k in range(1, n_rails):
+        m = _anchor_map([(d[0], d[4][k]) for d in descs])
+        if m is None:
+            FreeCAD.Console.PrintWarning(
+                "Railform Multi-rail sweep: the profiles do not meet rail %d "
+                "in the same order as rail 1 -- sampling it at equal arc "
+                "fractions instead (the surface may miss that rail between "
+                "stations).\n" % (k + 1))
+            m = lambda x: x   # noqa: E731
+        maps.append(m)
+
     rows = {}
 
     def station_row(s):
-        """One grid row (plus its per-column spine params) at sweep-station
-        arc fraction s."""
         cached = rows.get(s)
         if cached is not None:
             return cached
-        wpts = [arc[k].point_at(s) for k in range(n_rails)]
+        wpts = [arc[k].point_at(maps[k](s)) for k in range(n_rails)]
         sparams = _spine_params(wpts)
-        # Degenerate-station guard (the C++ zero-Jacobian check): a rail
-        # chord that collapses to a point cannot carry a section -- refuse
-        # instead of silently skinning garbage.
         chord = wpts[-1].sub(wpts[0])
         if chord.Length < 1e-9:
             raise ValueError(
@@ -1873,12 +1764,6 @@ def multi_rail_sweep(rails, profiles, n_rail=40, n_prof=20):
                 "degenerates" % s)
         ex = Vector(chord)
         ex.normalize()
-        # A row ON a profile's own station (within table noise of that
-        # station's arc fraction) is that profile's exact reconstruction --
-        # the hard-station contract. Proximity, not float equality: the
-        # uniform grid and an arc-table anchor differ by ~1e-14, and
-        # _dedupe_stations keeps only one of the pair, so whichever
-        # station survives must still anchor to the profile.
         hard = None
         for d in descs:
             if abs(s - d[0]) <= 1e-9:
@@ -1899,12 +1784,7 @@ def multi_rail_sweep(rails, profiles, n_rail=40, n_prof=20):
                 k += 1
             lo, hi = descs[k], descs[k + 1]
             span = hi[0] - lo[0]
-            # C2 template morph between the bracketing profiles: the shape
-            # blend eases in/out at every anchor (the C++ phi behaviour)
-            # instead of ramping linearly, so a profile's own station is a
-            # genuine dwell on that profile's shape.
-            w = 0.0 if span < 1e-12 else \
-                _smootherstep((s - lo[0]) / span)
+            w = 0.0 if span < 1e-12 else _smootherstep((s - lo[0]) / span)
         up = lo[1] * (1.0 - w) + hi[1] * w
         ez = ex.cross(up)
         if ez.Length < 1e-9:
@@ -1913,7 +1793,6 @@ def multi_rail_sweep(rails, profiles, n_rail=40, n_prof=20):
         ez.normalize()
         ey = ez.cross(ex)
         ey.normalize()
-        # interpolated reference spine: vertex k of lo/hi -> vertex k here
         zmap = [lo[3][k] * (1.0 - w) + hi[3][k] * w for k in range(n_rails)]
         row, sps = [], []
         for j in range(n_prof):
@@ -1923,41 +1802,20 @@ def multi_rail_sweep(rails, profiles, n_rail=40, n_prof=20):
             cx = cx0 * (1.0 - w) + cx1 * w
             cy = cy0 * (1.0 - w) + cy1 * w
             cz = cz0 * (1.0 - w) + cz1 * w
-            # C2 remap between the pinned rail columns for the GEOMETRY
-            # between two anchors (the C++ phi weights: dwell tangent at
-            # each rail vertex, so station transitions across the section
-            # are C2, not kinked).  At a hard station (w exactly 0 or 1:
-            # the row IS one profile's anchor) keep the plain linear map:
-            # with the anchor's own spine as the map source it is the
-            # identity there, so the row reproduces the profile's original
-            # interior positions exactly.
             if 0.0 < w < 1.0:
                 sp = _spine_map_c2(zmap, sparams, u)
             else:
                 sp = _spine_map(zmap, sparams, u)
-            # the section PARAMETERIZATION bookkeeping stays on the plain
-            # linear map (pre-C2 behaviour): the finisher's v grid must be
-            # the profiles' own column params for the anchor iso-curve's
-            # stage-A interpolation to reconstruct the profile curve to
-            # machine precision (OCC's interpolate() with a curve's own
-            # parameterization reproduces it exactly), which the C2
-            # dwell-plateau values would shift.
             sps.append(_spine_map(zmap, sparams, u))
             pt = _spine_eval(sparams, wpts, sp)
             row.append(pt + ex * cx + ey * cy + ez * cz)
         rows[s] = (row, sps)
         return rows[s]
 
-    # initial station set: the uniform n_rail grid plus the profiles' own
-    # hard stations and the exact ends
     station_list = _dedupe_stations(sorted(
         [i / float(n_rail - 1) for i in range(n_rail)]
         + [d[0] for d in descs] + [0.0, 1.0]))
 
-    # adaptive subdivision: probe each gap's midpoint row against the
-    # average of its bracketing rows over the full pinned-column set
-    # (the C++ chord-deviation probe); subdivide where it sags past the
-    # target, one round at a time, within the station budget
     max_stations = _MULTIRAIL_STATION_FACTOR * n_rail
     for _round in range(_MULTIRAIL_STATION_PASSES):
         room = max_stations - len(station_list)
@@ -1988,11 +1846,6 @@ def multi_rail_sweep(rails, profiles, n_rail=40, n_prof=20):
         grown.append(station_list[-1])
         station_list = _dedupe_stations(grown)
 
-    # final rows: every adaptive station, exactly interpolated through the
-    # grid points at EXPLICIT parameters (the station arc fractions along
-    # the sweep axis, each column's mean spine position across stations
-    # along the section axis) -- the between-node shape tracks the real
-    # rail/profile correspondence instead of chord-length guesses
     spine_u_acc = [0.0] * n_prof
     grid = []
     for s in station_list:
@@ -2007,20 +1860,15 @@ def multi_rail_sweep(rails, profiles, n_rail=40, n_prof=20):
     except Exception:
         shape = grid_to_surface(grid)
 
-    # measured, not assumed (the C++ Result::maxRailDeviation gate): hold
-    # the finished surface against the boundary rails -- the one guarantee
-    # profile-endpoint pinning always gives -- and say so when the
-    # between-station hold misses the target.  Warn, never throw: this
-    # path exists for input the exact continuous solve already refused.
     try:
-        dev = _deviation_of_curves([base.Curve, far.Curve], shape,
+        dev = _deviation_of_curves(rails, shape,
                                    _MULTIRAIL_GORDON_RAIL_SAMPLES)
         if dev > 10.0 * _MULTIRAIL_SPINE_TOL:
             FreeCAD.Console.PrintWarning(
                 "Railform Multi-rail sweep: station skinning holds the "
-                "boundary rails to %.3g between stations (target %.3g) -- "
-                "raise Rail Samples (denser stations) or add profiles near "
-                "the worst gap for a tighter sweep.\n"
+                "rails to %.3g between stations (target %.3g) -- raise Rail "
+                "Samples (denser stations) or add profiles near the worst "
+                "gap for a tighter sweep.\n"
                 % (dev, _MULTIRAIL_SPINE_TOL))
     except Exception:
         pass
@@ -2093,24 +1941,18 @@ def _rmf_frames(arc, stations, up0):
 
 
 def single_rail_sweep(rail, profiles, n_rail=40, n_prof=20):
-    """Classic pipe/spine sweep: one profile transported along ONE rail.
+    """Pipe sweep along ONE rail with a rotation-minimizing frame.
 
-    The other sweeps here need >= 2 rails because the second rail supplies
-    the section's orientation. This one uses the rail itself as the spine
-    and a rotation-minimizing frame (Wang et al. double reflection -- the
-    same transport the C++ FeatureMultiRailSweep belongs to) for the
-    orientation, so an arbitrary profile rides the curve the way
-    Part Sweep / makePipeShell(RMF) would: every station rebuilds the
-    profile's ORIGINAL offsets from the spine in the transported frame --
-    the offset lengths are preserved exactly, section transitions ease
-    with arc-length stations, and a closed profile closes the tube.
-
-    stations: uniform n_rail grid refined by the same measured midpoint
-    vs bracket-average chord-deviation subdivision the N-rail spine
-    fallback uses (same sag budget/constants). Multiple profiles are
-    accepted: each is pinned at its first sample's nearest-arc station on
-    the rail and the offsets morph linearly between them (two_rail_sweep's
-    description blending), so sections change shape along the spine.
+    Fixes: profile offsets used to be measured in a single-station frame
+    chain, rows were rebuilt in a chain seeded elsewhere (frames differ by
+    the transport rotation on curved rails), and the sag probe compared a
+    fresh single-station frame against the transported chain. Now every
+    pass builds ONE chain over the station list (which always contains each
+    profile's own station exactly), measures every profile's offsets in that
+    chain's frame at its station, builds all rows from the same frames, and
+    probes the gap midpoints from the same chain. A profile is reproduced
+    exactly at its station, and the sag measure sees geometry, not frame
+    mismatch.
     """
     n_prof = max(2, int(n_prof))
     n_rail = max(2, int(n_rail))
@@ -2123,74 +1965,65 @@ def single_rail_sweep(rail, profiles, n_rail=40, n_prof=20):
     cache = _NearestTCache()
     cols = [k / float(n_prof - 1) for k in range(n_prof)]
 
-    descs = []
-    up0 = None
+    descs = []                       # (station, samples)
     for pro in profiles:
         samp = [_eval01(pro, q) for q in cols]
-        # degeneracy: a collapsed profile.  For a CLOSED profile the
-        # first and last samples coincide BY construction (param 0 == 1),
-        # so measure against the mid-parameter sample instead.
         mid = samp[len(samp) // 2]
         if mid.sub(samp[0]).Length < 1e-9:
             continue
-        s_i = arc.fraction_of(cache.param(rail, samp[0]))
-        spine_i = arc.point_at(s_i)
-        # orientation reference for the transported frame start: the
-        # profile's own plane normal, projected perpendicular to the rail's
-        # tangent at the frame's start
-        t0 = _rail_tangent(arc, s_i)
-        if up0 is None:
-            nrm = _polygon_normal(samp)
-            nrm = nrm.sub(t0 * (nrm.dot(t0)))
-            if nrm.Length > 1e-9:
-                nrm.normalize()
-                up0 = nrm
-            else:
-                up0 = _perp(t0)
-        # the offsets ride in the TRANSPORT frame at this profile's own
-        # station, NOT in world axes -- rows rebuild spine + frame*offset,
-        # so world-coordinate offsets would re-express the profile in a
-        # wrongly rotated basis the moment the frame turns along the spine.
-        # A single-station RMF chain measures the frame directly (exactly
-        # for the first desc and on straight spines; interior profiles on
-        # curved spines get the closest practical anchor frame).
-        _t, _ey0, _ez0 = _rmf_frames(arc, [s_i], up0)[0]
-        off = []
-        for p in samp:
-            d = p.sub(spine_i)
-            off.append((d.dot(_t), d.dot(_ey0), d.dot(_ez0)))
-        descs.append((s_i, samp, off))
+        descs.append((arc.fraction_of(cache.param(rail, samp[0])), samp))
     if not descs:
         raise ValueError("single-rail sweep: profiles are degenerate "
                          "(zero chord)")
     descs.sort(key=lambda d: d[0])
-    # A CLOSED profile closes here natively: its param 0 == param 1 (the
-    # cols grid runs 0..1 inclusive and _eval01(1.0) repeats the first
-    # point), so the last column IS the seam -- adding a wrap column would
-    # put two identical points a param nudge apart, which OCC's
-    # interpolator rejects outright (Standard_ConstructionError, and the
-    # grid_to_surface fallback then re-parametrizes away the alignment).
-    # OPEN profiles sweep with a gap at the seam, exactly like the other
-    # sweeps' open sections.
-    m = n_prof
+    profile_stations = [d[0] for d in descs]
 
-    def desc_at(s):
-        if len(descs) == 1 or s <= descs[0][0]:
-            return descs[0], descs[0], 0.0
-        if s >= descs[-1][0]:
-            return descs[-1], descs[-1], 0.0
-        k = 0
-        while k < len(descs) - 1 and descs[k + 1][0] < s:
-            k += 1
-        lo, hi = descs[k], descs[k + 1]
-        span = hi[0] - lo[0]
-        return lo, hi, 0.0 if span < 1e-12 else (s - lo[0]) / span
+    # frame seed at station 0: first profile's plane normal, made
+    # perpendicular to the rail tangent there
+    t0 = _rail_tangent(arc, 0.0)
+    nrm = _polygon_normal(descs[0][1])
+    nrm = nrm.sub(t0 * (nrm.dot(t0)))
+    if nrm.Length > 1e-9:
+        nrm.normalize()
+        up0 = nrm
+    else:
+        up0 = _perp(t0)
+    m = n_prof                        # closed profiles close natively
 
-    def rows_for(stations):
-        """Grid rows at the given ordered arc stations. The RMF chain spans
-        the station list, so adaptive insertions re-walk it (cheap, and it
-        keeps the frames anchored to up0 regardless of station count)."""
+    def merge_stations(base):
+        out = [s for s in sorted(base)
+               if all(abs(s - p) > 1e-9 for p in profile_stations)]
+        return _dedupe_stations(sorted(out + profile_stations))
+
+    def nearest_index(stations, s):
+        k = bisect.bisect_left(stations, s)
+        cands = [i for i in (k - 1, k) if 0 <= i < len(stations)]
+        return min(cands, key=lambda i: abs(stations[i] - s))
+
+    def build(stations):
         frames = _rmf_frames(arc, stations, up0)
+        offs = []
+        for s_i, samp in descs:
+            t, ey, ez = frames[nearest_index(stations, s_i)]
+            spine_i = arc.point_at(s_i)
+            o = []
+            for p in samp:
+                d = p.sub(spine_i)
+                o.append((d.dot(t), d.dot(ey), d.dot(ez)))
+            offs.append((s_i, o))
+
+        def desc_at(s):
+            if len(offs) == 1 or s <= offs[0][0]:
+                return offs[0], offs[0], 0.0
+            if s >= offs[-1][0]:
+                return offs[-1], offs[-1], 0.0
+            k = 0
+            while k < len(offs) - 1 and offs[k + 1][0] < s:
+                k += 1
+            lo, hi = offs[k], offs[k + 1]
+            span = hi[0] - lo[0]
+            return lo, hi, 0.0 if span < 1e-12 else (s - lo[0]) / span
+
         grid = []
         for i, s in enumerate(stations):
             t, ey, ez = frames[i]
@@ -2198,50 +2031,44 @@ def single_rail_sweep(rail, profiles, n_rail=40, n_prof=20):
             lo, hi, w = desc_at(s)
             row = []
             for j in range(m):
-                a0, b0, c0 = lo[2][j]
-                a1, b1, c1 = hi[2][j]
-                ex_a = a0 * (1.0 - w) + a1 * w
-                ey_b = b0 * (1.0 - w) + b1 * w
-                ez_c = c0 * (1.0 - w) + c1 * w
-                row.append(spine + t * ex_a + ey * ey_b + ez * ez_c)
+                a0, b0, c0 = lo[1][j]
+                a1, b1, c1 = hi[1][j]
+                row.append(spine + t * (a0 * (1.0 - w) + a1 * w)
+                           + ey * (b0 * (1.0 - w) + b1 * w)
+                           + ez * (c0 * (1.0 - w) + c1 * w))
             grid.append(row)
         return grid
 
-    # adaptive refinement: same measured sag probe as the N-rail fallback
-    station_list = [i / float(n_rail - 1) for i in range(n_rail)]
+    station_list = merge_stations([i / float(n_rail - 1)
+                                   for i in range(n_rail)])
     max_stations = _MULTIRAIL_STATION_FACTOR * n_rail
     for _pass in range(_MULTIRAIL_STATION_PASSES):
         room = max_stations - len(station_list)
-        if room <= 0:
+        if room <= 0 or len(station_list) < 2:
             break
-        grid = rows_for(station_list)
-        inserts = set()
+        # interleave stations and gap midpoints so ONE chain covers both
+        probe = []
         for k in range(len(station_list) - 1):
-            if room <= 0:
-                break
-            row_a, row_b = grid[k], grid[k + 1]
-            sm = 0.5 * (station_list[k] + station_list[k + 1])
-            row_m = rows_for([sm])[0]
+            probe.append(station_list[k])
+            probe.append(0.5 * (station_list[k] + station_list[k + 1]))
+        probe.append(station_list[-1])
+        grid = build(probe)
+        sags = []
+        for k in range(len(station_list) - 1):
+            ra, rm, rb = grid[2 * k], grid[2 * k + 1], grid[2 * k + 2]
             dev = 0.0
             for j in range(m):
-                chord_mid = Vector((row_a[j].x + row_b[j].x) / 2.0,
-                                   (row_a[j].y + row_b[j].y) / 2.0,
-                                   (row_a[j].z + row_b[j].z) / 2.0)
-                dev = max(dev, row_m[j].distanceToPoint(chord_mid))
+                chord_mid = (ra[j] + rb[j]) * 0.5
+                dev = max(dev, rm[j].distanceToPoint(chord_mid))
             if dev > _MULTIRAIL_STATION_SAG * _MULTIRAIL_SPINE_TOL:
-                inserts.add(0.5 * (station_list[k] + station_list[k + 1]))
-                room -= 1
-        if not inserts:
+                sags.append((dev, probe[2 * k + 1]))
+        if not sags:
             break
-        grown = sorted(set(station_list) | inserts)
-        station_list = _dedupe_stations(grown)
-    grid = rows_for(station_list)
+        sags.sort(reverse=True)
+        station_list = merge_stations(
+            station_list + [s for _d, s in sags[:room]])
+    grid = build(station_list)
 
-    # finish like the other sweeps: explicit-parameter interpolation with
-    # the profile's own uniform column params (the rows reconstruct the
-    # profile's samples at every station), grid_to_surface on failure.
-    # v_vals == cols: for closed profiles the last column repeats col 0's
-    # point at param 1.0, which closes the row curve natively.
     v_vals = _strictly_increasing(list(cols))
     try:
         shape = _grid_interpolation_surface(
@@ -2263,14 +2090,9 @@ def plate_fill(edges, tol=0.001):
     builder = GP.BuildPlateSurface()
     builder.setNbBounds(len(edges))
     for e in edges:
-        curve = e.Curve if hasattr(e, "Curve") else e
-        if not isinstance(curve, Part.BSplineCurve):
-            fp = e.FirstParameter
-            lp = e.LastParameter
-            pts = [e.valueAt(fp + k / 29.0 * (lp - fp)) for k in range(30)]
-            bs = Part.BSplineCurve()
-            bs.approximate(Points=pts, DegMin=2, DegMax=5, Tolerance=tol)
-            curve = bs
+        curve = _to_bspline(e) if hasattr(e, "Curve") else e
+        if curve is None:
+            raise RuntimeError("plate_fill: could not convert an edge")
         builder.add(GP.CurveConstraint(curve, 0))
     builder.perform()
     if not builder.isDone():

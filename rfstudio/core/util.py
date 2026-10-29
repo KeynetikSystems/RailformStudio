@@ -3,6 +3,7 @@
 finite-difference derivatives, trim-aware boundary sampling, knot utilities).
 Base layer: depends on nothing else in the package."""
 
+import bisect
 import math
 import Part
 import FreeCAD                      # Console only -- not Gui, works headless
@@ -848,3 +849,57 @@ __all__ = [
     '_clamped_knots',
     '_clamped_mults',
 ]
+
+def _norm_param(c, t):
+    span = c.LastParameter - c.FirstParameter
+    return (t - c.FirstParameter) / span if span > 1e-12 else 0.0
+
+def _monotone(vals, eps=1e-9):
+    inc = all(b > a + eps for a, b in zip(vals, vals[1:]))
+    dec = all(b < a - eps for a, b in zip(vals, vals[1:]))
+    return inc or dec
+
+def _anchor_map(anchors):
+    """Piecewise-linear map x -> y through [(x, y), ...] anchors (arc
+    fractions on a reference rail -> arc fractions on another rail), slope-1
+    extrapolation beyond the end anchors, result clamped to [0, 1].
+
+    Returns None when the anchors are not strictly increasing in both x and y
+    (rails traversed in opposite directions / mis-ordered profiles) -- the
+    caller then falls back to the identity map and warns. No anchors ->
+    identity."""
+    clean = []
+    for x, y in sorted(anchors):
+        if clean and abs(x - clean[-1][0]) < 1e-9:
+            if abs(y - clean[-1][1]) < 1e-6:
+                continue
+            return None
+        if clean and y <= clean[-1][1] + 1e-9:
+            return None
+        clean.append((x, y))
+    if not clean:
+        return lambda x: x
+    xs = [p[0] for p in clean]
+    ys = [p[1] for p in clean]
+
+    def f(x):
+        if x <= xs[0]:
+            y = ys[0] + (x - xs[0])
+        elif x >= xs[-1]:
+            y = ys[-1] + (x - xs[-1])
+        else:
+            k = bisect.bisect_right(xs, x) - 1
+            w = (x - xs[k]) / (xs[k + 1] - xs[k])
+            y = ys[k] + w * (ys[k + 1] - ys[k])
+        return min(max(y, 0.0), 1.0)
+    return f
+
+def _network_scale(curves):
+    """Bounding-box diagonal of a curve set (1.0 if it can't be measured)."""
+    try:
+        bb = curves[0].toShape().BoundBox
+        for c in curves[1:]:
+            bb.add(c.toShape().BoundBox)
+        return max(bb.DiagonalLength, 1e-9)
+    except Exception:
+        return 1.0
