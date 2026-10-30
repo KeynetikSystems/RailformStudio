@@ -1225,8 +1225,8 @@ GROUPS = {
                ("Profiles", "Profiles",  "Cross-section curves (≥ 1)")],
     "ExtendSurf": [("BaseSurface", "Base Surface", "Surface to extend")],
     "Fill":   [("Boundaries", "Boundaries", "Boundary curves (>= 3)")],
-    "Match":  [("Reference", "Reference surfaces (one or more)"),
-               ("Target",    "Target surface to rebuild (exactly 1)")],
+    "Match":  [("Reference", "Reference surfaces", "One or more reference surfaces"),
+           ("Target",    "Target",             "Surface to rebuild (exactly 1)")],
     "N_sidedPatch": [("Boundaries", "Boundaries", "Boundary curves (≥ 3)")],
     "InterpCurve": [("Points", "Points", "Interpolation points")],
     "ControlCurve": [("Points", "Points", "Control points"),
@@ -1420,10 +1420,16 @@ class SurfaceVP(object):
     def __setstate__(self, state):
         self.kind = state.get("kind") if isinstance(state, dict) else None
         return None
-
+    
     def onChanged(self, vobj, prop):
-        if prop == "ShowEdges" or prop == "ShowSamples":
-            vobj.Shape.update()
+        if prop == "ShowEdges":
+            # Edge overlay = the "Flat Lines" display mode; off = plain "Shaded".
+            try:
+                vobj.DisplayMode = "Flat Lines" if vobj.ShowEdges else "Shaded"
+            except Exception:
+                pass
+        # "ShowSamples" has no implementation yet. The old code only called a
+        # method that doesn't exist, so it is deliberately a no-op for now.
 
     def execute(self, vobj):
         return
