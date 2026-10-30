@@ -304,8 +304,11 @@ class PointEditor(object):
         self._watchdog = None
         self._snap_pts = []
         self._snap_shapes = []
+        self._snap_faces = []
+        self._snap_anchor_pt = None
         self._hover_pts_cache = None    # lazily built for hover-snap preview
         self._hover_shapes_cache = None
+        self._hover_faces_cache = []
         # Live drag readout (ΔXYZ / distance) on the status bar, coalesced
         # off the Coin move callback via a single pending QTimer tick.
         self._status_scheduled = False
@@ -655,18 +658,54 @@ class PointEditor(object):
         self._update_cones(p, L)
 
     # ---- snap ---- #
+    def _snap_anchor(self, idx):
+        """The fixed reference point for anchor-relative constraint snaps
+        (perpendicular / tangent) while point `idx` is being dragged: its
+        neighbour on the curve. An endpoint's neighbour is the interior point
+        next to it, so dragging an END to a perpendicular/tangent foot makes
+        the END segment meet the target curve cleanly -- which is exactly the
+        'get a curve end to join another curve' case. None if there's no
+        neighbour (single-point object) or idx is out of range."""
+        pts = self._points()
+        if idx is None or not (0 <= idx < len(pts)):
+            return None
+        if idx > 0:
+            return pts[idx - 1]
+        if idx + 1 < len(pts):
+            return pts[idx + 1]
+        return None
+
     def _snap_candidates(self):
-        """EXACT high-priority discrete targets from all other objects,
-        each tagged with its snap family (vertex/control/knot ->
-        SNAP_VERTEX, curve-curve crossing -> SNAP_INTERSECTION) so the
-        indicator can show which kind engaged. Gated by the user's snap
-        toggles (rfstudio.snapsettings): a muted family isn't collected,
-        so it neither snaps nor flashes its marker. Coarse arc-length
-        samples are intentionally excluded -- the exact ray->edge path
-        already covers 'anywhere on a curve' precisely."""
-        return snaputil.collect_strong_snap_points_kinded(
-            self.obj.Document, exclude=self.obj,
-            kinds=snapsettings.enabled_kinds())
+        """EXACT high-priority discrete targets from all other objects, each
+        tagged with its snap family (vertex/control/knot -> SNAP_VERTEX,
+        midpoint -> SNAP_MIDPOINT, centre -> SNAP_CENTER, curve-curve crossing
+        -> SNAP_INTERSECTION) so the indicator can show which kind engaged,
+        PLUS the anchor-relative constraint targets (perpendicular / tangent)
+        when those families are on and a drag anchor exists. Gated by the
+        user's snap toggles (rfstudio.snapsettings): a muted family isn't
+        collected, so it neither snaps nor flashes its marker. Coarse
+        arc-length samples are intentionally excluded -- the exact ray->edge
+        path already covers 'anywhere on a curve' precisely."""
+        kinds = snapsettings.enabled_kinds()
+        doc = self.obj.Document
+        pts = snaputil.collect_strong_snap_points_kinded(
+            doc, exclude=self.obj, kinds=kinds)
+        anchor = getattr(self, "_snap_anchor_pt", None)
+        if anchor is not None and (snaputil.SNAP_PERPENDICULAR in kinds
+                                   or snaputil.SNAP_TANGENT in kinds):
+            try:
+                # Reuse the edge list already collected for on-curve
+                # projection; recollect only if 'edge' projection is off
+                # (so the constraint families still work on their own).
+                edges = getattr(self, "_snap_shapes", None)
+                if not edges:
+                    edges = [e for e, _o in snaputil.collect_snap_shapes(
+                        doc, exclude=self.obj)]
+                pts += snaputil.collect_constraint_snap_points_kinded(
+                    doc, anchor, exclude=self.obj, kinds=kinds, edges=edges)
+            except Exception:
+                pass
+        return pts
 
     def _snap_shape_candidates(self):
         """Edges from all other objects, for EXACT perpendicular-
@@ -680,17 +719,33 @@ class PointEditor(object):
                 snaputil.collect_snap_shapes(self.obj.Document,
                                              exclude=self.obj)]
 
+    def _snap_face_candidates(self):
+        """Faces from all other objects, for EXACT on-surface projection
+        snapping -- lets a dragged point land ON a reference skin, not only
+        on curves. Empty when the 'surface' snap family is off (its default),
+        so the heavier per-face scan only runs when asked for."""
+        if not snapsettings.enabled(snaputil.SNAP_SURFACE):
+            return []
+        try:
+            return snaputil.collect_snap_faces(self.obj.Document,
+                                               exclude=self.obj)
+        except Exception:
+            return []
+
     def _snap(self, pos):
         """(point, kind) snapped within self._snap_px screen pixels, or
         (None, None). Vertex/endpoint priority: an EXACT discrete target
-        (vertex, control point, knot, or curve-curve intersection) within
-        tolerance always wins over a generic on-edge projection -- only if
-        none is in range do we fall to the exact point anywhere along a
-        curve's real geometry (see snaputil.nearest_snap_ranked_kind). The
-        returned kind drives the indicator colour/glyph."""
+        (vertex, control point, knot, midpoint, centre, curve-curve
+        intersection, or a perpendicular/tangent constraint) within tolerance
+        always wins over a generic projection -- only if none is in range do
+        we fall to the exact point anywhere along a curve (on-edge) or on a
+        surface, whichever is nearer on screen (see
+        snaputil.nearest_snap_ranked_kind). The returned kind drives the
+        indicator colour/glyph."""
         return snaputil.nearest_snap_ranked_kind(
             self.view, self._snap_pts, getattr(self, "_snap_shapes", []),
-            pos, self._snap_px)
+            pos, self._snap_px,
+            face_shapes=getattr(self, "_snap_faces", []))
 
     @staticmethod
     def _resolve_snap_glyphs(coin):
@@ -728,6 +783,20 @@ class PointEditor(object):
             snaputil.SNAP_VERTEX: (idx(filled), (0.2, 0.95, 0.3)),
             snaputil.SNAP_INTERSECTION: (idx(filled), (1.0, 0.9, 0.2)),
             snaputil.SNAP_EDGE: (idx(hollow), (0.1, 0.95, 0.95)),
+            # Off-curve control handle -- green like a vertex but HOLLOW, so a
+            # weak control-point snap reads as distinct from an on-geometry
+            # vertex landing (filled).
+            snaputil.SNAP_CONTROL: (idx(hollow), (0.2, 0.95, 0.3)),
+            # Derived discrete targets (filled, like other landing snaps):
+            snaputil.SNAP_MIDPOINT: (idx(filled), (0.35, 0.7, 1.0)),
+            snaputil.SNAP_CENTER: (idx(filled), (1.0, 0.5, 0.9)),
+            # Constraint families -- filled, warm hues so a right-angle /
+            # tangential join reads differently from a plain vertex grab:
+            snaputil.SNAP_PERPENDICULAR: (idx(filled), (1.0, 0.6, 0.2)),
+            snaputil.SNAP_TANGENT: (idx(filled), (1.0, 0.85, 0.35)),
+            # On-surface projection: hollow, like the on-curve projection it
+            # competes with, in a distinct violet.
+            snaputil.SNAP_SURFACE: (idx(hollow), (0.7, 0.5, 1.0)),
         }
 
     def _show_snap_marker(self, pt, kind):
@@ -770,14 +839,16 @@ class PointEditor(object):
             statusbar.show(self._status_text)
 
     def _hover_snap_candidates(self):
-        """(shapes, points) for the hover-snap preview, built lazily and
-        cached so a hover doesn't re-scan every object each mouse move. The
-        cache is invalidated at the end of each drag (see _release), since
+        """(shapes, faces, points) for the hover-snap preview, built lazily
+        and cached so a hover doesn't re-scan every object each mouse move.
+        The cache is invalidated at the end of each drag (see _release), since
         the edited curve's geometry changes there.
 
-        Separate from the drag-time _snap_pts/_snap_shapes (which are
-        rebuilt at drag start) precisely so a preview can run BEFORE any
-        drag begins -- the whole point of the hover preview."""
+        Separate from the drag-time _snap_pts/_snap_shapes/_snap_faces (which
+        are rebuilt at drag start) precisely so a preview can run BEFORE any
+        drag begins -- the whole point of the hover preview. The constraint
+        families (perpendicular/tangent) are intentionally absent here: they
+        need a drag anchor, so they only appear once a drag is under way."""
         if self._hover_shapes_cache is None:
             try:
                 kinds = snapsettings.enabled_kinds()
@@ -785,13 +856,19 @@ class PointEditor(object):
                     [e for e, _o in snaputil.collect_snap_shapes(
                         self.obj.Document, exclude=self.obj)]
                     if snaputil.SNAP_EDGE in kinds else [])
+                self._hover_faces_cache = (
+                    snaputil.collect_snap_faces(
+                        self.obj.Document, exclude=self.obj)
+                    if snaputil.SNAP_SURFACE in kinds else [])
                 self._hover_pts_cache = \
                     snaputil.collect_strong_snap_points_kinded(
                         self.obj.Document, exclude=self.obj, kinds=kinds)
             except Exception:
                 self._hover_shapes_cache = []
+                self._hover_faces_cache = []
                 self._hover_pts_cache = []
-        return self._hover_shapes_cache, self._hover_pts_cache
+        return (self._hover_shapes_cache, self._hover_faces_cache,
+                self._hover_pts_cache)
 
     # ---- symmetric editing (model only half) ------------------------- #
     def set_symmetry(self, plane_base, plane_normal, tol=1e-4):
@@ -944,8 +1021,12 @@ class PointEditor(object):
         g0 = self.view.getPoint(pos[0], pos[1])
         self.drag = {"idx": idx, "axis": axis, "g0": g0,
                      "p0": self._points()[idx]}
-        self._snap_pts = self._snap_candidates()  # cache for this drag
-        self._snap_shapes = self._snap_shape_candidates()  # cache for this drag
+        # Order matters: the constraint snaps in _snap_candidates reuse
+        # _snap_shapes and read _snap_anchor_pt, so set those first.
+        self._snap_anchor_pt = self._snap_anchor(idx)
+        self._snap_shapes = self._snap_shape_candidates()  # edges, this drag
+        self._snap_faces = self._snap_face_candidates()    # faces, this drag
+        self._snap_pts = self._snap_candidates()           # discrete + constr.
         self._start_watchdog()
 
     def _on_move(self, ev):
@@ -1045,9 +1126,10 @@ class PointEditor(object):
             # it doesn't fight the deletion/edit hover cues.
             if (not self.creating and self.hover_point is None
                     and self.hover_handle is None):
-                shapes, dpts = self._hover_snap_candidates()
+                shapes, faces, dpts = self._hover_snap_candidates()
                 snapped, kind = snaputil.nearest_snap_ranked_kind(
-                    self.view, dpts, shapes, pos, self._snap_px)
+                    self.view, dpts, shapes, pos, self._snap_px,
+                    face_shapes=faces)
                 if snapped is not None:
                     self._show_snap_marker(snapped, kind)
                 else:
@@ -1851,6 +1933,7 @@ class PointEditor(object):
         # the preview rebuilds against current geometry on the next hover.
         self._hover_pts_cache = None
         self._hover_shapes_cache = None
+        self._hover_faces_cache = []
         # Persist the drag. Bezier-handle drags already wrote themselves back in
         # _edit_bezier_handle (live), so only a point/axis drag needs its final
         # marker position committed to obj.Points. (Previously _release never

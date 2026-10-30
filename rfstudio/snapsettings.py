@@ -23,15 +23,34 @@ import FreeCAD
 
 _PARAM_PATH = "User parameter:BaseApp/Preferences/Mod/RailformStudio/Snapping"
 
-# The three families, in display order. These strings are also the snap-kind
+# The snap families, in display order. These strings are also the snap-kind
 # tags snaputil.nearest_snap_ranked_kind returns, so a kind can be looked up
 # against enabled() directly.
-KINDS = ("vertex", "edge", "intersection")
+KINDS = ("vertex", "edge", "intersection", "midpoint", "center",
+         "surface", "perpendicular", "tangent")
 
 LABELS = {
     "vertex": "Vertices / control points",
     "edge": "On-curve projection",
     "intersection": "Curve intersections",
+    "midpoint": "Edge midpoints",
+    "center": "Arc / circle centres",
+    "surface": "On-surface projection",
+    "perpendicular": "Perpendicular to a curve",
+    "tangent": "Tangent to a curve",
+}
+
+# Per-family default when no preference is stored yet. The three original
+# families and the two cheap derived ones (midpoint/centre) default ON --
+# the historic always-snap behaviour. The three that default OFF are the
+# heavier or more specialised ones: surface projection is a per-face
+# distToShape scan, and the two constraint families (perpendicular/tangent)
+# add anchor-relative targets that only some authoring tasks want, so the
+# everyday drag stays uncluttered until the user turns them on.
+_DEFAULTS = {
+    "surface": False,
+    "perpendicular": False,
+    "tangent": False,
 }
 
 
@@ -42,10 +61,13 @@ def _params():
         return None
 
 
-def enabled(kind, default=True):
-    """True if snap `kind` is currently enabled. Unknown/unavailable ->
-    the default (True), so a missing parameter store never silently
-    disables snapping."""
+def enabled(kind, default=None):
+    """True if snap `kind` is currently enabled. `default` None means 'use
+    this family's built-in default' (_DEFAULTS, mostly True); pass an explicit
+    bool to override. Unknown/unavailable store -> the default, so a missing
+    parameter store never silently flips a family."""
+    if default is None:
+        default = _DEFAULTS.get(kind, True)
     p = _params()
     if p is None:
         return default

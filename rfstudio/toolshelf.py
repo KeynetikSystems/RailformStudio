@@ -208,26 +208,33 @@ class _Section(QtWidgets.QWidget):
 
 
 class _SnapBar(QtWidgets.QGroupBox):
-    """Vertex / Edge / Intersection snap on-off toggles (Draft-style),
-    backed by rfstudio.snapsettings so the editor snap collectors honour
-    them and the choice persists. Changing a box takes effect on the next
-    drag (the collectors read snapsettings when a drag begins)."""
+    """Per-family snap on-off toggles (Draft-style), backed by
+    rfstudio.snapsettings so the editor snap collectors honour them and the
+    choice persists. Changing a box takes effect on the next drag (the
+    collectors read snapsettings when a drag begins).
+
+    Laid out as a grid rather than a single row because there are now eight
+    families (vertex, edge, intersection, midpoint, centre, surface,
+    perpendicular, tangent) -- too many for one line in the dock."""
 
     def __init__(self):
         super(_SnapBar, self).__init__("Snapping")
-        lay = QtWidgets.QHBoxLayout(self)
-        lay.setContentsMargins(6, 2, 6, 4)
-        lay.setSpacing(8)
+        grid = QtWidgets.QGridLayout(self)
+        grid.setContentsMargins(6, 2, 6, 4)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(2)
         short = {"vertex": "Vertex", "edge": "Edge",
-                 "intersection": "Intersect"}
-        for kind in snapsettings.KINDS:
+                 "intersection": "Intersect", "midpoint": "Mid",
+                 "center": "Center", "surface": "Surface",
+                 "perpendicular": "Perp", "tangent": "Tangent"}
+        cols = 4
+        for i, kind in enumerate(snapsettings.KINDS):
             cb = QtWidgets.QCheckBox(short.get(kind, kind))
             cb.setChecked(snapsettings.enabled(kind))
             cb.setToolTip(snapsettings.LABELS.get(kind, kind))
             cb.toggled.connect(
                 lambda checked, k=kind: snapsettings.set_enabled(k, checked))
-            lay.addWidget(cb)
-        lay.addStretch(1)
+            grid.addWidget(cb, i // cols, i % cols)
 
 
 class _ToolShelf(QtWidgets.QDockWidget):

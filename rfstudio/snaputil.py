@@ -171,7 +171,7 @@ def _all_objects(doc, exclude=None):
 
 def collect_snap_points(doc, exclude=None, sample_step=3.0,
                         sample_bounds=(8, 60), include_knots=True,
-                        include_samples=False):
+                        include_samples=False, include_control=True):
     """EXACT discrete snap targets from every other object in `doc`
     (including objects inside groups and parts): their control points
     (Points property), shape vertices, and -- when `include_knots` is True
@@ -197,9 +197,10 @@ def collect_snap_points(doc, exclude=None, sample_step=3.0,
     pts = []
     lo, hi = sample_bounds
     for o in _all_objects(doc, exclude):
-        op = getattr(o, "Points", None)
-        if op:
-            pts.extend(list(op))
+        if include_control:
+            op = getattr(o, "Points", None)
+            if op:
+                pts.extend(list(op))
         shp = getattr(o, "Shape", None)
         if not shp:
             continue
@@ -218,6 +219,36 @@ def collect_snap_points(doc, exclude=None, sample_step=3.0,
             if include_knots:
                 pts.extend(_edge_knot_points(e))
     return pts
+
+
+def collect_control_points(doc, exclude=None):
+    """Just the off-curve CONTROL-polygon points (the `Points` property) of
+    every other object -- a ControlCurve's handles, which generally do NOT
+    lie on the curve itself. Kept separate from collect_snap_points' on-
+    geometry targets because the ranker treats control points as a WEAK tier
+    (SNAP_CONTROL): they can still snap, but only when genuinely nearest, so
+    they no longer out-prioritise contact with a curve body. Gui-free."""
+    pts = []
+    for o in _all_objects(doc, exclude):
+        op = getattr(o, "Points", None)
+        if op:
+            pts.extend(list(op))
+    return pts
+
+
+def collect_ranked_points(doc, exclude=None):
+    """(strong, weak) snap candidates for the non-kinded nearest_snap_ranked
+    callers (the authoring panels). `strong` are the magnet-eligible EXACT
+    on-geometry targets -- vertices, knots and true curve-curve intersections;
+    `weak` are the off-curve control-polygon points. Splitting them is what
+    lets nearest_snap_ranked keep control points as a distance-only tier so a
+    drawn curve end can make contact with another curve's body instead of
+    being grabbed by a nearby control handle. Gui-free -- headless-testable."""
+    strong = collect_snap_points(doc, exclude=exclude, include_control=False)
+    shapes = [e for e, _o in collect_snap_shapes(doc, exclude=exclude)]
+    strong += collect_intersection_points(shapes)
+    weak = collect_control_points(doc, exclude=exclude)
+    return strong, weak
 
 
 def _valid_dist_shape(shape):
@@ -291,6 +322,38 @@ def collect_snap_shapes(doc, exclude=None):
     return out
 
 
+def collect_snap_faces(doc, exclude=None):
+    """[face, ...] for every face of every other object in `doc` (groups and
+    parts included) -- the SURFACE-projection snap candidates. OCCT's
+    distToShape treats a Face exactly like an Edge, so
+    nearest_point_on_shapes_to_ray projects the cursor pick ray onto a
+    surface the same way it projects onto a curve. This is what lets a
+    dragged point land ON a surface (not only on curves), which is the point
+    of authoring section/feature curves that actually lie on a reference
+    skin. Gated upstream by the 'surface' snap family (off by default -- it
+    is a heavier scan than the curve families).
+
+    `exclude` is normally the object being edited. Gui-free -- only reads
+    Shape -- so this is covered by test_core.py, not manual GUI testing.
+    """
+    out = []
+    for o in _all_objects(doc, exclude):
+        shp = getattr(o, "Shape", None)
+        if not shp:
+            continue
+        try:
+            faces = shp.Faces
+        except Exception:
+            continue
+        for f in faces:
+            # _valid_dist_shape only special-cases Edge; a non-null Face
+            # passes, which is what we want (OCCT distToShape is safe on
+            # the trimmed B-spline faces this workbench produces).
+            if _valid_dist_shape(f):
+                out.append(f)
+    return out
+
+
 def _bbox_overlap(b1, b2, pad):
     """True if two Part BoundBoxes overlap once each is grown by `pad` --
     a cheap broad-phase reject so the O(n^2) intersection scan only runs
@@ -300,16 +363,68 @@ def _bbox_overlap(b1, b2, pad):
             b1.ZMin - pad <= b2.ZMax + pad and b2.ZMin - pad <= b1.ZMax + pad)
 
 
-def collect_intersection_points(shapes, tol=1e-6, max_edges=60):
+def _intersection_candidate_pairs(boxes, tol):
+    """Index edge bounding boxes into a uniform spatial grid and yield only
+    the (i, j) pairs whose padded boxes share a grid cell -- the broad phase
+    that lets the crossing scan scale past the old flat O(n^2) pair loop.
+
+    This is what removes the hard `max_edges` cliff in
+    collect_intersection_points: on a real patch network the edges are spread
+    out, so each cell holds only a handful, and the number of pairs actually
+    distance-tested grows ~linearly with the edge count instead of
+    quadratically. Returns a set of (i, j) with i < j. Gui-free."""
+    valid = [(i, b) for i, b in enumerate(boxes) if b is not None]
+    if len(valid) < 2:
+        return set()
+    # Overall extent + a cell size that targets ~a few edges per cell.
+    xs = [b.XMin for _i, b in valid] + [b.XMax for _i, b in valid]
+    ys = [b.YMin for _i, b in valid] + [b.YMax for _i, b in valid]
+    zs = [b.ZMin for _i, b in valid] + [b.ZMax for _i, b in valid]
+    span = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs), 1e-9)
+    import math as _math
+    cells_per_axis = max(1, int(_math.ceil(len(valid) ** (1.0 / 3.0))))
+    cell = max(span / cells_per_axis, 1e-9)
+    ox, oy, oz = min(xs), min(ys), min(zs)
+
+    def _cells(b):
+        i0 = int((b.XMin - tol - ox) / cell); i1 = int((b.XMax + tol - ox) / cell)
+        j0 = int((b.YMin - tol - oy) / cell); j1 = int((b.YMax + tol - oy) / cell)
+        k0 = int((b.ZMin - tol - oz) / cell); k1 = int((b.ZMax + tol - oz) / cell)
+        for ci in range(i0, i1 + 1):
+            for cj in range(j0, j1 + 1):
+                for ck in range(k0, k1 + 1):
+                    yield (ci, cj, ck)
+
+    grid = {}
+    for i, b in valid:
+        for c in _cells(b):
+            grid.setdefault(c, []).append(i)
+    pairs = set()
+    for members in grid.values():
+        if len(members) < 2:
+            continue
+        for a in range(len(members)):
+            for bb in range(a + 1, len(members)):
+                i, j = members[a], members[bb]
+                pairs.add((i, j) if i < j else (j, i))
+    return pairs
+
+
+def collect_intersection_points(shapes, tol=1e-6, max_edges=600):
     """True crossing points of the candidate edges -- where two curves
     actually meet in 3D (distToShape <= `tol`), NOT where they merely
     appear to cross on screen. Each such crossing is a semantically exact
     snap target (the CAD counterpart of Blender's vertex snap), so these
     join the exact discrete candidates that win over an on-edge projection.
 
-    Cost control: an O(n^2) pair scan gated by a bounding-box broad-phase
-    (_bbox_overlap), and skipped entirely above `max_edges` so a busy
-    document never stalls a drag. Gui-free -- headless-testable.
+    Cost control: a uniform spatial-grid broad phase
+    (_intersection_candidate_pairs) so only edges that share a cell get
+    distance-tested -- this scales ~linearly with edge count on a spread-out
+    patch network, where the old flat O(n^2) scan was skipped entirely above
+    60 edges (so a real model lost intersection snapping altogether). A small
+    edge count still uses the direct padded-bbox scan (no grid overhead);
+    `max_edges` is now only a last-resort safety ceiling, much higher.
+    Gui-free -- headless-testable.
     """
     edges = list(shapes)
     if len(edges) < 2 or len(edges) > max_edges:
@@ -320,24 +435,27 @@ def collect_intersection_points(shapes, tol=1e-6, max_edges=60):
             boxes.append(e.BoundBox)
         except Exception:
             boxes.append(None)
+
+    # Small n: the flat padded-bbox scan is cheaper than building a grid.
+    if len(edges) <= 40:
+        pairs = [(i, j) for i in range(len(edges))
+                 for j in range(i + 1, len(edges))]
+    else:
+        pairs = _intersection_candidate_pairs(boxes, tol)
+
     out = []
-    for i in range(len(edges)):
-        bi = boxes[i]
-        if bi is None:
+    for i, j in pairs:
+        bi, bj = boxes[i], boxes[j]
+        if bi is None or bj is None or not _bbox_overlap(bi, bj, tol):
             continue
-        for j in range(i + 1, len(edges)):
-            bj = boxes[j]
-            if bj is None or not _bbox_overlap(bi, bj, tol):
-                continue
-            if not _valid_dist_shape(edges[i]) or \
-                    not _valid_dist_shape(edges[j]):
-                continue
-            try:
-                d, pts_on, _info = edges[i].distToShape(edges[j])
-            except Exception:
-                continue
-            if d <= tol and pts_on:
-                out.append(pts_on[0][0])
+        if not _valid_dist_shape(edges[i]) or not _valid_dist_shape(edges[j]):
+            continue
+        try:
+            d, pts_on, _info = edges[i].distToShape(edges[j])
+        except Exception:
+            continue
+        if d <= tol and pts_on:
+            out.append(pts_on[0][0])
     return out
 
 
@@ -645,21 +763,31 @@ def nearest_exact_snap(view, shapes, pos, max_px, max_world_dist=None):
     tolerance, `shapes` is empty, or the view can't resolve a pick ray at
     `pos`.
     """
+    pt, _dpx = _exact_snap_detail(view, shapes, pos, max_px,
+                                  max_world_dist=max_world_dist)
+    return pt
+
+
+def _exact_snap_detail(view, shapes, pos, max_px, max_world_dist=None):
+    """nearest_exact_snap's core, but returns (point, screen_px_distance) so
+    a caller can compare two different shape sets (e.g. edges vs faces) and
+    keep whichever projects nearer on screen. Returns (None, None) when
+    nothing is within `max_px`, `shapes` is empty, or no pick ray resolves."""
     if not shapes:
-        return None
+        return None, None
     ray = pick_ray(view, pos)
     if ray is None:
-        return None
+        return None, None
     origin, direction = ray
     pt, _d, _shape = nearest_point_on_shapes_to_ray(
         origin, direction, shapes, max_dist=max_world_dist)
     if pt is None:
-        return None
+        return None, None
     sp = screen_project(view, pt)
     if sp is None:
-        return None
+        return None, None
     dpx = ((sp[0] - pos[0]) ** 2 + (sp[1] - pos[1]) ** 2) ** 0.5
-    return pt if dpx <= max_px else None
+    return (pt, dpx) if dpx <= max_px else (None, None)
 
 
 def nearest_axis_snap(view, axis_origin, axis_dir, shapes, pos, max_px,
@@ -710,50 +838,350 @@ def nearest_snap(view, points, pos, max_px):
 
 
 def nearest_snap_ranked(view, strong_points, edge_shapes, pos, max_px,
-                        max_world_dist=None):
-    """Tiered cursor snap: an EXACT discrete target (vertex / control point
-    / knot / curve-curve intersection, from collect_strong_snap_points)
-    within `max_px` ALWAYS beats a generic on-edge projection, even if the
-    on-edge point is a fraction of a pixel closer. Only when no strong
-    candidate is in range do we fall to the exact on-edge point
-    (nearest_exact_snap).
+                        max_world_dist=None, weak_points=None,
+                        magnet_fraction=None):
+    """Magnet-tiered cursor snap (Vector result; see nearest_snap_ranked_kind
+    for the family-reporting variant the PointEditor uses). `strong_points`
+    are the magnet-eligible EXACT on-geometry targets (vertices, knots, true
+    intersections -- collect_ranked_points' first element); `weak_points` are
+    the off-curve control-polygon handles (its second element), ranked
+    distance-only; `edge_shapes` the on-curve projection candidates.
 
-    This is Blender's vertex-over-edge priority: aiming near a curve end or
-    a shared corner lands you on that mathematically exact point, not on a
-    near-point that merely happens to sit slightly nearer the cursor along
-    some other edge. Returns the snapped Vector, or None.
+    Two passes:
+      1. A strong target within the inner magnet radius (magnet_fraction *
+         max_px) wins outright -- endpoints/crossings stay sticky.
+      2. Otherwise the nearest of {strong, weak, on-curve projection} within
+         `max_px` wins. Aiming at a curve body makes the projection ~0 px
+         away, so it beats a nearby control handle -- the fix for a drawn
+         curve end that couldn't make contact with another curve.
+
+    Returns the snapped Vector, or None.
     """
-    strong = nearest_snap(view, strong_points, pos, max_px)
-    if strong is not None:
-        return strong
-    return nearest_exact_snap(view, edge_shapes, pos, max_px,
-                              max_world_dist=max_world_dist)
+    if magnet_fraction is None:
+        magnet_fraction = MAGNET_FRACTION
+    magnet_px = max_px * magnet_fraction
+    # Pass 1 -- inner magnet: a strong on-geometry target is sticky.
+    s = nearest_snap(view, strong_points, pos, magnet_px)
+    if s is not None:
+        return s
+    # Pass 2 -- outer annulus: nearest across strong + weak + projection.
+    best, bestd = None, max_px
+    for p in list(strong_points) + list(weak_points or []):
+        sp = screen_project(view, p)
+        if sp is None:
+            continue
+        d = ((sp[0] - pos[0]) ** 2 + (sp[1] - pos[1]) ** 2) ** 0.5
+        if d < bestd:
+            best, bestd = p, d
+    ept, epx = _exact_snap_detail(view, edge_shapes, pos, max_px,
+                                  max_world_dist=max_world_dist)
+    if ept is not None and (best is None or epx < bestd):
+        best = ept
+    return best
 
 
 # ---- kinded snapping (which snap FAMILY won, for visible feedback) -------- #
 # The three families nearest_snap_ranked distinguishes, as plain string tags
 # so a caller can colour/glyph the snap indicator by kind and gate collection
 # with rfstudio.snapsettings. These MUST match snapsettings.KINDS.
-SNAP_VERTEX = "vertex"            # vertices, control points, knots (exact pts)
+SNAP_VERTEX = "vertex"            # shape vertices + B-spline knots (ON geometry)
 SNAP_INTERSECTION = "intersection"   # true curve-curve crossings
 SNAP_EDGE = "edge"               # perpendicular projection onto a curve
+SNAP_MIDPOINT = "midpoint"        # arc-length midpoint of a curve/edge
+SNAP_CENTER = "center"            # centre of an arc / circle / ellipse edge
+SNAP_SURFACE = "surface"          # projection onto any point of a FACE
+SNAP_CONTROL = "control"          # off-curve control-polygon point (WEAK tier)
+# Constraint families -- relative to a drag ANCHOR (the neighbouring point of
+# the one being moved), not just the cursor position:
+SNAP_PERPENDICULAR = "perpendicular"  # foot of the perpendicular from anchor
+SNAP_TANGENT = "tangent"          # point where anchor->P is tangent to a curve
+
+# --- ranking policy -------------------------------------------------------- #
+# The families that get the "magnet" privilege: EXACT points that lie on real
+# geometry and are meaningful landing targets. A magnet-eligible target within
+# the inner magnet radius always wins; everything else (control points, on-
+# curve/on-surface projection) competes on true screen distance. Control
+# points are deliberately NOT here -- they are off the curve, so letting them
+# win the whole tolerance circle is exactly what stopped a drag from making
+# contact with a curve body ("can't ask for land on this curve").
+MAGNET_KINDS = frozenset((SNAP_VERTEX, SNAP_INTERSECTION, SNAP_MIDPOINT,
+                          SNAP_CENTER, SNAP_PERPENDICULAR, SNAP_TANGENT))
+# Inner radius, as a fraction of the pixel tolerance, in which a magnet target
+# is "sticky". Outside it, the nearest thing wins -- so the outer annulus of
+# the tolerance circle is reachable for on-curve / on-surface contact.
+MAGNET_FRACTION = 0.5
+
+
+def _nearest_kinded(view, kinded_points, pos, max_px, kinds=None):
+    """(point, kind, screen_dist) nearest to `pos` within `max_px`, optionally
+    restricted to `kinds`. screen_dist is max_px when nothing qualifies (so a
+    caller can compare a projection against it directly). Gui wrapper."""
+    best, bestd, bestk = None, max_px, None
+    for p, k in kinded_points:
+        if kinds is not None and k not in kinds:
+            continue
+        sp = screen_project(view, p)
+        if sp is None:
+            continue
+        d = ((sp[0] - pos[0]) ** 2 + (sp[1] - pos[1]) ** 2) ** 0.5
+        if d < bestd:
+            best, bestd, bestk = p, d, k
+    return best, bestk, bestd
+
+
+def collect_feature_points_kinded(doc, exclude=None, kinds=None):
+    """Derived EXACT discrete targets that aren't vertices/knots but are
+    geometrically meaningful: the arc-length MIDPOINT of every edge
+    (SNAP_MIDPOINT) and the CENTRE of every arc/circle/ellipse edge
+    (SNAP_CENTER). These are the cheap, high-value snaps Draft exposes --
+    halving a span or centring on a radius without first drawing a
+    construction point.
+
+    `kinds`, if given, limits which of the two families is collected; None
+    collects both. Gui-free -- only reads Shape/Curve -- headless-testable.
+    """
+    import Part
+    want_mid = kinds is None or SNAP_MIDPOINT in kinds
+    want_ctr = kinds is None or SNAP_CENTER in kinds
+    if not (want_mid or want_ctr):
+        return []
+    out = []
+    for o in _all_objects(doc, exclude):
+        shp = getattr(o, "Shape", None)
+        if not shp:
+            continue
+        try:
+            edges = shp.Edges
+        except Exception:
+            continue
+        for e in edges:
+            if not _valid_dist_shape(e):
+                continue
+            if want_mid:
+                try:
+                    # Arc-length midpoint (getParameterByLength), so a
+                    # non-uniform B-spline's midpoint is the geometric
+                    # half-way point, not the parametric one. Fall back to
+                    # the parameter midpoint if length mapping is refused.
+                    try:
+                        m = e.getParameterByLength(e.Length / 2.0)
+                    except Exception:
+                        m = 0.5 * (e.FirstParameter + e.LastParameter)
+                    out.append((e.valueAt(m), SNAP_MIDPOINT))
+                except Exception:
+                    pass
+            if want_ctr:
+                c = getattr(e, "Curve", None)
+                if isinstance(c, (Part.Circle, Part.Ellipse)):
+                    try:
+                        out.append((c.Center, SNAP_CENTER))
+                    except Exception:
+                        pass
+    return out
+
+
+def perpendicular_points_from(anchor, edges, n=96, tol=1e-9):
+    """Feet of the perpendicular dropped from `anchor` (a Vector) onto each
+    edge: the points P where (P - anchor) is perpendicular to the edge's
+    tangent. Dragging the moving end to such a P makes the segment
+    anchor->P meet the target curve at a right angle -- the perpendicular
+    constraint, without a datum line.
+
+    All feet are found (a wavy curve can have several), not just the nearest:
+    g(t) = (P(t) - anchor) . T(t) is sampled along the curve and every sign
+    change is bisected to a root. Feet essentially AT an endpoint are dropped
+    (those are already SNAP_VERTEX targets and aren't a genuine right angle).
+    Returns [Vector, ...]. Gui-free -- headless-testable.
+    """
+    from FreeCAD import Vector
+    a = Vector(anchor)
+    out = []
+    for e in edges:
+        if not _valid_dist_shape(e):
+            continue
+        try:
+            fp, lp = e.FirstParameter, e.LastParameter
+        except Exception:
+            continue
+        span = lp - fp
+        if span <= tol:
+            continue
+
+        def g(t):
+            P = e.valueAt(t)
+            T = e.tangentAt(t)
+            return (P - a).dot(T)
+
+        try:
+            prev_t, prev = fp, g(fp)
+        except Exception:
+            continue
+        for i in range(1, n + 1):
+            t = fp + span * i / n
+            try:
+                cur = g(t)
+            except Exception:
+                prev_t, prev = t, None
+                continue
+            if prev is not None and prev != 0.0 and (prev < 0.0) != (cur < 0.0):
+                lo, hi, glo = prev_t, t, prev
+                for _ in range(40):
+                    mid = 0.5 * (lo + hi)
+                    try:
+                        gm = g(mid)
+                    except Exception:
+                        break
+                    if (glo < 0.0) != (gm < 0.0):
+                        hi = mid
+                    else:
+                        lo, glo = mid, gm
+                root = 0.5 * (lo + hi)
+                if root - fp > span * 1e-3 and lp - root > span * 1e-3:
+                    try:
+                        out.append(e.valueAt(root))
+                    except Exception:
+                        pass
+            prev_t, prev = t, cur
+    return out
+
+
+def tangent_points_from(anchor, edges, n=96, tol_deg=1.0):
+    """Points P on each edge where the line anchor->P is TANGENT to the curve
+    -- i.e. (P - anchor) is parallel to the curve tangent there. Dragging the
+    moving end to such a P makes the span leave the target curve tangentially
+    (a G1-looking join without a construction tangent).
+
+    The residual r(t) = |（P-anchor) x T| / (|P-anchor| |T|) is sin(angle)
+    between the chord and the tangent; its local minima are found on a sampled
+    grid and golden-section refined, and a minimum is accepted only when
+    r <= sin(tol_deg). Returns [Vector, ...]. Gui-free -- headless-testable.
+    """
+    import math
+    from FreeCAD import Vector
+    a = Vector(anchor)
+    thresh = math.sin(math.radians(tol_deg))
+    out = []
+    for e in edges:
+        if not _valid_dist_shape(e):
+            continue
+        try:
+            fp, lp = e.FirstParameter, e.LastParameter
+        except Exception:
+            continue
+        span = lp - fp
+        if span <= 1e-12:
+            continue
+
+        def r(t):
+            P = e.valueAt(t)
+            T = e.tangentAt(t)
+            v = P - a
+            vl = v.Length
+            tl = T.Length
+            if vl < 1e-9 or tl < 1e-9:
+                return None
+            return v.cross(T).Length / (vl * tl)
+
+        ts = [fp + span * i / n for i in range(n + 1)]
+        rs = []
+        for t in ts:
+            try:
+                rs.append(r(t))
+            except Exception:
+                rs.append(None)
+        for i in range(1, n):
+            a0, a1, a2 = rs[i - 1], rs[i], rs[i + 1]
+            if a0 is None or a1 is None or a2 is None:
+                continue
+            if a1 <= a0 and a1 <= a2:                 # interior local minimum
+                lo, hi = ts[i - 1], ts[i + 1]
+                ok = True
+                for _ in range(40):
+                    m1 = lo + 0.382 * (hi - lo)
+                    m2 = lo + 0.618 * (hi - lo)
+                    r1, r2 = r(m1), r(m2)
+                    if r1 is None or r2 is None:
+                        ok = False
+                        break
+                    if r1 < r2:
+                        hi = m2
+                    else:
+                        lo = m1
+                if not ok:
+                    continue
+                tm = 0.5 * (lo + hi)
+                rm = r(tm)
+                if rm is not None and rm <= thresh:
+                    try:
+                        out.append(e.valueAt(tm))
+                    except Exception:
+                        pass
+    return out
+
+
+def collect_constraint_snap_points_kinded(doc, anchor, exclude=None,
+                                           kinds=None, edges=None):
+    """Anchor-relative constraint snaps as a kinded list: perpendicular feet
+    (SNAP_PERPENDICULAR) and tangent points (SNAP_TANGENT) from `anchor` onto
+    every other object's edges. These are what make a curve END join another
+    curve *cleanly* (right-angle or tangential) rather than just touching it
+    at an arbitrary spot.
+
+    `anchor` is the fixed reference point (normally the neighbour of the point
+    being dragged); None yields []. `edges` lets the caller pass an
+    already-collected edge list (it usually has one for on-curve projection)
+    so the document isn't scanned twice. `kinds` limits the families. Gui-free
+    -- headless-testable via its two collectors.
+    """
+    want_perp = kinds is None or SNAP_PERPENDICULAR in kinds
+    want_tan = kinds is None or SNAP_TANGENT in kinds
+    if anchor is None or not (want_perp or want_tan):
+        return []
+    if edges is None:
+        edges = [e for e, _o in collect_snap_shapes(doc, exclude=exclude)]
+    out = []
+    if want_perp:
+        for p in perpendicular_points_from(anchor, edges):
+            out.append((p, SNAP_PERPENDICULAR))
+    if want_tan:
+        for p in tangent_points_from(anchor, edges):
+            out.append((p, SNAP_TANGENT))
+    return out
 
 
 def collect_strong_snap_points_kinded(doc, exclude=None, kinds=None):
-    """collect_strong_snap_points, but each point tagged with its family so
-    the snap indicator can show WHICH kind engaged. Returns
-    [(Vector, kind), ...] with kind in {SNAP_VERTEX, SNAP_INTERSECTION}.
+    """The document's discrete snap targets, each tagged with its family so
+    the indicator can show WHICH kind engaged and the ranker can treat them
+    differently. Returns [(Vector, kind), ...] covering SNAP_VERTEX
+    (on-geometry vertices + knots), SNAP_CONTROL (off-curve control-polygon
+    points -- the WEAK tier), SNAP_MIDPOINT / SNAP_CENTER
+    (collect_feature_points_kinded) and SNAP_INTERSECTION (true curve-curve
+    crossings).
+
+    Control points share the SNAP_VERTEX toggle (they're collected whenever
+    vertices are) but carry the distinct SNAP_CONTROL tag so
+    nearest_snap_ranked_kind can rank them as distance-only rather than
+    magnet-sticky -- the fix for off-curve handles hijacking a drag that was
+    aiming at a curve body.
 
     `kinds` (a set of kind tags), if given, limits which families are
-    collected -- e.g. {SNAP_VERTEX} skips the O(n^2) intersection scan
-    entirely. None collects both. Gui-free -- headless-testable, same as
-    collect_strong_snap_points which it delegates to."""
+    collected -- e.g. {SNAP_VERTEX} skips the midpoint/centre scan and the
+    intersection scan entirely. None collects all of them. Gui-free --
+    headless-testable, same as the collectors it delegates to.
+
+    (Constraint families -- SNAP_PERPENDICULAR / SNAP_TANGENT -- are NOT
+    here: they depend on a drag anchor, so they come from
+    collect_constraint_snap_points_kinded instead.)"""
     want_vertex = kinds is None or SNAP_VERTEX in kinds
     want_inter = kinds is None or SNAP_INTERSECTION in kinds
     out = []
     if want_vertex:
-        for p in collect_snap_points(doc, exclude=exclude):
+        for p in collect_snap_points(doc, exclude=exclude,
+                                     include_control=False):
             out.append((p, SNAP_VERTEX))
+        for p in collect_control_points(doc, exclude=exclude):
+            out.append((p, SNAP_CONTROL))
+    out.extend(collect_feature_points_kinded(doc, exclude=exclude, kinds=kinds))
     if want_inter:
         shapes = [e for e, _o in collect_snap_shapes(doc, exclude=exclude)]
         for p in collect_intersection_points(shapes):
@@ -776,20 +1204,50 @@ def nearest_snap_kind(view, kinded_points, pos, max_px):
 
 
 def nearest_snap_ranked_kind(view, kinded_strong, edge_shapes, pos, max_px,
-                             max_world_dist=None):
-    """nearest_snap_ranked that also reports which snap family won, for a
-    kind-coloured indicator. `kinded_strong` is a [(pt, kind), ...] list
-    (from collect_strong_snap_points_kinded); `edge_shapes` the on-edge
-    projection candidates (from collect_snap_shapes), used only when no
-    strong point is in range -- the same vertex-over-edge priority
-    nearest_snap_ranked applies. Returns (point, kind) with kind one of
-    SNAP_VERTEX / SNAP_INTERSECTION / SNAP_EDGE, or (None, None)."""
-    pt, kind = nearest_snap_kind(view, kinded_strong, pos, max_px)
-    if pt is not None:
-        return pt, kind
-    pt = nearest_exact_snap(view, edge_shapes, pos, max_px,
-                            max_world_dist=max_world_dist)
-    return (pt, SNAP_EDGE) if pt is not None else (None, None)
+                             max_world_dist=None, face_shapes=None,
+                             magnet_fraction=None):
+    """Magnet-tiered cursor snap that also reports which family won, for a
+    kind-coloured indicator. `kinded_strong` is a [(pt, kind), ...] list (from
+    collect_strong_snap_points_kinded plus any anchor-relative constraint
+    points from collect_constraint_snap_points_kinded); `edge_shapes` /
+    `face_shapes` are the on-curve / on-surface projection candidates.
+
+    Two passes, which is the fix for 'the discrete tier unconditionally
+    outranks on-curve contact':
+
+      1. A MAGNET-eligible exact target (MAGNET_KINDS: vertex/knot,
+         intersection, midpoint, centre, perpendicular, tangent) within the
+         inner magnet radius (magnet_fraction * max_px) wins outright -- these
+         stay sticky, so aiming AT an endpoint/crossing/foot lands exactly on
+         it.
+      2. Otherwise EVERYTHING left competes on true screen distance: the weak
+         SNAP_CONTROL points, on-curve projection (SNAP_EDGE) and on-surface
+         projection (SNAP_SURFACE). Because an on-curve projection's screen
+         distance is ~0 when you aim at a curve body, contact with the curve
+         now beats an off-curve control handle a few pixels away -- you can
+         finally 'ask for land on this curve'.
+
+    Returns (point, kind), or (None, None)."""
+    if magnet_fraction is None:
+        magnet_fraction = MAGNET_FRACTION
+    # Pass 1 -- inner magnet: a landing target close to the cursor is sticky.
+    magnet_px = max_px * magnet_fraction
+    mpt, mk, _md = _nearest_kinded(view, kinded_strong, pos, magnet_px,
+                                   kinds=MAGNET_KINDS)
+    if mpt is not None:
+        return mpt, mk
+    # Pass 2 -- outer annulus: nearest wins across all remaining candidates.
+    best_pt, best_k, best_d = _nearest_kinded(view, kinded_strong, pos, max_px)
+    ept, epx = _exact_snap_detail(view, edge_shapes, pos, max_px,
+                                  max_world_dist=max_world_dist)
+    if ept is not None and (best_pt is None or epx < best_d):
+        best_pt, best_k, best_d = ept, SNAP_EDGE, epx
+    if face_shapes:
+        fpt, fpx = _exact_snap_detail(view, face_shapes, pos, max_px,
+                                      max_world_dist=max_world_dist)
+        if fpt is not None and (best_pt is None or fpx < best_d):
+            best_pt, best_k, best_d = fpt, SNAP_SURFACE, fpx
+    return (best_pt, best_k) if best_pt is not None else (None, None)
 
 
 def nearest_index(pos, screen_points, max_px):

@@ -96,7 +96,8 @@ class CurvePanel(_EditPanelBase):
         self._cbid = None
         self._cbid_mov = None       # move-event callback for draw-mode snap
         self._snap_pt = None        # snapped 3D point, used by next click
-        self._snap_cands = []       # cached candidates for current pick session
+        self._snap_cands = []       # cached STRONG candidates for pick session
+        self._snap_weak = []        # cached off-curve control pts (weak tier)
         self._snap_shapes = []      # cached edges for exact projection snap
         self._snap_coin_root = None # Coin3D snap indicator root
         self._active_row = None
@@ -1200,6 +1201,7 @@ class CurvePanel(_EditPanelBase):
                 self._remove_snap_overlay(view)
                 self._snap_pt = None
                 self._snap_cands = []
+                self._snap_weak = []
                 self._snap_shapes = []
         except Exception as exc:
             FreeCAD.Console.PrintWarning("Railform: 3D pick unavailable (%s)\n"
@@ -1247,6 +1249,7 @@ class CurvePanel(_EditPanelBase):
                 ))
                 self._remove_snap_overlay(view)
                 self._snap_cands = []
+                self._snap_weak = []
                 self._snap_shapes = []
 
                 # Finalize drawing
@@ -1256,13 +1259,17 @@ class CurvePanel(_EditPanelBase):
                                          % exc)
 
     def _collect_snap_cands(self):
-        """EXACT high-priority discrete snap targets from all other objects
-        -- vertices, control points, knots, and true curve-curve
-        intersections (snaputil.collect_strong_snap_points), samples off.
-        These win over an on-edge projection in the ranked snap. Shared with
-        editmode.PointEditor."""
-        return snaputil.collect_strong_snap_points(self.obj.Document,
-                                                   exclude=self.obj)
+        """The magnet-eligible EXACT on-geometry snap targets -- vertices,
+        knots and true curve-curve intersections -- from all other objects.
+        Off-curve control-polygon handles are collected separately into
+        self._snap_weak (the distance-only tier), so they no longer hijack a
+        draw that is aiming at a curve body. Returns the strong list; sets
+        _snap_weak as a side effect. Shared policy with editmode.PointEditor
+        (see snaputil.collect_ranked_points / nearest_snap_ranked)."""
+        strong, weak = snaputil.collect_ranked_points(self.obj.Document,
+                                                      exclude=self.obj)
+        self._snap_weak = weak
+        return strong
 
     def _collect_snap_shapes(self):
         """Edges from all other objects, for EXACT perpendicular-
@@ -1324,7 +1331,7 @@ class CurvePanel(_EditPanelBase):
             snap_px = snaputil._snap_tolerance_mm(view, 4.0)
             best = snaputil.nearest_snap_ranked(
                 view, self._snap_cands, getattr(self, "_snap_shapes", []),
-                pos, snap_px)
+                pos, snap_px, weak_points=getattr(self, "_snap_weak", None))
             self._snap_pt = best
             if self._snap_coin_root is not None:
                 if best is not None:
@@ -1395,7 +1402,7 @@ class CurvePanel(_EditPanelBase):
             snap_px = snaputil._snap_tolerance_mm(view, 4.0)
             best = snaputil.nearest_snap_ranked(
                 view, self._snap_cands, getattr(self, "_snap_shapes", []),
-                pos, snap_px)
+                pos, snap_px, weak_points=getattr(self, "_snap_weak", None))
             self._snap_pt = best
             if self._snap_coin_root is not None:
                 if best is not None:

@@ -1125,6 +1125,103 @@ def test_snaputil_collect_strong_snap_points_includes_intersections():
         FreeCAD.closeDocument(doc.Name)
 
 
+def test_snaputil_intersection_grid_scales_past_old_cliff():
+    """The grid broad-phase must find every crossing in a set BIGGER than the
+    old hard 60-edge cap -- the cliff that made intersection snapping vanish
+    on a real patch network. 40 spatially separated crossing-pairs = 80
+    edges; the old flat O(n^2) scan bailed out above 60 and returned nothing,
+    the grid returns all 40 crossings."""
+    from rfstudio import snaputil
+    edges = []
+    for k in range(40):
+        cx = 100.0 * k                       # pairs far apart -> grid prunes
+        edges.append(Part.Edge(Part.LineSegment(
+            Vector(cx - 1, 0, 0), Vector(cx + 1, 0, 0))))
+        edges.append(Part.Edge(Part.LineSegment(
+            Vector(cx, -1, 0), Vector(cx, 1, 0))))
+    hits = snaputil.collect_intersection_points(edges)   # 80 edges
+    assert len(hits) == 40, len(hits)
+    xs = sorted(round(h.x, 6) for h in hits)
+    assert xs == [100.0 * k for k in range(40)], xs
+    out("  intersection grid  OK  80 edges -> 40 crossings (old cliff was 60)")
+
+
+def test_snaputil_feature_points_midpoint_and_center():
+    """collect_feature_points_kinded must return the arc-length MIDPOINT of an
+    edge (SNAP_MIDPOINT) and the CENTRE of a circle edge (SNAP_CENTER), and
+    honour `kinds` gating (centre-only must yield no midpoints)."""
+    from rfstudio import snaputil
+    doc = FreeCAD.newDocument("snaputil_feature_test") \
+        if hasattr(FreeCAD, "newDocument") else None
+    if doc is None:
+        out("  feature snap pts   SKIP (no document API available)")
+        return
+    try:
+        ln = doc.addObject("Part::Feature", "L")
+        ln.Shape = Part.makeLine(Vector(-4, 2, 0), Vector(4, 2, 0))
+        circ = doc.addObject("Part::Feature", "C")
+        circ.Shape = Part.Edge(Part.Circle(Vector(10, 0, 0),
+                                           Vector(0, 0, 1), 3))
+        doc.recompute()
+        kinded = snaputil.collect_feature_points_kinded(doc, exclude=None)
+        mids = [p for p, k in kinded if k == snaputil.SNAP_MIDPOINT]
+        ctrs = [p for p, k in kinded if k == snaputil.SNAP_CENTER]
+        assert any(p.distanceToPoint(Vector(0, 2, 0)) < 1e-6 for p in mids), mids
+        assert any(p.distanceToPoint(Vector(10, 0, 0)) < 1e-6 for p in ctrs), ctrs
+        only_ctr = snaputil.collect_feature_points_kinded(
+            doc, exclude=None, kinds={snaputil.SNAP_CENTER})
+        assert all(k == snaputil.SNAP_CENTER for _p, k in only_ctr), only_ctr
+        out("  feature snap pts   OK  mid=(0,2,0), centre=(10,0,0), gating holds")
+    finally:
+        FreeCAD.closeDocument(doc.Name)
+
+
+def test_snaputil_collect_snap_faces():
+    """collect_snap_faces must return the faces of other objects, and those
+    faces must project correctly via nearest_point_on_shapes (the surface-
+    snap path): a box has six faces, and the nearest surface point to a point
+    above the top is on the top face."""
+    from rfstudio import snaputil
+    doc = FreeCAD.newDocument("snaputil_face_test") \
+        if hasattr(FreeCAD, "newDocument") else None
+    if doc is None:
+        out("  surface snap faces SKIP (no document API available)")
+        return
+    try:
+        box = doc.addObject("Part::Feature", "Box")
+        box.Shape = Part.makeBox(10, 10, 10)
+        doc.recompute()
+        faces = snaputil.collect_snap_faces(doc, exclude=None)
+        assert len(faces) == 6, len(faces)
+        pt, d, _shp = snaputil.nearest_point_on_shapes(Vector(5, 5, 20), faces)
+        assert pt is not None and abs(pt.z - 10.0) < 1e-6, pt
+        # excluding the only object leaves no faces
+        assert snaputil.collect_snap_faces(doc, exclude=box) == []
+        out("  surface snap faces OK  6 box faces, project lands on top (z=10)")
+    finally:
+        FreeCAD.closeDocument(doc.Name)
+
+
+def test_snaputil_constraint_points_perp_and_tangent():
+    """perpendicular_points_from / tangent_points_from must find the right-
+    angle foot and the tangent touch points, and exclude a foot that lands on
+    an endpoint (that's a plain vertex, not a genuine perpendicular)."""
+    from rfstudio import snaputil
+    xaxis = Part.Edge(Part.LineSegment(Vector(-10, 0, 0), Vector(10, 0, 0)))
+    feet = snaputil.perpendicular_points_from(Vector(0, 5, 0), [xaxis])
+    assert any(p.distanceToPoint(Vector(0, 0, 0)) < 1e-6 for p in feet), feet
+    # anchor straight above the right END -> true foot is the endpoint, dropped
+    feet2 = snaputil.perpendicular_points_from(Vector(10, 5, 0), [xaxis])
+    assert all(p.distanceToPoint(Vector(10, 0, 0)) > 1e-6 for p in feet2), feet2
+    # two tangent touch points from an external point to a circle of radius 3
+    circ = Part.Edge(Part.Circle(Vector(0, 0, 0), Vector(0, 0, 1), 3))
+    tans = snaputil.tangent_points_from(Vector(10, 0, 0), [circ])
+    assert len(tans) >= 2, tans
+    assert all(abs(p.Length - 3.0) < 1e-3 for p in tans), tans
+    out("  constraint snaps   OK  perp foot=(0,0,0), endpoint excluded, "
+        "2 tangents on r=3")
+
+
 class _FakeOrthoView(object):
     """Minimal stand-in for a View3DInventor: a fixed top-down orthographic
     view along -Z, just enough for pick_ray/screen_project to run for real
@@ -1179,6 +1276,38 @@ def test_snaputil_vertex_beats_closer_edge_point():
     ranked2 = snaputil.nearest_snap_ranked(view, [far_vertex], [edge], pos, max_px)
     assert ranked2 is not None and abs(ranked2.x - 0.02) < 1e-9, ranked2
     out("  vertex priority    OK  in-tol vertex wins; out-of-tol falls to edge")
+
+
+def test_snaputil_magnet_lets_body_contact_beat_control_point():
+    """The ranking fix: outside the inner magnet radius, on-curve projection
+    (aiming at a curve body) must beat an off-curve control point a few px
+    away -- you can 'ask for land on this curve'. And a true landing target
+    (endpoint) inside the magnet must stay sticky even when the curve body is
+    geometrically closer. Runs the REAL ranked-snap paths via the fake view."""
+    from rfstudio import snaputil
+    view = _FakeOrthoView()           # screen == world xy, 1 unit == 1 px
+    line = Part.Edge(Part.LineSegment(Vector(0, 0, 0), Vector(10, 0, 0)))
+
+    # (1) body contact beats a control point: cursor on the line at x=5, a
+    # control point 6px above. Edge projects to (5,0) at 0px -> edge wins.
+    strong = [(Vector(0, 0, 0), snaputil.SNAP_VERTEX)]   # far endpoint
+    weak = [Vector(5, 6, 0)]
+    pt, kind = snaputil.nearest_snap_ranked_kind(
+        view, strong + [(weak[0], snaputil.SNAP_CONTROL)], [line], (5, 0), 18)
+    assert kind == snaputil.SNAP_EDGE, kind
+    assert pt.distanceToPoint(Vector(5, 0, 0)) < 1e-6, pt
+    # non-kinded ranker, same scenario via weak_points
+    pt2 = snaputil.nearest_snap_ranked(
+        view, [Vector(0, 0, 0)], [line], (5, 0), 18, weak_points=weak)
+    assert pt2.distanceToPoint(Vector(5, 0, 0)) < 1e-6, pt2
+
+    # (2) endpoint stays sticky inside the magnet: cursor 2px from the end,
+    # still on the line (edge dist ~0) -> the endpoint must win, not the edge.
+    pt3, kind3 = snaputil.nearest_snap_ranked_kind(
+        view, [(Vector(0, 0, 0), snaputil.SNAP_VERTEX)], [line], (2, 0), 18)
+    assert kind3 == snaputil.SNAP_VERTEX, kind3
+    assert pt3.distanceToPoint(Vector(0, 0, 0)) < 1e-6, pt3
+    out("  snap magnet        OK  body-contact beats control pt; endpoint sticky")
 
 
 def test_review_recommendation_classifies_outcomes():
@@ -3631,8 +3760,13 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_snaputil_axis_snap_stays_on_axis,
               test_on_curve_constraint_pulls_point_onto_edge,
               test_snaputil_collect_intersection_points,
+              test_snaputil_intersection_grid_scales_past_old_cliff,
               test_snaputil_collect_strong_snap_points_includes_intersections,
+              test_snaputil_feature_points_midpoint_and_center,
+              test_snaputil_collect_snap_faces,
+              test_snaputil_constraint_points_perp_and_tangent,
               test_snaputil_vertex_beats_closer_edge_point,
+              test_snaputil_magnet_lets_body_contact_beat_control_point,
               test_clean_patch_44_exact_control_net,
               test_clean_patch_66_exact_control_net,
               test_clean_patch_rejects_wrong_grid_size,
