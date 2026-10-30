@@ -1530,11 +1530,13 @@ def _dedupe_stations(stations, gap=1e-9):
     return out
 
 
-def _deviation_of_curves(curves, shape, samples):
-    """Worst distance from points along each curve to `shape`: both ends
-    plus `samples` midpoints. Accepts edges or BSplineCurves (edges are
-    converted trim-aware). Cost is dominated by distToShape; keep `samples`
-    modest."""
+def _py_deviation_of_curves(curves, shape, samples):
+    """(reference) Worst distance from points along each curve to `shape`:
+    both ends plus `samples` midpoints. Accepts edges or BSplineCurves
+    (edges are converted trim-aware). Cost is dominated by distToShape;
+    keep `samples` modest. This stays first-class: it is the fallback
+    whenever the compiled gate (rfstudio.native.rfs_native) cannot serve
+    the call, and the correctness oracle it must agree with."""
     worst = 0.0
     n = max(1, int(samples))
     fracs = [0.0] + [(k + 0.5) / n for k in range(n)] + [1.0]
@@ -1548,6 +1550,196 @@ def _deviation_of_curves(curves, shape, samples):
                         Part.Vertex(c.value(fp + f * (lp - fp))
                                     ).distToShape(shape)[0])
     return worst
+
+
+class _NativeUnsupported(Exception):
+    """Shape/sample data the compiled deviation gate does not cover."""
+
+
+_NATIVE = {'checked': False, 'mod': None, 'umajor': False}
+
+
+def _flat_knots(surf, is_u):
+    """Flat (multiplicity-expanded) knot sequence, length = poles+deg+1.
+
+    UKnotSequence/VKnotSequence is that flat vector in FreeCAD 1.x; rebuild
+    from getUKnots/getUMultiplicities when an older/newer build disagrees."""
+    n = surf.NbUPoles if is_u else surf.NbVPoles
+    d = surf.UDegree if is_u else surf.VDegree
+    seq = list(surf.UKnotSequence if is_u else surf.VKnotSequence)
+    if len(seq) != n + d + 1:
+        kn = surf.getUKnots() if is_u else surf.getVKnots()
+        mu = surf.getUMultiplicities() if is_u else surf.getVMultiplicities()
+        seq = []
+        for k, m in zip(kn, mu):
+            seq.extend([k] * int(m))
+    if len(seq) != n + d + 1:
+        raise ValueError('knot sequence length %d != poles+degree+1 %d'
+                         % (len(seq), n + d + 1))
+    return seq
+
+
+def _homogeneous_poles(surf):
+    """(Nu, Nv, 4) array of (x*w, y*w, z*w, w) poles, axis0 = U.
+
+    getPoles()/getWeights() are verified to be U-major (axis0 = U) once per
+    process via debug_eval against surf.value; a mismatched build falls
+    back to the Python loop."""
+    import numpy
+    nu, nv = surf.NbUPoles, surf.NbVPoles
+    poles = surf.getPoles()
+    wts = surf.getWeights()
+    rows, cols = len(poles), len(poles[0])
+    if (rows, cols) != (nu, nv):
+        raise _NativeUnsupported(
+            'poles grid (%d,%d) != (Nu,Nv) (%d,%d)' % (rows, cols, nu, nv))
+    H = numpy.empty((nu, nv, 4))
+    for i in range(nu):
+        row = poles[i]
+        wrow = wts[i]
+        for j in range(nv):
+            p = row[j]
+            H[i, j, 0] = p.x
+            H[i, j, 1] = p.y
+            H[i, j, 2] = p.z
+            H[i, j, 3] = wrow[j]
+    return H
+
+
+def _native_gate():
+    """The loaded rfs_native module after a one-time orientation probe, or
+    None (then the pure-Python gate is used). Never raises."""
+    st = _NATIVE
+    if not st['checked']:
+        st['checked'] = True
+        try:
+            import numpy
+            from rfstudio.native import rfs_native as mod
+            # Endorse the U-major pole assumption with the module's own
+            # evaluator against a freshly built surface.
+            probe = Part.BSplineSurface()
+            probe.interpolate([[FreeCAD.Vector(0.0, 0.0, 0.0),
+                                FreeCAD.Vector(1.0, 0.0, 0.6)],
+                               [FreeCAD.Vector(0.0, 3.0, 0.4),
+                                FreeCAD.Vector(1.0, 3.0, 1.3)],
+                               [FreeCAD.Vector(0.0, 6.0, 0.1),
+                                FreeCAD.Vector(1.0, 6.0, 0.8)]])
+            H = _homogeneous_poles(probe)
+            ku = _flat_knots(probe, True)
+            kv = _flat_knots(probe, False)
+            um = ku[0] + 0.44 * (ku[-1] - ku[0])
+            vm = kv[0] + 0.57 * (kv[-1] - kv[0])
+            got = mod.debug_eval(H, numpy.asarray(ku), numpy.asarray(kv),
+                                 probe.UDegree, probe.VDegree, um, vm)
+            ref = probe.value(um, vm)
+            ok = max(abs(got[i] - ref[i]) for i in range(3)) < 1e-9
+            # a flipped pole grid must NOT match (guards coincident dims)
+            Ht = numpy.transpose(H, (1, 0, 2))
+            try:
+                got2 = mod.debug_eval(Ht, numpy.asarray(ku),
+                                      numpy.asarray(kv),
+                                      probe.UDegree, probe.VDegree, um, vm)
+                ok2 = max(abs(got2[i] - ref[i]) for i in range(3)) < 1e-9
+            except Exception:
+                ok2 = False
+            if ok and not ok2:
+                st['mod'] = mod
+                st['umajor'] = True
+        except Exception:
+            pass
+    return st['mod']
+
+
+def _gate_face_data(shape):
+    """Per-face (poles (Nu,Nv,4), knots_u, knots_v, deg_u, deg_v) tuples for
+    the compiled gate, or raise _NativeUnsupported.
+
+    Supported: BSplineSurface faces spanning their surface's NATURAL
+    parameter box (boundary trim == natural bounds) and not periodic --
+    i.e. exactly the face geometry produced by the sweep/loft/gordon
+    builders. Anything else (analytic faces, trimmed interior, periodic)
+    goes back to the Python reference loop."""
+    import numpy
+    faces = None
+    if hasattr(shape, 'Faces'):
+        try:
+            faces = list(shape.Faces)
+        except Exception:
+            faces = None
+    if not faces:
+        if hasattr(shape, 'Surface'):
+            faces = [shape]
+        else:
+            raise _NativeUnsupported('shape exposes no faces')
+    out = []
+    for f in faces:
+        try:
+            surf = f.Surface
+        except Exception:
+            raise _NativeUnsupported('face without a Surface')
+        if not isinstance(surf, Part.BSplineSurface):
+            raise _NativeUnsupported('non-bspline face')
+        if surf.isUPeriodic() or surf.isVPeriodic():
+            raise _NativeUnsupported('periodic surface')
+        du_, dv_ = surf.UDegree, surf.VDegree
+        ku = _flat_knots(surf, True)
+        kv = _flat_knots(surf, False)
+        # face must cover the surface's natural parameter box
+        umin, umax, vmin, vmax = f.ParameterRange
+        if (abs(umin - ku[du_]) > 1e-9 or abs(umax - ku[-1 - du_]) > 1e-9 or
+                abs(vmin - kv[dv_]) > 1e-9 or abs(vmax - kv[-1 - dv_]) > 1e-9):
+            raise _NativeUnsupported('face trimmed inside the natural box')
+        out.append((_homogeneous_poles(surf), numpy.asarray(ku),
+                    numpy.asarray(kv), du_, dv_))
+    if not out:
+        raise _NativeUnsupported('no faces')
+    return out
+
+
+def _native_deviation(curves, shape, samples):
+    """Compiled-gate implementation of _deviation_of_curves.
+
+    Point gathering is IDENTICAL to _py_deviation_of_curves (same
+    _to_bspline conversion, same fracs); only distance measurement is
+    handed to rfs_native.max_surface_deviation."""
+    mod = _native_gate()
+    if mod is None:
+        raise _NativeUnsupported('compiled gate unavailable')
+    face_tuples = _gate_face_data(shape)
+    n = max(1, int(samples))
+    fracs = [0.0] + [(k + 0.5) / n for k in range(n)] + [1.0]
+    pts = []
+    for c in curves:
+        c = _to_bspline(c)
+        if c is None:
+            continue
+        fp, lp = c.FirstParameter, c.LastParameter
+        for f in fracs:
+            p = c.value(fp + f * (lp - fp))
+            pts.append((p.x, p.y, p.z))
+    if not pts:
+        return 0.0
+    import numpy
+    pa = numpy.asarray(pts, dtype=float)
+    if pa.shape[0] and not numpy.isfinite(pa).all():
+        raise _NativeUnsupported('non-finite sample point')
+    return float(mod.max_surface_deviation(pa, face_tuples))
+
+
+def _deviation_of_curves(curves, shape, samples):
+    """Worst distance from points along each curve to `shape`: both ends
+    plus `samples` midpoints. Accepts edges or BSplineCurves (edges are
+    converted trim-aware).
+
+    Dispatches to the compiled projection gate when rfs_native is present
+    and the faces qualify (native bspline faces on their natural box); the
+    pure-Python reference loop handles everything else. Any failure inside
+    the native path falls back silently -- gate calls must never break a
+    sweep."""
+    try:
+        return _native_deviation(curves, shape, samples)
+    except Exception:
+        return _py_deviation_of_curves(curves, shape, samples)
 
 
 def _rail_order_warning(profile_params):

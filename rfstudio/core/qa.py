@@ -43,6 +43,59 @@ def _analytic_cross_d2(face, side, u, v):
         return None
 
 
+def _native_project_face(face, points):
+    """Project each point in `points` onto `face` using the compiled gate
+    (rfstudio.native.rfs_native), returning a list of (dist, u, v) in the
+    face's natural surface parameters -- or None when the gate can't serve
+    this face, so the caller uses the exact Part.Vertex.distToShape path.
+
+    This is the QA counterpart of patches._native_deviation: it reuses that
+    module's one-time orientation probe (_native_gate) and its homogeneous-
+    pole / natural-box face extraction (_gate_face_data), so the same strict
+    eligibility contract applies -- only a non-periodic B-spline face
+    spanning its surface's NATURAL parameter box qualifies (exactly the
+    geometry the sweep/loft/gordon/blend builders produce). A trimmed,
+    periodic, or analytic face, a non-finite query point, or a missing /
+    ABI-mismatched extension all return None.
+
+    Note: the natural-box guard is also what makes projecting onto the full
+    surface equivalent to projecting onto the (untrimmed) face, so the
+    native result matches distToShape there. `patches` is imported lazily
+    to avoid a surfacing/qa import cycle at module load.
+    """
+    try:
+        import numpy
+        from rfstudio.core import patches
+        mod = patches._native_gate()
+        if mod is None:
+            return None
+        # Raises patches._NativeUnsupported for an ineligible face.
+        poles, ku, kv, degu, degv = patches._gate_face_data(face)[0]
+        pa = numpy.asarray([[p.x, p.y, p.z] for p in points], dtype=float)
+        if pa.shape[0] == 0:
+            return []
+        if not numpy.isfinite(pa).all():
+            return None
+        batch = getattr(mod, "project_points", None)
+        if batch is not None:
+            # rfs_native >= 0.3.0: one lattice build for the whole batch.
+            res = batch(pa, poles, ku, kv, degu, degv)
+            return [(float(res[i, 0]), float(res[i, 1]), float(res[i, 2]))
+                    for i in range(res.shape[0])]
+        # Older extension without the batched entry: per-point projection
+        # (each call rebuilds the lattice, but still far cheaper than the
+        # OCCT distToShape path).
+        out = []
+        for i in range(pa.shape[0]):
+            r = mod.debug_project(poles, ku, kv, degu, degv, pa[i])
+            out.append((float(r[0]), float(r[1]), float(r[2])))
+        return out
+    except Exception:
+        # Any failure (unsupported face, numpy/extension missing, bad data)
+        # falls back silently to the exact OCCT distToShape path.
+        return None
+
+
 def surface_deviation(face_a, face_b, samples=24):
     """Numeric G0/G1/G2 deviation between two faces across their nearest
     facing boundary -- the QA counterpart to match_surface().
@@ -109,18 +162,35 @@ def surface_deviation(face_a, face_b, samples=24):
             p2 = face.valueAt(u, v + sgn * 2 * eps)
         return (p0 - p1 * 2.0 + p2) * (1.0 / (eps * eps))
 
-    rows = []
-    max_g0 = max_g1 = max_g2 = 0.0
+    # Sample face_a's side once (trim-aware), then project every sample onto
+    # face_b. The projection is the expensive step: Part.Vertex(pa)
+    # .distToShape(face_b) rebuilds an OCCT extrema context per sample
+    # (~4-13 ms each; the same cost the sweep/loft deviation gate already
+    # moved to C++). When the compiled gate is present AND face_b qualifies,
+    # the batch is projected by rfs_native instead -- pure arithmetic that
+    # also hands back the (u, v) on face_b directly, so no parameter()
+    # inversion is needed. _native_project_face returns None (and we use the
+    # exact distToShape path) whenever the gate can't serve this face.
+    a_samples = []
     for k in range(samples):
         t = k / (samples - 1.0)
         ua, va = _side_uv_trimmed(face_a, a_pr, sa, t, _edge_cache)
-        pa = face_a.valueAt(ua, va)
-        dist, pts_on, _info = Part.Vertex(pa).distToShape(face_b)
-        pb = pts_on[0][1] if pts_on else pa
-        try:
-            ub, vb = face_b.Surface.parameter(pb)
-        except Exception:
-            ub, vb = _side_uv_trimmed(face_b, b_pr, sb, t, _edge_cache)
+        a_samples.append((t, ua, va, face_a.valueAt(ua, va)))
+
+    native_proj = _native_project_face(face_b, [s[3] for s in a_samples])
+
+    rows = []
+    max_g0 = max_g1 = max_g2 = 0.0
+    for k, (t, ua, va, pa) in enumerate(a_samples):
+        if native_proj is not None:
+            dist, ub, vb = native_proj[k]
+        else:
+            dist, pts_on, _info = Part.Vertex(pa).distToShape(face_b)
+            pb = pts_on[0][1] if pts_on else pa
+            try:
+                ub, vb = face_b.Surface.parameter(pb)
+            except Exception:
+                ub, vb = _side_uv_trimmed(face_b, b_pr, sb, t, _edge_cache)
 
         Ta = _cross_tan(face_a, sa, ua, va)
         Tb = _cross_tan(face_b, sb, ub, vb)
