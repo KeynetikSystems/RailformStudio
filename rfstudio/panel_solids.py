@@ -107,7 +107,7 @@ class BooleanPanel(_EditPanelBase):
         self._status = QtWidgets.QLabel("")
         self._status.setWordWrap(True)
         self._status.setStyleSheet(
-            "color:#9aa6b2;font-size:11px;padding:4px 0;")
+            "color:palette(mid);font-size:11px;padding:4px 0;")
         lay.addWidget(self._status)
 
         self.live = QtWidgets.QCheckBox("Live preview")
@@ -258,7 +258,7 @@ class MeshToSurfacePanel(_EditPanelBase):
         self._status = QtWidgets.QLabel("")
         self._status.setWordWrap(True)
         self._status.setStyleSheet(
-            "color:#9aa6b2;font-size:11px;padding:4px 0;")
+            "color:palette(mid);font-size:11px;padding:4px 0;")
         lay.addWidget(self._status)
 
         self.live = QtWidgets.QCheckBox("Live preview")
@@ -388,7 +388,7 @@ class HiddenLineExportPanel(_EditPanelBase):
         self._status = QtWidgets.QLabel("")
         self._status.setWordWrap(True)
         self._status.setStyleSheet(
-            "color:#9aa6b2;font-size:11px;padding:4px 0;")
+            "color:palette(mid);font-size:11px;padding:4px 0;")
         lay.addWidget(self._status)
 
         export_btn = QtWidgets.QPushButton("Export SVG…")
@@ -590,7 +590,7 @@ class MirrorPanel(_EditPanelBase):
         self._status = QtWidgets.QLabel("")
         self._status.setWordWrap(True)
         self._status.setStyleSheet(
-            "color:#9aa6b2;font-size:11px;padding:4px 0;")
+            "color:palette(mid);font-size:11px;padding:4px 0;")
         lay.addWidget(self._status)
 
         self.live = QtWidgets.QCheckBox("Live preview")

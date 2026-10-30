@@ -257,15 +257,27 @@ def _face_and_wire_from_selection(need_label):
 
 
 def native_trim():
-    """Native provider for RFS_Trim -- replaces Curves' Trim command with
-    core.trim_face (Part.Face(surface, wire), OCCT's own primitive for
-    'a surface bounded by a wire on it')."""
+    """Native provider for RFS_Trim -- opens the guided TrimSoSPanel (Face /
+    boundary-curve slots) rather than firing blind off the current
+    selection, matching native_blend_surface's panel pattern. The panel
+    gathers the two roles explicitly and calls core.trim_face (Part.Face
+    (surface, wire), OCCT's own primitive for 'a surface bounded by a wire
+    on it')."""
+    _open_trim_sos_panel("Trim")
+
+
+def _open_trim_sos_panel(mode):
     import FreeCAD
-    from rfstudio import core
-    face, wire = _face_and_wire_from_selection("Trim")
-    trimmed = core.trim_face(face, wire)
-    doc = FreeCAD.ActiveDocument
-    _add_feature_with_undo(doc, "Trim", trimmed)
+    import FreeCADGui
+    from rfstudio import taskpanels
+    if FreeCAD.ActiveDocument is None:
+        FreeCAD.newDocument()
+    if FreeCADGui.Control.activeDialog():
+        try:
+            FreeCADGui.Control.closeDialog()
+        except Exception:
+            pass
+    FreeCADGui.Control.showDialog(taskpanels.TrimSoSPanel(mode=mode))
 
 
 def native_blend_surface():
@@ -289,16 +301,12 @@ def native_blend_surface():
 
 
 def native_sketch_on_surf():
-    """Native provider for RFS_SketchOnSurf -- replaces Curves' SoS command
-    with core.project_wire_onto_face (nearest-point projection + refit,
-    since FreeCAD's Part API doesn't expose a general surface-projection
-    binding directly)."""
-    import FreeCAD
-    from rfstudio import core
-    face, wire = _face_and_wire_from_selection("Sketch on surface")
-    projected = core.project_wire_onto_face(face, wire)
-    doc = FreeCAD.ActiveDocument
-    _add_feature_with_undo(doc, "SketchOnSurf", projected)
+    """Native provider for RFS_SketchOnSurf -- opens the guided TrimSoSPanel
+    (target Face / curve-to-project slots) rather than firing blind off the
+    current selection. The panel calls core.project_wire_onto_face
+    (nearest-point projection + refit, since FreeCAD's Part API doesn't
+    expose a general surface-projection binding directly)."""
+    _open_trim_sos_panel("SketchOnSurf")
 
 
 # --- booleans / mesh-to-surface / hidden-line drafting export ------------ #

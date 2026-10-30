@@ -359,7 +359,7 @@ class CurvePanel(_EditPanelBase):
         self.constraint_status = QtWidgets.QLabel("")
         self.constraint_status.setWordWrap(True)
         self.constraint_status.setStyleSheet(
-            "color:#9aa6b2;font-size:11px;padding:2px 0;")
+            "color:palette(mid);font-size:11px;padding:2px 0;")
         constraints_layout.addWidget(self.constraint_status)
 
         self._lay.addLayout(constraints_layout)

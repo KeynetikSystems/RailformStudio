@@ -29,6 +29,7 @@ except Exception:                     # older shim: widgets live in QtGui
 from rfstudio import deps, engines
 from rfstudio import panel_nurbspull
 from rfstudio import panel_sketch3d
+from rfstudio import statusbar
 from rfstudio import taskpanels
 
 _ICON_DIR = os.path.join(os.path.dirname(__file__), "resources")
@@ -141,9 +142,27 @@ def _selection_has_external_sources():
     return False
 
 
+# Human-readable selection requirements, surfaced two ways: appended to a
+# command's tooltip ("Needs: ...") so a user knows what to select BEFORE
+# clicking, and shown as the non-modal status-bar message when a command is
+# clicked without a valid selection. One source of truth for both the gate
+# (_selection_ok_for) and the hint (selection_requirement) -- see UX note on
+# why we no longer silently grey these buttons out.
+SELECTION_HINTS = {
+    "RFS_Trim": "one face and one boundary curve",
+    "RFS_SketchOnSurf": "one face and one curve",
+    "RFS_BlendSurf": "two surfaces",
+    "RFS_BlendSurfClosed": "three or more faces",
+}
+
+_GENERIC_SELECTION_HINT = "at least one object"
+
+
 def _selection_ok_for(cmd_id):
     """Selection-validity pre-check for provider commands that need specific
-    geometry.  Returns (ok, reason)."""
+    geometry.  Returns (ok, reason). The reason text comes from
+    SELECTION_HINTS so the greyed-out explanation, the tooltip hint, and the
+    click-time message all read the same."""
     sel = _selection()
     if not sel:
         return False, "select geometry first"
@@ -151,15 +170,15 @@ def _selection_ok_for(cmd_id):
     if cmd_id == "RFS_Trim":
         # needs a face + an edge/curve
         return (_selection_has_face() and _selection_has_edge()), \
-            "select one face and one boundary curve"
+            "select " + SELECTION_HINTS[cmd_id]
     if cmd_id == "RFS_SketchOnSurf":
         return (_selection_has_face() and _selection_has_edge()), \
-            "select one face and one curve"
+            "select " + SELECTION_HINTS[cmd_id]
     if cmd_id == "RFS_BlendSurf":
         return _selection_has_face() and _selection_count() >= 2, \
-            "select two surfaces"
+            "select " + SELECTION_HINTS[cmd_id]
     if cmd_id == "RFS_BlendSurfClosed":
-        return _selection_count() >= 3, "select >= 3 faces"
+        return _selection_count() >= 3, "select " + SELECTION_HINTS[cmd_id]
     return True, ""
 
 
@@ -173,11 +192,46 @@ _PANEL_NEEDS_SELECTION = {
     "RFS_Sweep2Rail", "RFS_SweepN", "RFS_Fill",
 }
 
+def selection_requirement(cmd_id):
+    """Short 'what to select' phrase for a command, or '' when it needs no
+    particular selection. Drives the tooltip hint and the click-time
+    message. Panel commands that just need *something* selected fall back to
+    the generic phrase; the specific provider requirements live in
+    SELECTION_HINTS."""
+    if cmd_id in SELECTION_HINTS:
+        return SELECTION_HINTS[cmd_id]
+    if cmd_id in _PANEL_NEEDS_SELECTION:
+        return _GENERIC_SELECTION_HINT
+    return ""
+
+
+def _tip_with_hint(cmd_id, tip):
+    """Append the selection requirement (if any) to a command's tooltip, so
+    the toolbar/menu/shelf button all explain what to pick before it will
+    do anything."""
+    req = selection_requirement(cmd_id)
+    if not req:
+        return tip
+    note = "Needs: " + req + "."
+    return (tip + "\n\n" + note) if tip else note
+
+
 # Commands that modify/destroy geometry -- require explicit confirmation.
 _DESTRUCTIVE = {
     "RFS_BooleanSubtract", "RFS_BooleanUnion", "RFS_BooleanIntersect",
     "RFS_Trim", "RFS_TrimByIntersection", "RFS_Shell",
 }
+
+# Provider commands whose native path opens a guided slot-picker panel
+# (engines.native_trim / native_sketch_on_surf -> TrimSoSPanel;
+# native_blend_surface -> BlendSurfPanel). For these we must NOT gate on
+# (or reject) the viewport selection before running: the whole point of the
+# panel is to let the user assign the face/curve/surface roles explicitly,
+# prefilled from the selection when possible. The panel is the real commit
+# point, so the destructive-confirm prompt moves there too (and the native
+# trim/SoS are additive anyway -- they add a new Part::Feature, leaving the
+# source untouched).
+_OPENS_PANEL = {"RFS_Trim", "RFS_SketchOnSurf", "RFS_BlendSurf"}
 
 # Commands that must not run while another object is being edited.
 _EDITING_OBJ = None  # name of the object currently in edit mode
@@ -189,9 +243,8 @@ def _confirm_destructive(cmd_id, menu_text):
     try:
         reply = QtWidgets.QMessageBox.question(
             FreeCADGui.getMainWindow(), "Railform Studio",
-            "“%s” will modify the selected geometry.\n"
-            "This cannot be undone with Ctrl+Z unless the operation is "
-            "wrapped in a transaction.  Continue?" % menu_text,
+            "“%s” will modify the selected geometry and may be hard to "
+            "undo.  Continue?" % menu_text,
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.No)
         return reply == QtWidgets.QMessageBox.Yes
@@ -216,7 +269,8 @@ class ProviderCommand:
     def __init__(self, cmd_id, menu, tip, icon):
         self._id = cmd_id
         self._chain = engines.PROVIDERS[cmd_id]
-        self._res = {"MenuText": menu, "ToolTip": tip, "Pixmap": _icon(icon)}
+        self._res = {"MenuText": menu, "ToolTip": _tip_with_hint(cmd_id, tip),
+                     "Pixmap": _icon(icon)}
 
     def GetResources(self):
         return self._res
@@ -234,24 +288,30 @@ class ProviderCommand:
             return False
         if not any(self._provider_ready(p) for p in self._chain):
             return False
-        ok, _reason = _selection_ok_for(self._id)
-        return ok
+        # Selection is deliberately NOT gated here. A button that greys out
+        # on the wrong selection can never tell you what it wants, because
+        # Activated() never fires on a disabled button. Keep it enabled
+        # (its tooltip carries the "Needs: ..." hint) and explain the
+        # requirement on click via a non-modal status flash instead.
+        return True
 
     def Activated(self):
-        ok, reason = _selection_ok_for(self._id)
-        if not ok:
-            FreeCAD.Console.PrintWarning(
-                "Railform Studio: %s -- %s\n" % (self._id, reason))
-            try:
-                QtWidgets.QMessageBox.warning(
-                    FreeCADGui.getMainWindow(), "Railform Studio",
-                    "%s" % reason)
-            except Exception:
-                pass
-            return
-        if self._id in _DESTRUCTIVE and not _confirm_destructive(
-                self._id, self._res.get("MenuText", self._id)):
-            return
+        # Commands whose native path opens a guided panel skip the pre-click
+        # selection gate and destructive-confirm entirely -- the panel
+        # gathers the selection into slots and is the real commit point.
+        if self._id not in _OPENS_PANEL:
+            ok, reason = _selection_ok_for(self._id)
+            if not ok:
+                # Non-modal: a wrong-selection precondition is not worth a
+                # modal interruption -- flash it on the status bar (falls
+                # back to the Console when there's no main window).
+                statusbar.flash(
+                    "%s — %s" % (self._res.get("MenuText", self._id), reason),
+                    error=True)
+                return
+            if self._id in _DESTRUCTIVE and not _confirm_destructive(
+                    self._id, self._res.get("MenuText", self._id)):
+                return
         for provider in self._chain:
             if provider[0] == "native":
                 fn = getattr(engines, provider[1], None)
@@ -274,16 +334,14 @@ class ProviderCommand:
             % (self._id, self._chain))
         # A console-only PrintError is easy to miss -- the toolbar button
         # just looks like it did nothing. Every provider in the chain has
-        # already failed at this point, so also surface it as a dialog.
-        try:
-            QtWidgets.QMessageBox.warning(
-                FreeCADGui.getMainWindow(), "Railform Studio",
-                "“%s” isn’t available right now: none of its "
-                "providers could run (tried: %s).\nSee the Report view for "
-                "details." % (self._res.get("MenuText", self._id),
-                              ", ".join(str(p) for p in self._chain)))
-        except Exception:
-            pass
+        # already failed at this point, so also surface it where the user is
+        # looking. Non-modal (status bar) to keep one consistent feedback
+        # rule: modal dialogs are reserved for destructive confirmation.
+        statusbar.flash(
+            "“%s” isn’t available right now — none of its providers could "
+            "run. See the Report view for details."
+            % self._res.get("MenuText", self._id),
+            error=True, msec=8000)
 
 
 class HealthResetCommand:
@@ -320,7 +378,8 @@ class PanelCommand:
     def __init__(self, cmd_id, factory, menu, tip, icon):
         self._id = cmd_id  # used by IsActive (selection gating) / Activated
         self._factory = factory     # callable -> task-panel instance
-        self._res = {"MenuText": menu, "ToolTip": tip, "Pixmap": _icon(icon)}
+        self._res = {"MenuText": menu, "ToolTip": _tip_with_hint(cmd_id, tip),
+                     "Pixmap": _icon(icon)}
 
     def GetResources(self):
         return self._res
@@ -328,8 +387,9 @@ class PanelCommand:
     def IsActive(self):
         if FreeCAD.ActiveDocument is None:
             return False
-        if self._id in _PANEL_NEEDS_SELECTION and not _selection():
-            return False
+        # Selection is NOT gated here (see ProviderCommand.IsActive): the
+        # button stays enabled with a "Needs: ..." tooltip and explains the
+        # requirement on click, rather than greying out silently.
         if _selection_has_external_sources():
             # referenced objects are read-only -- editing breaks associations
             return False
@@ -339,16 +399,22 @@ class PanelCommand:
         global _EDITING_OBJ
         if FreeCAD.ActiveDocument is None:
             FreeCAD.newDocument()
-        # single-edit-mode: refuse to open a second edit panel while one
-        # object is already being edited
+        # Selection precondition: explain on click (non-modal) instead of
+        # greying the button out with no hint.
+        if self._id in _PANEL_NEEDS_SELECTION and not _selection():
+            statusbar.flash(
+                "%s — select %s first."
+                % (self._res.get("MenuText", self._id),
+                   _GENERIC_SELECTION_HINT),
+                error=True)
+            return
+        # single-edit-mode: don't open a second edit panel while one object
+        # is already being edited. Non-modal nudge (the open panel is still
+        # right there in the Tasks tab) rather than a modal interruption.
         if _EDITING_OBJ is not None:
-            try:
-                QtWidgets.QMessageBox.information(
-                    FreeCADGui.getMainWindow(), "Railform Studio",
-                    "Finish editing “%s” before opening another tool."
-                    % _EDITING_OBJ)
-            except Exception:
-                pass
+            statusbar.flash(
+                "Finish editing “%s” before opening another tool."
+                % _EDITING_OBJ)
             return
         # destructive confirmation
         if self._id in _DESTRUCTIVE and not _confirm_destructive(
@@ -628,16 +694,33 @@ TOOLBARS = [
     ("Railform Exchange",["RFS_ImportRails", "RFS_HiddenLineExport"]),
 ]
 
+# Toolbars show a curated, high-frequency SUBSET of each group. Icon-only
+# toolbar buttons are hard to learn 40 of, so the full set lives one click
+# away in the menus and the docked tool shelf -- both of which show text
+# labels next to every icon. This is pure data: move an id between here and
+# TOOLBARS freely to promote/demote a tool from the toolbar. Every id here
+# must also appear in TOOLBARS (which is what registers the command).
+TOOLBAR_PRIMARY = [
+    ("Railform Draw",    ["RFS_DrawInterp", "RFS_DrawControl", "RFS_DrawBezier",
+                          "RFS_DrawBlend", "RFS_DrawFreehand"]),
+    ("Railform Surface", ["RFS_Loft", "RFS_Gordon", "RFS_Coons",
+                          "RFS_Sweep2Rail", "RFS_Trim", "RFS_BlendSurf"]),
+    ("Railform Solids",  ["RFS_BooleanUnion", "RFS_BooleanSubtract",
+                          "RFS_Mirror"]),
+    ("Railform Inspect", ["RFS_SurfaceReview", "RFS_WorkflowGuide"]),
+    ("Railform Exchange", ["RFS_ImportRails", "RFS_HiddenLineExport"]),
+]
+
 
 def command_info(cmd_id):
     """(menu_text, icon_path, tooltip) for a curated command -- used by the
     docked tool shelf to build its buttons."""
     if cmd_id in _PANEL_COMMANDS:
         _, menu, tip, icon = _PANEL_COMMANDS[cmd_id]
-        return menu, _icon(icon), tip
+        return menu, _icon(icon), _tip_with_hint(cmd_id, tip)
     if cmd_id in _DELEGATE_META:
         menu, tip, icon = _DELEGATE_META[cmd_id]
-        return menu, _icon(icon), tip
+        return menu, _icon(icon), _tip_with_hint(cmd_id, tip)
     return cmd_id, "", ""
 
 

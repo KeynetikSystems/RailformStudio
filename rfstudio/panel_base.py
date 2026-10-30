@@ -343,7 +343,7 @@ def _ShortcutHintBar(shortcuts_text="X/Y/Z: lock  |  Tab: plane  |  Esc: drop  |
     lay.setContentsMargins(8, 4, 8, 4)
     lay.setSpacing(8)
     lbl = QtWidgets.QLabel(shortcuts_text)
-    lbl.setStyleSheet("color:#9aa6b2;font-size:10px;")
+    lbl.setStyleSheet("color:palette(mid);font-size:10px;")
     lay.addWidget(lbl)
     lay.addStretch(1)
     bar.lbl = lbl
@@ -385,7 +385,11 @@ def _muted_color():
     read-only weight label) that stays legible on both light and dark
     FreeCAD themes. A single value, not theme-derived, because a global Qt
     stylesheet theme doesn't repopulate QPalette for us to read."""
-    return "#808a93"
+    # palette(mid) is a Qt stylesheet reference to the active QPalette's Mid
+    # role, so it tracks the live FreeCAD theme instead of fighting it --
+    # the same principle the table styling above follows. (Only valid inside
+    # a Qt style sheet; do NOT pass this to QColor(...).)
+    return "palette(mid)"
 
 
 def _style_point_table(table):
@@ -432,7 +436,7 @@ def _delete_cell_button():
 
 # Shared status-line styling: one source for the grey/red status text
 # that used to be inlined ~20 times across panels (see _status_label).
-_STATUS_STYLE = "color:#9aa6b2;font-size:11px;padding:4px 0;"
+_STATUS_STYLE = "color:palette(mid);font-size:11px;padding:4px 0;"
 _ERROR_STYLE = "color:#c0392b;font-size:11px;padding:4px 0;"
 
 
@@ -569,7 +573,7 @@ class _CurveGroup(object):
         if hint:
             lbl = QtWidgets.QLabel(hint)
             lbl.setWordWrap(True)
-            lbl.setStyleSheet("color:#9aa6b2;font-size:10px;")
+            lbl.setStyleSheet("color:palette(mid);font-size:10px;")
             lay.addWidget(lbl)
 
         self.list = QtWidgets.QListWidget()

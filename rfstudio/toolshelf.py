@@ -243,6 +243,23 @@ class _ToolShelf(QtWidgets.QDockWidget):
         outer.setContentsMargins(4, 4, 4, 4)
         outer.setSpacing(4)
 
+        # Onboarding entry point: with ~40 tools across five sections and no
+        # obvious "start", a first-time user has nowhere to begin. This one
+        # muted link opens the guided surfacing checklist (the Workflow
+        # guide), which otherwise hides under the Inspect group.
+        self._start_here = QtWidgets.QToolButton()
+        self._start_here.setText("New here?  Open the Workflow guide")
+        self._start_here.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+        self._start_here.setAutoRaise(True)
+        self._start_here.setStyleSheet("QToolButton { color: palette(mid); }")
+        try:
+            self._start_here.setCursor(QtCore.Qt.PointingHandCursor)
+        except Exception:
+            pass
+        self._start_here.clicked.connect(
+            lambda: self._run("RFS_WorkflowGuide"))
+        outer.addWidget(self._start_here)
+
         self.search = QtWidgets.QLineEdit()
         self.search.setPlaceholderText("Filter tools…")
         self.search.setClearButtonEnabled(True)
@@ -271,7 +288,7 @@ class _ToolShelf(QtWidgets.QDockWidget):
         # Shown only when a live filter matches nothing, so a blank shelf
         # reads as "no match" rather than "broken".
         self._empty = QtWidgets.QLabel("No tools match that filter.")
-        self._empty.setStyleSheet("color:#9aa6b2;font-size:11px;padding:6px;")
+        self._empty.setStyleSheet("color:palette(mid);font-size:11px;padding:6px;")
         self._empty.setWordWrap(True)
         self._empty.setVisible(False)
         outer.addWidget(self._empty)

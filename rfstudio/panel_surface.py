@@ -24,6 +24,7 @@ from rfstudio import panel_logic
 from rfstudio.panel_base import (
     _EditPanelBase, _CurveGroup, _selected_objects, _notify_overlay_unavailable,
     _CollapsibleGroup, _ShortcutHintBar, drop_callbacks, _status_label,
+    _std_buttons, _panel_error,
 )
 from rfstudio.panel_lawcurve import LawCurveWidget
 
@@ -89,7 +90,7 @@ class SurfacePanel(_EditPanelBase):
         # gets the same visible diagnostic everywhere.
         self._status = QtWidgets.QLabel("")
         self._status.setStyleSheet(
-            "color:#9aa6b2;font-size:11px;padding:4px 0;")
+            "color:palette(mid);font-size:11px;padding:4px 0;")
         self._status.setWordWrap(True)
         self._lay.addWidget(self._status)
         # back-compat alias: some call sites still refer to _gordon_status
@@ -199,29 +200,48 @@ class SurfacePanel(_EditPanelBase):
         else:
             skip_match = set()
 
-        for name in obj.PropertiesList:
-            if name in skip_match:
-                continue
-            if obj.getGroupOfProperty(name) != self.kind or name in link_props:
-                continue
-            tid = obj.getTypeIdOfProperty(name)
-            if tid == "App::PropertyEnumeration":
-                self._add_enum(name)
-            elif tid == "App::PropertyBool":
-                self._add_bool(name)
-            elif tid in ("App::PropertyInteger", "App::PropertyIntegerConstraint"):
-                self._add_int(name)
-            elif tid == "App::PropertyFloat":
-                self._add_float(name)
-            elif tid == "App::PropertyVector":
-                self._add_vector(name)
+        # Progressive disclosure: route the generic scalar controls into a
+        # collapsible "Options" group rather than stacking every spinbox and
+        # combo straight into the (narrow, often tall) task column. Expanded
+        # by default -- nothing is hidden on open -- but now collapsible, so
+        # the panel can be reduced to its essential link-list groups once the
+        # options are set. _row()/_add_vector() honour self._row_target.
+        opts = _CollapsibleGroup("Options", collapsed=False)
+        self._row_target = opts.content_layout
+        try:
+            for name in obj.PropertiesList:
+                if name in skip_match:
+                    continue
+                if obj.getGroupOfProperty(name) != self.kind or name in link_props:
+                    continue
+                tid = obj.getTypeIdOfProperty(name)
+                if tid == "App::PropertyEnumeration":
+                    self._add_enum(name)
+                elif tid == "App::PropertyBool":
+                    self._add_bool(name)
+                elif tid in ("App::PropertyInteger", "App::PropertyIntegerConstraint"):
+                    self._add_int(name)
+                elif tid == "App::PropertyFloat":
+                    self._add_float(name)
+                elif tid == "App::PropertyVector":
+                    self._add_vector(name)
+        finally:
+            self._row_target = None
+        if opts.content_layout.count():
+            self._lay.addWidget(opts)
 
     def _row(self, label, widget):
         r = QtWidgets.QHBoxLayout()
         r.addWidget(QtWidgets.QLabel(label))
         r.addStretch(1)
         r.addWidget(widget)
-        self._lay.addLayout(r)
+        # Honour an active collapsible-group target (see _scalar_controls);
+        # falls back to the main panel layout when none is set.
+        target = getattr(self, "_row_target", None)
+        if target is not None:
+            target.addLayout(r)
+        else:
+            self._lay.addLayout(r)
 
     def _add_enum(self, name):
         cb = QtWidgets.QComboBox()
@@ -273,7 +293,11 @@ class SurfacePanel(_EditPanelBase):
         row.addStretch(1)
         for sb in spins:
             row.addWidget(sb)
-        self._lay.addLayout(row)
+        target = getattr(self, "_row_target", None)
+        if target is not None:
+            target.addLayout(row)
+        else:
+            self._lay.addLayout(row)
 
     def _xfer(self, src_i, dst_i):
         """Move selected items from one group list to the other."""
@@ -391,7 +415,7 @@ class SurfacePanel(_EditPanelBase):
                 % colors.get(grade, "#9aa6b2"))
         except Exception as exc:
             lbl.setText("Match diagnostics unavailable: %s" % exc)
-            lbl.setStyleSheet("color:#9aa6b2;font-size:11px;padding:2px 0;")
+            lbl.setStyleSheet("color:palette(mid);font-size:11px;padding:2px 0;")
 
     def _update_status(self):
         """Live readiness diagnostic, generalized from the Gordon-only fix.
@@ -1161,7 +1185,7 @@ class LoftPanel(_EditPanelBase):
         # leaving an empty viewport.
         self._status = QtWidgets.QLabel("")
         self._status.setStyleSheet(
-            "color:#9aa6b2;font-size:11px;padding:4px 0;")
+            "color:palette(mid);font-size:11px;padding:4px 0;")
         self._status.setWordWrap(True)
         self._lay.addWidget(self._status)
 
@@ -1286,7 +1310,7 @@ class OffsetThickenPanel(_EditPanelBase):
         self._status = QtWidgets.QLabel("")
         self._status.setWordWrap(True)
         self._status.setStyleSheet(
-            "color:#9aa6b2;font-size:11px;padding:4px 0;")
+            "color:palette(mid);font-size:11px;padding:4px 0;")
         lay.addWidget(self._status)
 
         self.live = QtWidgets.QCheckBox("Live preview")
@@ -1387,7 +1411,7 @@ class ShellPanel(_EditPanelBase):
         self._status = QtWidgets.QLabel("")
         self._status.setWordWrap(True)
         self._status.setStyleSheet(
-            "color:#9aa6b2;font-size:11px;padding:4px 0;")
+            "color:palette(mid);font-size:11px;padding:4px 0;")
         lay.addWidget(self._status)
 
         self.live = QtWidgets.QCheckBox("Live preview")
@@ -1513,7 +1537,7 @@ class StitchShellPanel(object):
             "first if you need to know whether the seams being stitched "
             "are actually G1/G2, not just touching.")
         note.setWordWrap(True)
-        note.setStyleSheet("color:#9aa6b2;font-size:10px;padding:4px 0;")
+        note.setStyleSheet("color:palette(mid);font-size:10px;padding:4px 0;")
         lay.addWidget(note)
 
         self.status = QtWidgets.QLabel("")
@@ -1641,13 +1665,13 @@ class BlendSurfPanel(_EditPanelBase):
             "analytic 3rd derivative) -- treat it as a best-effort target "
             "and check the achieved result below, not a proven match.")
         g3_note.setWordWrap(True)
-        g3_note.setStyleSheet("color:#9aa6b2;font-size:10px;padding:2px 0;")
+        g3_note.setStyleSheet("color:palette(mid);font-size:10px;padding:2px 0;")
         lay.addWidget(g3_note)
 
         self._status = QtWidgets.QLabel("")
         self._status.setWordWrap(True)
         self._status.setStyleSheet(
-            "color:#9aa6b2;font-size:11px;padding:4px 0;")
+            "color:palette(mid);font-size:11px;padding:4px 0;")
         lay.addWidget(self._status)
 
         # Live G0/G1/G2 readout -- checking what continuity a blend
@@ -1727,7 +1751,7 @@ class BlendSurfPanel(_EditPanelBase):
                 % colors.get(worst, "#9aa6b2"))
         except Exception as exc:
             lbl.setText("Continuity check failed: %s" % exc)
-            lbl.setStyleSheet("color:#9aa6b2;font-size:11px;padding:2px 0;")
+            lbl.setStyleSheet("color:palette(mid);font-size:11px;padding:2px 0;")
 
     def recompute(self):
         try:
@@ -1746,6 +1770,204 @@ class BlendSurfPanel(_EditPanelBase):
             ("color:#7fae5a;" if ok else "color:#c08552;")
             + "font-size:11px;padding:4px 0;")
         self._update_continuity()
+
+
+class TrimSoSPanel(object):
+    """Guided slot-picker for RFS_Trim and RFS_SketchOnSurf.
+
+    Both native operations need exactly one FACE and one boundary WIRE:
+    core.trim_face (a surface bounded by a wire on it) and
+    core.project_wire_onto_face (a curve projected onto a surface). The old
+    native providers read whatever happened to be selected and rejected a
+    wrong selection into the Report view; this panel instead lets the user
+    assign each role explicitly into a named slot -- the same pattern
+    BlendSurfPanel uses for its two faces -- prefilled from the current
+    selection when it already holds a usable face/edges.
+
+    One-shot: it produces a plain Part::Feature (not a re-editable
+    parametric object), so it has Ok/Cancel and no edit transaction to keep
+    open. The result is added inside its own undo transaction, so Ctrl+Z
+    reverts it. Opened by engines.native_trim / native_sketch_on_surf,
+    mirroring how native_blend_surface opens BlendSurfPanel."""
+
+    _TITLES = {"Trim": "Trim surface", "SketchOnSurf": "Sketch on surface"}
+    _LABELS = {"Trim": "Trim", "SketchOnSurf": "SketchOnSurf"}
+
+    def __init__(self, mode="Trim"):
+        self.mode = mode if mode in self._TITLES else "Trim"
+        self._face = None          # (owning_obj, Part.Face)
+        self._edges = []           # list of Part.Edge
+        self._edges_src = ""       # source label(s) for the curve slot
+
+        self.form = QtWidgets.QWidget()
+        self.form.setWindowTitle("Railform – " + self._TITLES[self.mode])
+        lay = QtWidgets.QVBoxLayout(self.form)
+
+        intro = ("Trim a face back to a boundary curve. Assign the face and "
+                 "its boundary curve(s), then click OK."
+                 if self.mode == "Trim" else
+                 "Project a curve onto a surface. Assign the target face and "
+                 "the curve(s) to project, then click OK.")
+        hint = QtWidgets.QLabel(intro)
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:palette(mid);font-size:11px;padding:2px 0;")
+        lay.addWidget(hint)
+
+        self._face_lbl = QtWidgets.QLabel()
+        face_btn = QtWidgets.QPushButton("Set face from selection")
+        face_btn.clicked.connect(lambda _c=False: self._pick_face(quiet=False))
+        lay.addLayout(self._slot_row(self._face_lbl, face_btn))
+
+        self._edges_lbl = QtWidgets.QLabel()
+        curve_btn = QtWidgets.QPushButton("Set curve(s) from selection")
+        curve_btn.clicked.connect(lambda _c=False: self._pick_edges(quiet=False))
+        lay.addLayout(self._slot_row(self._edges_lbl, curve_btn))
+
+        self.status = _status_label("")
+        lay.addWidget(self.status)
+
+        # Best-effort prefill from whatever is already selected, silently
+        # (no "select a face" scolding before the user has done anything).
+        self._pick_face(quiet=True)
+        self._pick_edges(quiet=True)
+        self._refresh_labels()
+
+    # ---- UI helpers ---------------------------------------------------- #
+    @staticmethod
+    def _slot_row(lbl, btn):
+        r = QtWidgets.QHBoxLayout()
+        r.addWidget(lbl)
+        r.addStretch(1)
+        r.addWidget(btn)
+        return r
+
+    def _refresh_labels(self):
+        if self._face is None:
+            self._face_lbl.setText("Face: (none)")
+        else:
+            self._face_lbl.setText("Face: " + getattr(
+                self._face[0], "Label", "?"))
+        if not self._edges:
+            self._edges_lbl.setText("Curve(s): (none)")
+        else:
+            self._edges_lbl.setText(
+                "Curve(s): %d edge(s)%s"
+                % (len(self._edges),
+                   (" from " + self._edges_src) if self._edges_src else ""))
+
+    # ---- slot assignment ----------------------------------------------- #
+    def _pick_face(self, quiet=True):
+        """Assign the face slot: a sub-face pick first, else the first face
+        of a whole-object pick."""
+        try:
+            import FreeCADGui
+            for so in FreeCADGui.Selection.getSelectionEx():
+                obj = so.Object
+                for sub in (so.SubObjects or []):
+                    if getattr(sub, "ShapeType", "") == "Face":
+                        self._face = (obj, sub)
+                        self._refresh_labels()
+                        return True
+                shp = getattr(obj, "Shape", None)
+                if shp is not None and shp.Faces:
+                    self._face = (obj, shp.Faces[0])
+                    self._refresh_labels()
+                    return True
+        except Exception:
+            pass
+        if not quiet:
+            _panel_error(self, "Select a face, then click Set face.")
+        return False
+
+    def _pick_edges(self, quiet=True):
+        """Assign the curve slot: sub-edge picks first; otherwise every edge
+        of a selected curve/wire object (NOT a face object, so picking the
+        face for the face slot doesn't also dump its edges in here)."""
+        edges = []
+        srcs = []
+        try:
+            import FreeCADGui
+            for so in FreeCADGui.Selection.getSelectionEx():
+                obj = so.Object
+                picked = [sub for sub in (so.SubObjects or [])
+                          if getattr(sub, "ShapeType", "") == "Edge"]
+                if picked:
+                    edges.extend(picked)
+                    srcs.append(getattr(obj, "Label", "?"))
+                    continue
+                shp = getattr(obj, "Shape", None)
+                if shp is not None and shp.Edges and not shp.Faces:
+                    edges.extend(shp.Edges)
+                    srcs.append(getattr(obj, "Label", "?"))
+        except Exception:
+            pass
+        if edges:
+            self._edges = edges
+            self._edges_src = ", ".join(dict.fromkeys(srcs))
+            self._refresh_labels()
+            return True
+        if not quiet:
+            _panel_error(self, "Select one or more boundary curves/edges, "
+                               "then click Set curve(s).")
+        return False
+
+    # ---- task-dialog protocol ------------------------------------------ #
+    def getStandardButtons(self):
+        return _std_buttons()
+
+    def accept(self):
+        import FreeCAD
+        import Part
+        from rfstudio import core
+        if self._face is None:
+            _panel_error(self, "Assign a face first.")
+            return False
+        if not self._edges:
+            _panel_error(self, "Assign at least one boundary curve first.")
+            return False
+
+        label = self._LABELS[self.mode]
+        try:
+            edges = list(self._edges)
+            wire = (Part.Wire(Part.__sortEdges__(edges))
+                    if len(edges) > 1 else Part.Wire([edges[0]]))
+            if self.mode == "Trim":
+                result = core.trim_face(self._face[1], wire)
+            else:
+                result = core.project_wire_onto_face(self._face[1], wire)
+        except Exception as exc:
+            _panel_error(self, "%s failed: %s" % (self._TITLES[self.mode], exc))
+            FreeCAD.Console.PrintError(
+                "Railform: %s failed (%s)\n" % (label, exc))
+            return False   # keep the panel open so the user can re-pick
+
+        doc = FreeCAD.ActiveDocument or FreeCAD.newDocument()
+        doc.openTransaction("Railform Studio: " + label)
+        try:
+            obj = doc.addObject("Part::Feature", label)
+            obj.Shape = result
+            doc.recompute()
+            doc.commitTransaction()
+        except Exception as exc:
+            try:
+                doc.abortTransaction()
+            except Exception:
+                pass
+            _panel_error(self, "Could not add result: %s" % exc)
+            return False
+        self._close()
+        return True
+
+    def reject(self):
+        self._close()
+        return True
+
+    def _close(self):
+        try:
+            import FreeCADGui
+            FreeCADGui.Control.closeDialog()
+        except Exception:
+            pass
 
 
 class PolylineFilletPanel(_EditPanelBase):
@@ -2070,7 +2292,7 @@ class JoinCurvePanel(_EditPanelBase):
         self._status = QtWidgets.QLabel("")
         self._status.setWordWrap(True)
         self._status.setStyleSheet(
-            "color:#9aa6b2;font-size:11px;padding:4px 0;")
+            "color:palette(mid);font-size:11px;padding:4px 0;")
         lay.addWidget(self._status)
 
         self.live = QtWidgets.QCheckBox("Live preview")
@@ -2194,7 +2416,7 @@ class BlendSurfClosedPanel(_EditPanelBase):
         self._status = QtWidgets.QLabel("")
         self._status.setWordWrap(True)
         self._status.setStyleSheet(
-            "color:#9aa6b2;font-size:11px;padding:4px 0;")
+            "color:palette(mid);font-size:11px;padding:4px 0;")
         lay.addWidget(self._status)
 
         self.live = QtWidgets.QCheckBox("Live preview")
@@ -2341,7 +2563,7 @@ class TrimByIntersectionPanel(_EditPanelBase):
         self._status = QtWidgets.QLabel("")
         self._status.setWordWrap(True)
         self._status.setStyleSheet(
-            "color:#9aa6b2;font-size:11px;padding:4px 0;")
+            "color:palette(mid);font-size:11px;padding:4px 0;")
         lay.addWidget(self._status)
 
         self.live = QtWidgets.QCheckBox("Live preview")
