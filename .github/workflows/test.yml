@@ -88,4 +88,4 @@ print('Critical commands have native fallbacks')
       - name: Run GUI import tests
         run: |
           cd ${{ github.workspace }}
-          freecadcmd test_gui_imports.py
+          freecadcmd rfstudio/test_gui_imports.py
