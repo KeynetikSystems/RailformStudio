@@ -1,0 +1,91 @@
+name: Headless Tests
+
+on:
+  push:
+    branches: [main, master, ux-improvements]
+  pull_request:
+    branches: [main, master, ux-improvements]
+
+jobs:
+  test:
+    name: Headless Tests (freecadcmd)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up FreeCAD
+        uses: freecad/freecad-github-actions@master
+        with:
+          version: '1.1'
+          
+      - name: Run headless core tests
+        run: |
+          cd ${{ github.workspace }}
+          freecadcmd test_core.py
+          
+      - name: Run panel logic tests
+        run: |
+          cd ${{ github.workspace }}
+          freecadcmd test_panel_logic.py
+          
+      - name: Run provider chain validation
+        run: |
+          cd ${{ github.workspace }}
+          python3 -c "
+import sys
+sys.path.insert(0, '.')
+import FreeCAD
+from rfstudio import engines, deps
+problems = engines.validate_providers()
+if problems:
+    print('PROVIDER CHAIN PROBLEMS:')
+    for p in problems:
+        print(f'  {p}')
+    sys.exit(1)
+print('Provider chains OK')
+"
+          
+      - name: Run single points of failure check
+        run: |
+          cd ${{ github.workspace }}
+          python3 -c "
+import sys
+sys.path.insert(0, '.')
+import FreeCAD
+from rfstudio import engines, deps
+# At minimum, critical commands should have native fallback
+critical = ['RFS_Trim', 'RFS_SketchOnSurf', 'RFS_BlendSurf']
+single_points = deps.report_single_points_of_failure(engines.PROVIDERS)
+for cmd in critical:
+    if cmd in single_points:
+        print(f'CRITICAL: {cmd} has no native fallback!')
+        sys.exit(1)
+print('Critical commands have native fallbacks')
+"
+
+  test-imports:
+    name: GUI Import Tests (smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: test
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up FreeCAD
+        uses: freecad/freecad-github-actions@master
+        with:
+          version: '1.1'
+          
+      - name: Run GUI import tests
+        run: |
+          cd ${{ github.workspace }}
+          freecadcmd test_gui_imports.py
