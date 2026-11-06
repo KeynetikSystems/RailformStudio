@@ -43,6 +43,83 @@ the optional Curves workbench enables a few fallback engines only.
 6. **Exchange**: import Blender Railform rails (JSON → exact NURBS curves) or
    export hidden-line drawings as SVG.
 
+## Try it (2 minutes)
+
+A ready-made script builds two curved patches with a gap, blends them to G2,
+prints the numeric continuity at both seams, and gives the blend a wall
+thickness:
+
+```text
+FreeCADCmd.exe examples/try_blend_and_thickness.py        (headless)
+```
+
+or, inside FreeCAD, in the Python console:
+
+```python
+exec(open(r"<path to>/RailformStudio/examples/try_blend_and_thickness.py").read())
+```
+
+Expected output (verified on FreeCAD 1.1.4):
+
+```text
+left seam   G0 8.88e-16   G1 0.0000 deg   G2 0.00000 (1/mm)   -> G2
+right seam  G0 9.93e-16   G1 0.0000 deg   G2 0.00000 (1/mm)   -> G2
+blend thickness: OK t=1.5 Symmetric | solids: 1 | volume: 159.5 mm^3
+thickness off  : off | solids: 0
+```
+
+Then, in the GUI, select the `RailformBlendSurf` object and edit its
+properties:
+
+- **Continuity** (`G0`/`G1`/`G2`) and **Scale** (tangent strength) change the
+  blend on recompute.
+- **Thickness** (`0` = plain surface), **ThicknessMode** (`Outward`, `Inward`,
+  `Symmetric`) and the read-only **ThicknessStatus** are on every free-form
+  surface feature (Loft, Gordon, Coons, Sweep, SweepN, Fill, Match,
+  ExtendSurf, BlendSurf, BlendSurfClosed, N-sided). The surface is rebuilt on
+  each recompute and thickened from scratch, so nothing compounds and setting
+  `Thickness` back to `0` restores the plain surface.
+- Run **Inspect → Surface review** for the numeric continuity report on any
+  selection of faces.
+
+## Known limitations
+
+- **Surface match (`match_surface`) rebuilds the target from its boundary data
+  only.** The target's interior shape and its two side boundaries are replaced
+  by the profile curves' end curves (only the corner points are kept), so
+  features inside the target are lost. When the boundaries are knot-compatible
+  the exact matchers (`match_surface_exact_g1/g2`) keep the target's control
+  net and are used first; they refuse antiparallel or trimmed edges and fall
+  back to the sampled path.
+- **Continuity grades are in new units.** `surface_deviation()`'s `max_g2` is
+  now the difference in cross-direction normal curvature (1/length); the old
+  raw second-derivative difference is `g2_raw`. Scripts or thresholds written
+  against the old `max_g2` need re-tuning.
+- **Blend and match profiles change shape on recompute.** Handle length is now
+  `chord * scale` (it was effectively chord/9 to chord/21), so models saved
+  with an earlier version look different after recompute. Set **Scale** to about 0.33 if
+  you want the old tightness.
+- **Thickness can fail where the surface is tighter than the wall.** If the
+  thickness reaches the surface's minimum curvature radius, OCCT's offset may
+  fail or self-intersect on the concave side. `ThicknessStatus` warns when
+  `thickness >= min radius` and, on failure, the plain surface is kept with the
+  reason shown. A Loft with `Solid` on is already a solid and is not thickened.
+- Class-A claims are numeric, sampled checks, not a certified tolerance
+  analysis: grade your own seams with the Surface review report.
+- Some actions still lean on the optional Curves workbench as a fallback; see
+  *Dependencies*.
+
+## Tested with
+
+| FreeCAD | OS | Status |
+|---|---|---|
+| **1.1.4** | Windows 11 | **Tested.** Headless suites (`test_core.py`, `test_panel_logic.py`, `test_panel_base.py`, `test_bezier_handles.py`, `test_provider_chains.py`, `rfstudio/test_gui_imports.py`) and the real-GUI command test (`test_gui_commands.py`, 123/123) all pass. |
+| 1.0.x | any | **Not tested.** `package.xml` declares 1.0 as the floor because the APIs used are 1.0-era; treat 1.0 as unverified. |
+| Linux / macOS | — | **Not tested** locally. A GitHub Actions workflow (`.github/workflows/test.yml`) runs the headless suites on Ubuntu with FreeCAD 1.1 for PRs to `main`. |
+
+The demo script above has only been run headless; the GUI viewport has not
+been screenshot-verified.
+
 ## Features
 
 The tool shelf groups the curated actions in workflow order (filter box,
