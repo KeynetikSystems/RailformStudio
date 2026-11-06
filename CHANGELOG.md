@@ -10,6 +10,10 @@ fresh `Unreleased` section above it.
 
 ## Unreleased
 
+### Added (Section extraction)
+- `core.extract_iso_curves` + **Extract sections** (`RFS_ExtractSections`): live cross-section (constant-U) or rail-wise (constant-V) curves from any sweep, loft or pipe; even in parameter or arc length, optional end curves. **Sections to curves** (`RFS_SectionCurves`) splits them into live `SectionCurve` objects tagged Profile / GuideRail for Loft / SweepN. Round trip through the N-rail sweep is exact (~1e-5) for 3+ rails.
+- Known, not fixed (sweep builders): 2-rail sweeps rebuilt from several extracted profiles do not hold them; the curved-rail pipe sweep is exact only at its own stations (tube radius dips in between).
+
 ## 0.1.1 - 2026-11-06
 
 ### Fixed (Surface blend / match correctness)

@@ -107,6 +107,18 @@ properties:
   fail or self-intersect on the concave side. `ThicknessStatus` warns when
   `thickness >= min radius` and, on failure, the plain surface is kept with the
   reason shown. A Loft with `Solid` on is already a solid and is not thickened.
+- **Extract sections** pulls live cross-section curves (constant-U) or
+  rail-wise curves (constant-V) out of a sweep, loft or pipe; **Sections to
+  curves** splits them into individual Profile / Guide-Rail curves for
+  Loft / SweepN. Rebuilding is exact (about 1e-5) for N-rail sweeps with 3 or
+  more rails. **Known issues found while testing it:** (1) a *two*-rail
+  sweep (or an N-rail sweep with only 2 rails) rebuilt from several extracted
+  profiles does not hold those profiles (the bulge between the rails came
+  back inverted, ~4 mm off in a 40 mm test); (2) on a *curved* rail the
+  single-rail pipe sweep is only exact at its own stations -- between them
+  the tube radius dips (a r=0.5 test pipe had 4.6x the expected surface
+  area), so sections taken between stations are not true circles. Both are
+  in the sweep builders, not the extractor, and are not fixed yet.
 - Class-A claims are numeric, sampled checks, not a certified tolerance
   analysis: grade your own seams with the Surface review report.
 - Some actions still lean on the optional Curves workbench as a fallback; see
@@ -131,7 +143,7 @@ collapsible sections whose state is remembered):
 | Group | Tools |
 |---|---|
 | **Draw** | Interpolate curve · control-point curve · approximate curve · polyline · Bezier curve (tangent handles) · 3D sketch · blend curve (G1/G2) · fillet polyline · join curves · freehand draw tool |
-| **Surface** | Loft (with guide rails) · multi loft · Gordon / network surface · Coons patch · two-rail sweep · multi-rail sweep (every rail anchors the surface; exact Gordon route where the network allows) · N-sided fill · surface match (G2) · closed-loop blend (G1/G2) · sketch on surface · trim surface · trim by intersection · offset · thicken · shell · stitch shell |
+| **Surface** | Loft (with guide rails) · multi loft · Gordon / network surface · Coons patch · two-rail sweep · multi-rail sweep (every rail anchors the surface; exact Gordon route where the network allows) · N-sided fill · surface match (G2) · closed-loop blend (G1/G2) · sketch on surface · trim surface · trim by intersection · offset · thicken · shell · stitch shell · extract sections · sections to curves |
 | **Solids** | Boolean union / subtract / intersect · mesh/scan to surface · mirror · mirror group |
 | **Inspect** | Surface review (continuity + draft report) · workflow guide |
 | **Exchange** | Blender Railform rail import (JSON → exact NURBS curves) · hidden-line drawing export (SVG) |
