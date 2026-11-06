@@ -107,13 +107,16 @@ properties:
   fail or self-intersect on the concave side. `ThicknessStatus` warns when
   `thickness >= min radius` and, on failure, the plain surface is kept with the
   reason shown. A Loft with `Solid` on is already a solid and is not thickened.
+
+![Seven live section curves extracted from an N-rail sweep](docs/sections-on-sweep.png)
+
 - **Extract sections** pulls live cross-section curves (constant-U) or
   rail-wise curves (constant-V) out of a sweep, loft or pipe; **Sections to
   curves** splits them into individual Profile / Guide-Rail curves for
   Loft / Sweep / SweepN. Rebuilding a sweep from its own extracted rails and
-  sections reproduces it to ~1e-5 mm (2-rail, N-rail and pipe sweeps). On a
-  single-rail pipe the Rails direction follows points on the profile as the
-  moving frame twists, so those curves can spiral; use Cross-sections.
+  sections reproduces it to ~1e-5 mm (2-rail, N-rail and pipe sweeps).
+  **Sections to curves** can be re-run after changing Count or Direction: it
+  reuses existing curves, adds missing ones and deletes the extras.
 - Class-A claims are numeric, sampled checks, not a certified tolerance
   analysis: grade your own seams with the Surface review report.
 - Some actions still lean on the optional Curves workbench as a fallback; see

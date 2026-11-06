@@ -13,6 +13,10 @@ fresh `Unreleased` section above it.
 ### Added (Section extraction)
 - `core.extract_iso_curves` + **Extract sections** (`RFS_ExtractSections`): live cross-section (constant-U) or rail-wise (constant-V) curves from any sweep, loft or pipe; even in parameter or arc length, optional end curves. **Sections to curves** (`RFS_SectionCurves`) splits them into live `SectionCurve` objects tagged Profile / GuideRail for Loft / SweepN. Round trip through the N-rail sweep is exact (~1e-5) for 3+ rails.
 
+- **Extract sections / Sections to curves objects were invisible in the 3D view**: a bare `Part::FeaturePython` created from code has no display mode, so the curves were never drawn. They now carry `SectionsVP` (curve view provider with their own icons; double-click does not open the curve point editor). Found by taking a real-GUI screenshot; `test_gui_commands.py` now runs both commands and asserts a display mode.
+- **Sections to curves is re-runnable**: it reuses existing `SectionCurve` objects, creates missing ones and deletes those whose index fell off the end after Count was lowered (orphans are hidden until then); `SectionsSync` reports created / reused / removed.
+- Rails direction on a single-rail pipe no longer spirals (that was the frame-flip bug below): the curves run parallel to the spine, within a few percent of its length.
+
 ### Fixed (sweep builders, found while testing section extraction)
 - **Single-rail pipe sweep on a bent rail**: the tube radius collapsed between stations (a r=0.5 test pipe had 4.6x the expected area; the old tests only sampled at station-aligned parameters). Cause: `_rmf_frames` transported the up vector with a "double reflection" built from the tangent difference, which negated ey/ez at every station whenever the seed up lay in the bend plane (always the case for a round profile, whose normal ~ the rail tangent). Replaced with a Rodrigues rotation about `prev_tan x tan`.
 - `_rail_tangent` took an ARC FRACTION as a curve parameter; on a chord-length-parametrized rail the tangent was up to ~20 deg off the spine. It now maps through the arc table.
