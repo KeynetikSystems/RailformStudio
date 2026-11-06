@@ -6,8 +6,11 @@ standalone — no mandatory third-party workbench. The optional **Curves**
 workbench (Grellier) is used only as a *fallback engine* for a handful of
 selections the native path doesn't yet resolve.
 
-<!-- TODO before release: add a screenshot here, e.g.
-     ![Railform Studio tool shelf and a surfaced model](docs/screenshot-workbench.png) -->
+![Railform Studio tool shelf (left), model tree, and a Coons patch built from guide curves](docs/screenshot-workbench.png)
+
+*The Railform Studio workbench in FreeCAD 1.1: the tool shelf with snapping
+toggles and the Draw / Surface groups (left), the model tree, and a Coons patch
+surfaced from its boundary curves.*
 
 ## Install
 
