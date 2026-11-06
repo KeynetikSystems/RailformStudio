@@ -1288,6 +1288,30 @@ def _perp(v):
 
 
 
+def _profile_runs_far_to_base(cache, pro, base, far):
+    """True when `pro` runs from the FAR rail to the BASE rail (so it must be
+    sampled reversed). Decided by which end actually lies on which rail
+    (point-to-rail DISTANCES); only when that is ambiguous (both orders
+    within 0.1% of the profile's chord, e.g. a profile floating midway
+    between the rails) does it fall back to comparing nearest-point
+    parameters. The parameter comparison alone was fragile: with rails that
+    are not parallel, the nearest-point parameters of the two ends differ by
+    a tiny amount in the wrong direction and a perfectly oriented profile
+    was reversed -- its bulge came out mirrored."""
+    e0, e1 = _eval01(pro, 0.0), _eval01(pro, 1.0)
+    try:
+        d = lambda pt, rail: Part.Vertex(pt).distToShape(rail)[0]   # noqa: E731
+        straight = d(e0, base) + d(e1, far)
+        flipped = d(e1, base) + d(e0, far)
+        tol = 1e-3 * max(e0.distanceToPoint(e1), 1e-9)
+        if abs(straight - flipped) > tol:
+            return flipped < straight
+    except Exception:
+        pass
+    return (cache.param(base, e1) + cache.param(far, e0)) < \
+           (cache.param(base, e0) + cache.param(far, e1))
+
+
 def two_rail_sweep(rail1, rail2, profiles, n_rail=40, n_prof=20):
     """Skin profile curves between two rails.
 
@@ -1308,8 +1332,7 @@ def two_rail_sweep(rail1, rail2, profiles, n_rail=40, n_prof=20):
     prev_up = None
     for pro in profiles:
         e0, e1 = _eval01(pro, 0.0), _eval01(pro, 1.0)
-        flip = (cache.param(rail1, e1) + cache.param(rail2, e0)) < \
-               (cache.param(rail1, e0) + cache.param(rail2, e1))
+        flip = _profile_runs_far_to_base(cache, pro, rail1, rail2)
         samp = [_eval01(pro, (1.0 - s) if flip else s) for s in cols]
         a, b = samp[0], samp[-1]
         chord = b.sub(a)
@@ -1979,8 +2002,7 @@ def multi_rail_sweep(rails, profiles, n_rail=40, n_prof=20):
     prev_up = None
     for pro in profiles:
         e0, e1 = _eval01(pro, 0.0), _eval01(pro, 1.0)
-        flip = (cache.param(base, e1) + cache.param(far, e0)) < \
-               (cache.param(base, e0) + cache.param(far, e1))
+        flip = _profile_runs_far_to_base(cache, pro, base, far)
 
         def P(t, _pro=pro, _flip=flip):
             return _eval01(_pro, 1.0 - t if _flip else t)
@@ -2186,9 +2208,16 @@ def _rail_tangent(arc, s):
     """
     eps = 1.0 / max(2.0 * len(arc.acc), 4.0)
     s = min(max(s, 0.0), 1.0)
-    lo, hi = max(s - eps, 0.0), min(s + eps, 1.0)
+    # `s` is an ARC FRACTION; the edge is evaluated in normalized PARAMETER
+    # space. The two only coincide on a uniformly parametrized rail, so map
+    # through the arc table first -- otherwise on a curved/chord-length
+    # parametrized rail the tangent is taken at the wrong point, the section
+    # plane leans off the spine and the swept tube's radius dips between the
+    # stations where the two happen to agree.
+    p = arc.param_at(s)
+    lo, hi = max(p - eps, 0.0), min(p + eps, 1.0)
     if hi - lo < 1e-12:
-        lo, hi = max(s - 2.0 * eps, 0.0), 1.0
+        lo, hi = max(p - 2.0 * eps, 0.0), 1.0
     d = _eval01(arc.edge, hi).sub(_eval01(arc.edge, lo))
     if d.Length < 1e-12:
         raise ValueError("single-rail sweep: rail has no tangent at "
@@ -2214,16 +2243,25 @@ def _rmf_frames(arc, stations, up0):
         if prev_up is None:
             ey = up0
         else:
-            v1 = t.sub(prev_tan)
-            c1 = v1.dot(v1)
+            # Rotation-minimizing transport: rotate the previous up vector
+            # about the axis (prev_tan x t) by the angle between the two
+            # tangents (Rodrigues). This replaces a "double reflection"
+            # that used the TANGENT difference as the first reflection
+            # vector: that single reflection already maps prev_tan onto t
+            # but negates any up component lying in the bend plane, and the
+            # follow-up reflection never fired -- so whenever the up vector
+            # lay in the plane the rail bends in (e.g. a closed round
+            # profile, whose polygon normal is ~ the rail tangent, leaves
+            # the seed up arbitrary) the frame flipped sign at EVERY
+            # station and the swept tube collapsed between stations.
             ey = prev_up
-            if c1 > 1e-14:
-                ey = ey - v1 * (2.0 * v1.dot(ey) / c1)
-                tl = prev_tan + v1 * (2.0 * v1.dot(t) / c1)
-                v2 = t.sub(tl)
-                c2 = v2.dot(v2)
-                if c2 > 1e-14:
-                    ey = ey - v2 * (2.0 * v2.dot(ey) / c2)
+            axis = prev_tan.cross(t)
+            sin_a = axis.Length
+            if sin_a > 1e-12:
+                cos_a = prev_tan.dot(t)
+                k = axis * (1.0 / sin_a)
+                ey = (prev_up * cos_a + k.cross(prev_up) * sin_a
+                      + k * (k.dot(prev_up) * (1.0 - cos_a)))
         ey = ey.sub(t * (ey.dot(t)))
         if ey.Length < 1e-9:
             ey = _perp(t)

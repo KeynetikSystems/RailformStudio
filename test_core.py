@@ -1789,6 +1789,83 @@ def test_extract_sections_features_and_split():
         FreeCAD.closeDocument(doc.Name)
 
 
+def test_rmf_frames_stable_when_up_lies_in_bend_plane():
+    """Regression: with the seed up vector IN the plane the rail bends in
+    (a closed round profile leaves the seed arbitrary) the old transport
+    negated ey/ez at EVERY station. Frames must stay continuous."""
+    rail = spline([Vector(0, 0, 0), Vector(5, 0, 2.0), Vector(10, 0, -1.0)])
+    arc = core._ArcRail(rail)
+    stations = [i / 99.0 for i in range(100)]
+    t0 = core._rail_tangent(arc, 0.0)
+    up_in_plane = Vector(-t0.z, 0.0, t0.x)            # perpendicular, bend plane
+    for up in (up_in_plane, Vector(0, 1, 0)):
+        frames = core._rmf_frames(arc, stations, up)
+        for i in range(len(frames) - 1):
+            assert frames[i][1].dot(frames[i + 1][1]) > 0.99, ("ey", i)
+            assert frames[i][2].dot(frames[i + 1][2]) > 0.99, ("ez", i)
+            assert frames[i][0].dot(frames[i][1]) < 1e-9
+    out("  rmf frames in-plane up OK")
+
+
+def test_rail_tangent_follows_spine_on_chord_length_rail():
+    """_rail_tangent takes an ARC FRACTION; on a chord-length parametrized
+    rail that is not the curve parameter, so it must map through the arc
+    table (the tangent has to match the spine point at that fraction)."""
+    rail = spline([Vector(0, 0, 0), Vector(1, 0, 3.0), Vector(12, 0, -2.0),
+                   Vector(20, 0, 1.0)])
+    arc = core._ArcRail(rail)
+    worst = 0.0
+    for k in range(1, 40):
+        s_ = k / 40.0
+        t = core._rail_tangent(arc, s_)
+        d = arc.point_at(min(1.0, s_ + 1e-3)) - arc.point_at(max(0.0, s_ - 1e-3))
+        d.normalize()
+        worst = max(worst, math.degrees(math.acos(min(1.0, t.dot(d)))))
+    assert worst < 0.5, worst
+    out("  rail tangent vs spine OK  worst=%.3f deg" % worst)
+
+
+def test_single_rail_pipe_on_curved_rail_holds_radius_between_stations():
+    """Regression: the pipe sweep's tube radius used to collapse BETWEEN its
+    stations on a bent rail (area 4.6x too large) because the existing
+    tests only sampled at station-aligned parameters. Sample off-station."""
+    rail = spline([Vector(0, 0, 0), Vector(5, 0, 2.0), Vector(10, 0, -1.0)])
+    profile = Part.makeCircle(0.5, Vector(0, 0, 0), _rail_start_axis(rail))
+    s = core.single_rail_sweep(rail, [profile], n_rail=25, n_prof=64)
+    face = s.Faces[0]
+    surf = face.Surface
+    worst = 0.0
+    for k in range(37):
+        for j in range(9):
+            p = surf.value(0.013 + k * 0.0267, j / 8.0)        # off-station u
+            worst = max(worst, abs(Part.Vertex(p).distToShape(rail)[0] - 0.5))
+    assert worst < 5e-3, worst
+    expected = 2.0 * math.pi * 0.5 * rail.Length
+    assert abs(face.Area - expected) / expected < 0.02, (face.Area, expected)
+    out("  pipe on curved rail holds radius off-station OK  dev=%.1e area=%.1f/%.1f"
+        % (worst, face.Area, expected))
+
+
+def test_two_rail_sweep_reproduces_profile_on_nonparallel_rails():
+    """Regression: the profile-direction test compared nearest-point
+    PARAMETERS and could reverse a correctly oriented profile on diverging
+    rails (bulge mirrored). Any profile taken from the sweep must now
+    rebuild the same surface, alone or together with the others."""
+    r1 = Part.makeLine(Vector(0, -5, 0), Vector(40, -5, 0))
+    r2 = Part.makeLine(Vector(0, 5, 0), Vector(40, 5, 3))
+    prof = Part.Arc(Vector(0, -5, 0), Vector(0, 0, 2), Vector(0, 5, 0)).toShape()
+    orig = core.two_rail_sweep(r1, r2, [prof], n_rail=20, n_prof=16)
+    for pro in core.extract_iso_curves(orig, count=3):
+        one = core.two_rail_sweep(r1, r2, [pro], n_rail=20, n_prof=16)
+        d = _surface_max_dev(one, orig.Faces[0])
+        assert d < 1e-3, d
+    many = core.two_rail_sweep(r1, r2, core.extract_iso_curves(orig, count=5),
+                               n_rail=20, n_prof=16)
+    d1, d2 = _surface_max_dev(many, orig.Faces[0]), _surface_max_dev(orig, many.Faces[0])
+    assert d1 < 1e-3 and d2 < 1e-3, (d1, d2)
+    out("  two-rail multi-profile hold OK  dev=%.1e/%.1e" % (d1, d2))
+
+
 def test_match_surface_exact_g2_curved_reference():
     """Load-bearing G2 test on CURVED geometry: planes have zero
     curvature everywhere, so G2 holds trivially on plane-plane seams
@@ -4219,6 +4296,10 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_extract_iso_curves_from_straight_pipe,
               test_extract_sections_roundtrips_multi_rail_sweep,
               test_extract_sections_features_and_split,
+              test_rmf_frames_stable_when_up_lies_in_bend_plane,
+              test_rail_tangent_follows_spine_on_chord_length_rail,
+              test_single_rail_pipe_on_curved_rail_holds_radius_between_stations,
+              test_two_rail_sweep_reproduces_profile_on_nonparallel_rails,
               test_match_surface_fp_execute_uses_references,
               test_match_surface_to_references_prefers_exact_g1,
               test_match_surface_to_references_reports_method,
