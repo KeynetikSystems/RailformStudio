@@ -18,6 +18,7 @@ from .curves import *  # noqa: F401,F403
 from .patches import *  # noqa: F401,F403
 from .surfacing import *  # noqa: F401,F403
 from .manufacturing import *  # noqa: F401,F403
+from .sections import *  # noqa: F401,F403
 from .trimming import *  # noqa: F401,F403
 from .constraints import *  # noqa: F401,F403
 from .qa import *  # noqa: F401,F403

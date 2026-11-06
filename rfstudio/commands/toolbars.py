@@ -20,7 +20,7 @@ TOOLBARS = [
                           "RFS_BlendSurfClosed", "RFS_Trim",
                           "RFS_TrimByIntersection", "RFS_SketchOnSurf",
                           "RFS_Offset", "RFS_Thicken", "RFS_Shell",
-                          "RFS_StitchShell"]),
+                          "RFS_StitchShell", "RFS_ExtractSections", "RFS_SectionCurves"]),
     ("Railform Solids",  ["RFS_BooleanUnion", "RFS_BooleanSubtract",
                           "RFS_BooleanIntersect", "RFS_MeshToSurface",
                           "RFS_Mirror", "RFS_MirrorGroup"]),

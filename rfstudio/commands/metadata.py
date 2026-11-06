@@ -85,6 +85,8 @@ SELECTION_HINTS = {
     "RFS_BlendSurf": "two surfaces",
     "RFS_BlendSurfClosed": "three or more faces",
     "RFS_TagProfile": "one or more curves",
+    "RFS_ExtractSections": "a sweep, loft or pipe surface",
+    "RFS_SectionCurves": "an Extract Sections object",
     "RFS_TagRail": "one or more curves",
 }
 
@@ -355,6 +357,12 @@ _DELEGATE_META = {
     "RFS_HiddenLineExport": ("Hidden-line export (legacy)",
                              "Export 2D hidden-line SVG -- use panel command RFS_HiddenLineExport instead.",
                              "rfs_hl_export.svg"),
+    "RFS_ExtractSections": ("Extract sections",
+                            "Pull live cross-section (or rail-wise) curves out of a sweep, loft or pipe.",
+                            "rfs_sections.svg"),
+    "RFS_SectionCurves": ("Sections to curves",
+                          "Split an Extract Sections object into individual live curves tagged as Profiles/Rails.",
+                          "rfs_sectioncurves.svg"),
     "RFS_TagProfile": ("Tag as Profile",
                        "Tag selected curve(s) as Profiles (auto-routed to U/Profile inputs).",
                        "rfs_tag_profile.svg"),

@@ -138,6 +138,8 @@ NATIVE_OVERRIDES["RFS_HiddenLineExport"] = [
     ("native", "native_hidden_line_export")]
 NATIVE_OVERRIDES["RFS_TagProfile"] = [("native", "native_tag_profile")]
 NATIVE_OVERRIDES["RFS_TagRail"] = [("native", "native_tag_rail")]
+NATIVE_OVERRIDES["RFS_ExtractSections"] = [("native", "native_extract_sections")]
+NATIVE_OVERRIDES["RFS_SectionCurves"] = [("native", "native_section_curves")]
 
 
 def _build_providers() -> ProvidersDict:
@@ -314,6 +316,43 @@ def native_blend_surface() -> None:
         except Exception:
             pass
     FreeCADGui.Control.showDialog(taskpanels.BlendSurfPanel())
+
+
+def native_extract_sections() -> None:
+    """Native provider for RFS_ExtractSections: create a live Extract
+    Sections object (cross-section curves) from the selected sweep / loft /
+    pipe surface. Tune Count / Direction / Spacing in the property editor."""
+    import FreeCADGui
+    from rfstudio import parametric, statusbar
+    sel = [o for o in FreeCADGui.Selection.getSelection()
+           if getattr(getattr(o, "Shape", None), "Faces", None)]
+    if not sel:
+        raise ValueError("select a surface (sweep, loft, pipe) first")
+    doc = sel[0].Document
+    obj = parametric.make_sections(sel[0], doc)
+    doc.recompute()
+    FreeCADGui.Selection.clearSelection()
+    FreeCADGui.Selection.addSelection(obj)
+    statusbar.flash("Extracted %d section(s) from %s -- use 'Sections to "
+                    "curves' to split them into editable profiles"
+                    % (len(obj.Shape.Edges) if obj.Shape else 0, sel[0].Label))
+
+
+def native_section_curves() -> None:
+    """Native provider for RFS_SectionCurves: split the selected Extract
+    Sections object into one live curve per section, tagged Profile/Rail."""
+    import FreeCADGui
+    from rfstudio import parametric, statusbar
+    sel = [o for o in FreeCADGui.Selection.getSelection()
+           if type(getattr(o, "Proxy", None)).__name__ == "ExtractSectionsFP"]
+    if not sel:
+        raise ValueError("select an Extract Sections object first")
+    made = parametric.make_section_curves(sel[0])
+    FreeCADGui.Selection.clearSelection()
+    for o in made:
+        FreeCADGui.Selection.addSelection(o)
+    statusbar.flash("Created %d section curve(s) -- select them as Loft / "
+                    "SweepN profiles" % len(made))
 
 
 def native_sketch_on_surf() -> None:

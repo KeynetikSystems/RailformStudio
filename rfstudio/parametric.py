@@ -422,6 +422,79 @@ class PlateFillFP(_BaseFP):
             FreeCAD.Console.PrintError("Railform Fill: %s\n" % exc)
 
 
+class ExtractSectionsFP(_BaseFP):
+    """Live section curves pulled out of a sweep / loft / any surface:
+    constant-U ("Cross-sections", one profile per rail station) or
+    constant-V ("Rails") iso curves, as one compound. Pair with
+    SectionCurveFP (split into individual curve objects) to edit a pipe's
+    profiles and rebuild it with Loft / SweepN."""
+    Kind = "Sections"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        obj.addProperty("App::PropertyLink", "Source", "Sections",
+                        "Surface (sweep, loft, pipe...) to extract from")
+        obj.addProperty("App::PropertyEnumeration", "Direction", "Sections",
+                        "Cross-sections = one profile per rail station; "
+                        "Rails = rail-wise curves (best on 2-/multi-rail sweeps)")
+        obj.Direction = list(core.SECTION_DIRECTIONS)
+        obj.Direction = "Cross-sections"
+        obj.addProperty("App::PropertyIntegerConstraint", "Count", "Sections",
+                        "Number of section curves")
+        obj.Count = (9, 1, 500, 1)
+        obj.addProperty("App::PropertyEnumeration", "Spacing", "Sections",
+                        "Even in surface parameter, or even along arc length")
+        obj.Spacing = list(core.SECTION_SPACINGS)
+        obj.Spacing = "Parameter"
+        obj.addProperty("App::PropertyBool", "IncludeEnds", "Sections",
+                        "Put a curve exactly on both boundary iso lines")
+        obj.IncludeEnds = True
+        obj.addProperty("App::PropertyIntegerConstraint", "FaceIndex", "Sections",
+                        "Which face of the source to use (0 = first)")
+        obj.FaceIndex = (0, 0, 999, 1)
+
+    def execute(self, obj):
+        src = obj.Source
+        shape = getattr(src, "Shape", None) if src else None
+        if shape is None or shape.isNull() or not shape.Faces:
+            return
+        try:
+            edges = core.extract_iso_curves(
+                shape, count=int(obj.Count), direction=str(obj.Direction),
+                spacing=str(obj.Spacing), include_ends=bool(obj.IncludeEnds),
+                face_index=int(obj.FaceIndex))
+            obj.Shape = Part.Compound(edges)
+            groups.apply_input_visibility(obj, ["Source"])
+        except Exception as exc:
+            FreeCAD.Console.PrintError("Railform Sections: %s\n" % exc)
+
+
+class SectionCurveFP(_BaseFP):
+    """One live curve = edge `Index` of an ExtractSections object, so it can
+    be used directly as a Profile / rail input of Loft, Sweep, SweepN..."""
+    Kind = "SectionCurve"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        obj.addProperty("App::PropertyLink", "Sections", "SectionCurve",
+                        "The Extract Sections object this curve is taken from")
+        obj.addProperty("App::PropertyInteger", "Index", "SectionCurve",
+                        "Which section (0-based)")
+        obj.Index = 0
+
+    def execute(self, obj):
+        src = obj.Sections
+        shape = getattr(src, "Shape", None) if src else None
+        if shape is None or shape.isNull():
+            return
+        edges = shape.Edges
+        i = int(obj.Index)
+        if 0 <= i < len(edges):
+            obj.Shape = edges[i]
+        else:
+            obj.Shape = Part.Shape()       # Count shrank below this index
+
+
 class OffsetFP(_BaseFP):
     Kind = "Offset"
 
@@ -1324,6 +1397,7 @@ _FP = {"Loft": LoftFP, "Gordon": GordonFP, "Coons": CoonsFP,
        "Sweep": Sweep2RailFP, "SweepN": SweepNFP, "Fill": PlateFillFP,
        "Match": MatchSurfaceFP,
        "Offset": OffsetFP, "Thicken": ThickenFP, "Shell": ShellFP,
+       "Sections": ExtractSectionsFP, "SectionCurve": SectionCurveFP,
        "ExtendSurf": ExtendSurfFP, "BlendSurf": BlendSurfFP,
        "BlendSurfClosed": BlendSurfClosedFP,
        "N_sidedPatch": N_sidedPatchFP,
@@ -1339,6 +1413,7 @@ _LABEL = {"Loft": "RailformLoft", "Gordon": "RailformGordon",
           "Fill": "RailformFill", "Match": "RailformMatch",
           "Offset": "RailformOffset", "Thicken": "RailformThicken",
           "Shell": "RailformShell", "BlendSurf": "RailformBlendSurf",
+          "Sections": "RailformSections", "SectionCurve": "RailformSectionCurve",
           "BlendSurfClosed": "RailformBlendSurfClosed",
           "N_sidedPatch": "RailformN_sidedPatch",
           "InterpCurve": "RailformInterpCurve", "ControlCurve": "RailformControlCurve",
@@ -1476,6 +1551,44 @@ def make_curve(kind, doc=None):
         CurveVP(obj.ViewObject)
     groups.add_to_group(obj, "Curves")
     return obj
+
+
+def make_sections(source, doc=None):
+    """Create a live ExtractSections object for `source` (any surface
+    object); filed under Curves and styled like a curve."""
+    doc = doc or FreeCAD.ActiveDocument or FreeCAD.newDocument()
+    obj = doc.addObject("Part::FeaturePython", _LABEL["Sections"])
+    ExtractSectionsFP(obj)
+    if source is not None:
+        obj.Source = source
+    if obj.ViewObject is not None:
+        _style_curve_vobj(obj.ViewObject)
+    groups.add_to_group(obj, "Curves")
+    return obj
+
+
+def make_section_curves(sections_obj):
+    """Split an ExtractSections object into one live SectionCurve object per
+    section, tagged Profile (Cross-sections) or GuideRail (Rails) so Loft /
+    Sweep / SweepN auto-seed from them. Returns the new objects."""
+    doc = sections_obj.Document
+    shp = getattr(sections_obj, "Shape", None)
+    n = len(shp.Edges) if shp is not None and not shp.isNull() \
+        else int(sections_obj.Count)
+    role = "GuideRail" if str(sections_obj.Direction) == "Rails" else "Profile"
+    out = []
+    for i in range(n):
+        o = doc.addObject("Part::FeaturePython", _LABEL["SectionCurve"])
+        SectionCurveFP(o)
+        o.Sections = sections_obj
+        o.Index = i
+        if o.ViewObject is not None:
+            _style_curve_vobj(o.ViewObject)
+        groups.add_to_group(o, "Curves")
+        set_curve_role(o, role)
+        out.append(o)
+    doc.recompute()
+    return out
 
 
 def make_polyline_fillet(source, doc=None):

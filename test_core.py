@@ -1700,6 +1700,95 @@ def test_surface_feature_virtual_thickness():
         FreeCAD.closeDocument(doc.Name)
 
 
+def _surface_max_dev(a, b, n=10):
+    """Max distance from an n x n grid of points on face `a` to shape `b`."""
+    fa = a.Faces[0]
+    u0, u1, v0, v1 = fa.ParameterRange
+    return max(
+        Part.Vertex(fa.valueAt(u0 + (u1 - u0) * i / (n - 1.0),
+                               v0 + (v1 - v0) * j / (n - 1.0))
+                    ).distToShape(b)[0]
+        for i in range(n) for j in range(n))
+
+
+def test_extract_iso_curves_from_straight_pipe():
+    """Cross-sections of a single-rail pipe: evenly spaced planar circles of
+    the pipe radius, ends exactly on the boundary iso lines."""
+    rail = spline([Vector(0, 0, 0), Vector(10, 0, 0)])
+    profile = Part.makeCircle(1.5, Vector(0, 0, 0), Vector(1, 0, 0))
+    pipe = core.single_rail_sweep(rail, [profile], n_rail=21, n_prof=48)
+    secs = core.extract_iso_curves(pipe, count=6)
+    assert len(secs) == 6
+    xs = [e.valueAt(e.FirstParameter).x for e in secs]
+    for k, x in enumerate(xs):
+        assert abs(x - 2.0 * k) < 1e-3, (k, x)             # 0,2,..,10
+    circ = 2.0 * math.pi * 1.5
+    for e in secs:
+        assert abs(e.Length - circ) < 5e-3, e.Length
+    inner = core.extract_iso_curves(pipe, count=3, include_ends=False)
+    assert all(0.5 < e.valueAt(e.FirstParameter).x < 9.5 for e in inner)
+    alen = core.extract_iso_curves(pipe, count=6, spacing="Arc length")
+    assert len(alen) == 6
+    for bad in (dict(direction="x"), dict(spacing="x"), dict(count=0),
+                dict(face_index=3)):
+        try:
+            core.extract_iso_curves(pipe, **bad)
+        except ValueError:
+            continue
+        raise AssertionError("no ValueError for %r" % (bad,))
+    out("  extract sections: pipe OK  %d circles, len=%.3f" % (len(secs), circ))
+
+
+def test_extract_sections_roundtrips_multi_rail_sweep():
+    """Extract the rails and cross-sections of a 3-rail sweep and rebuild it
+    with the N-rail sweep: the rebuilt surface lies on the original."""
+    r1 = Part.makeLine(Vector(0, -5, 0), Vector(40, -5, 0))
+    r2 = Part.makeLine(Vector(0, 5, 0), Vector(40, 5, 3))
+    r3 = Part.makeLine(Vector(0, 0, 4), Vector(40, 0, 6))
+    prof = Part.Arc(Vector(0, -5, 0), Vector(0, 0, 2), Vector(0, 5, 0)).toShape()
+    orig = core.multi_rail_sweep([r1, r3, r2], [prof], n_rail=20, n_prof=16)
+    profiles = core.extract_iso_curves(orig, count=6, spacing="Arc length")
+    rails = core.extract_iso_curves(orig, count=3, direction="Rails")
+    assert len(profiles) == 6 and len(rails) == 3
+    rebuilt = core.multi_rail_sweep(rails, profiles, n_rail=20, n_prof=16)
+    d1 = _surface_max_dev(rebuilt, orig.Faces[0])
+    d2 = _surface_max_dev(orig, rebuilt.Faces[0])
+    assert d1 < 5e-3 and d2 < 5e-3, (d1, d2)
+    out("  extract sections: N-rail round trip OK  dev=%.1e/%.1e" % (d1, d2))
+
+
+def test_extract_sections_features_and_split():
+    """ExtractSections is a live feature; SectionCurve objects pick single
+    sections (tagged Profile / GuideRail) and follow Count / Direction."""
+    from rfstudio import parametric
+    doc = FreeCAD.newDocument("sections_test")
+    try:
+        r1 = Part.makeLine(Vector(0, -5, 0), Vector(40, -5, 0))
+        r2 = Part.makeLine(Vector(0, 5, 0), Vector(40, 5, 3))
+        prof = Part.Arc(Vector(0, -5, 0), Vector(0, 0, 2), Vector(0, 5, 0)).toShape()
+        src = doc.addObject("Part::Feature", "SweepSrc")
+        src.Shape = core.two_rail_sweep(r1, r2, [prof], n_rail=20, n_prof=16)
+        sec = parametric.make_sections(src, doc)
+        doc.recompute()
+        assert len(sec.Shape.Edges) == 9
+        kids = parametric.make_section_curves(sec)
+        assert len(kids) == 9 and all(k.Shape.Edges for k in kids)
+        assert all(k.RailformRole == "Profile" for k in kids)
+        sec.Count = 4
+        doc.recompute()
+        assert len(sec.Shape.Edges) == 4
+        assert not kids[8].Shape.Edges                  # index fell off the end
+        sec.Direction = "Rails"
+        sec.Count = 2
+        doc.recompute()
+        assert all(abs(e.Length - 40.0) < 0.5 for e in sec.Shape.Edges)
+        rail_kids = parametric.make_section_curves(sec)
+        assert all(k.RailformRole == "GuideRail" for k in rail_kids)
+        out("  extract sections: features+split OK")
+    finally:
+        FreeCAD.closeDocument(doc.Name)
+
+
 def test_match_surface_exact_g2_curved_reference():
     """Load-bearing G2 test on CURVED geometry: planes have zero
     curvature everywhere, so G2 holds trivially on plane-plane seams
@@ -4127,6 +4216,9 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_match_surface_far_tangent_and_g2_stable,
               test_match_surface_exact_abutting_does_not_fold,
               test_surface_feature_virtual_thickness,
+              test_extract_iso_curves_from_straight_pipe,
+              test_extract_sections_roundtrips_multi_rail_sweep,
+              test_extract_sections_features_and_split,
               test_match_surface_fp_execute_uses_references,
               test_match_surface_to_references_prefers_exact_g1,
               test_match_surface_to_references_reports_method,
