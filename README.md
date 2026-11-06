@@ -110,15 +110,10 @@ properties:
 - **Extract sections** pulls live cross-section curves (constant-U) or
   rail-wise curves (constant-V) out of a sweep, loft or pipe; **Sections to
   curves** splits them into individual Profile / Guide-Rail curves for
-  Loft / SweepN. Rebuilding is exact (about 1e-5) for N-rail sweeps with 3 or
-  more rails. **Known issues found while testing it:** (1) a *two*-rail
-  sweep (or an N-rail sweep with only 2 rails) rebuilt from several extracted
-  profiles does not hold those profiles (the bulge between the rails came
-  back inverted, ~4 mm off in a 40 mm test); (2) on a *curved* rail the
-  single-rail pipe sweep is only exact at its own stations -- between them
-  the tube radius dips (a r=0.5 test pipe had 4.6x the expected surface
-  area), so sections taken between stations are not true circles. Both are
-  in the sweep builders, not the extractor, and are not fixed yet.
+  Loft / Sweep / SweepN. Rebuilding a sweep from its own extracted rails and
+  sections reproduces it to ~1e-5 mm (2-rail, N-rail and pipe sweeps). On a
+  single-rail pipe the Rails direction follows points on the profile as the
+  moving frame twists, so those curves can spiral; use Cross-sections.
 - Class-A claims are numeric, sampled checks, not a certified tolerance
   analysis: grade your own seams with the Surface review report.
 - Some actions still lean on the optional Curves workbench as a fallback; see

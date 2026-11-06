@@ -12,7 +12,11 @@ fresh `Unreleased` section above it.
 
 ### Added (Section extraction)
 - `core.extract_iso_curves` + **Extract sections** (`RFS_ExtractSections`): live cross-section (constant-U) or rail-wise (constant-V) curves from any sweep, loft or pipe; even in parameter or arc length, optional end curves. **Sections to curves** (`RFS_SectionCurves`) splits them into live `SectionCurve` objects tagged Profile / GuideRail for Loft / SweepN. Round trip through the N-rail sweep is exact (~1e-5) for 3+ rails.
-- Known, not fixed (sweep builders): 2-rail sweeps rebuilt from several extracted profiles do not hold them; the curved-rail pipe sweep is exact only at its own stations (tube radius dips in between).
+
+### Fixed (sweep builders, found while testing section extraction)
+- **Single-rail pipe sweep on a bent rail**: the tube radius collapsed between stations (a r=0.5 test pipe had 4.6x the expected area; the old tests only sampled at station-aligned parameters). Cause: `_rmf_frames` transported the up vector with a "double reflection" built from the tangent difference, which negated ey/ez at every station whenever the seed up lay in the bend plane (always the case for a round profile, whose normal ~ the rail tangent). Replaced with a Rodrigues rotation about `prev_tan x tan`.
+- `_rail_tangent` took an ARC FRACTION as a curve parameter; on a chord-length-parametrized rail the tangent was up to ~20 deg off the spine. It now maps through the arc table.
+- **2-rail / N-rail sweep with several profiles**: the profile-direction test compared nearest-point parameters and could reverse a correctly oriented profile on non-parallel rails (bulge mirrored, ~4 mm error in a 40 mm test). Now decided by which end lies on which rail (`_profile_runs_far_to_base`), parameters only as a tie-break. Shared with the non-Gordon multi-rail path.
 
 ## 0.1.1 - 2026-11-06
 
