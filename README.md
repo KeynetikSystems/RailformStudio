@@ -92,7 +92,7 @@ activation and in `test_core.py`.
 | `rfstudio/editmode.py` | In-viewport editors (control points, knots, Bezier handles) + snapping | ❌ GUI only |
 | `rfstudio/toolshelf.py` | Left-docked tool shelf (filter, collapsible sections, engine-aware greying) | ❌ GUI only |
 | `rfstudio/snaputil.py` · `snapsettings.py` · `statusbar.py` | Ranked snapping, snap on/off settings, status-bar messaging | snaputil ✅ |
-| `rfstudio/commands.py` | `ProviderCommand` + `PanelCommand` + curated toolbars | ❌ GUI only |
+| `rfstudio/commands/` (package) | `ProviderCommand` + `PanelCommand` + curated toolbars | ❌ GUI only |
 | `InitGui.py` · `rfstudio/workbench.py` | Workbench registration | ❌ GUI only |
 
 > **Design rule:** Curves imports `FreeCAD.Gui` at load, and so does anything

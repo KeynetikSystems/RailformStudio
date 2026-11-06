@@ -10,6 +10,8 @@ fresh `Unreleased` section above it.
 
 ## Unreleased
 
+## 0.1.1 - 2026-11-06
+
 ### Fixed (Surface blend / match correctness)
 - `blend_surface` / `match_surface` now pair antiparallel boundary edges end-to-end (`_seam_reversed`) instead of twisting the strip; the exact G1/G2 matchers refuse such pairs and fall back to the sampled path.
 - `match_surface`: far-end tangent now points outward on max-u/v target sides (no overshoot past the far edge); G2/G3 curvature and jerk are normalised by the true cross-parameter speed (`Surface.tangent()` is unit length) so a G2 request on an already-G2 continuation no longer blows up; finite differences step inward; target far-side curvature is kept; G3 jerk sign corrected.
