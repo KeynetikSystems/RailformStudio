@@ -452,6 +452,12 @@ class ExtractSectionsFP(_BaseFP):
         obj.addProperty("App::PropertyIntegerConstraint", "FaceIndex", "Sections",
                         "Which face of the source to use (0 = first)")
         obj.FaceIndex = (0, 0, 999, 1)
+        obj.addProperty("App::PropertyString", "SectionsSync", "Sections",
+                        "Result of the last 'Sections to curves' run")
+        try:
+            obj.setEditorMode("SectionsSync", 1)           # read-only
+        except Exception:
+            pass
 
     def execute(self, obj):
         src = obj.Source
@@ -493,6 +499,12 @@ class SectionCurveFP(_BaseFP):
             obj.Shape = edges[i]
         else:
             obj.Shape = Part.Shape()       # Count shrank below this index
+            vo = getattr(obj, "ViewObject", None)
+            if vo is not None:
+                try:
+                    vo.Visibility = False  # orphan: re-run 'Sections to curves'
+                except Exception:
+                    pass
 
 
 class OffsetFP(_BaseFP):
@@ -1561,33 +1573,63 @@ def make_sections(source, doc=None):
     ExtractSectionsFP(obj)
     if source is not None:
         obj.Source = source
-    if obj.ViewObject is not None:
-        _style_curve_vobj(obj.ViewObject)
+    _attach_sections_vp(obj)
     groups.add_to_group(obj, "Curves")
     return obj
+
+
+def section_curve_children(sections_obj):
+    """The SectionCurve objects currently attached to `sections_obj`."""
+    return [o for o in sections_obj.Document.Objects
+            if type(getattr(o, "Proxy", None)).__name__ == "SectionCurveFP"
+            and getattr(o, "Sections", None) == sections_obj]
 
 
 def make_section_curves(sections_obj):
     """Split an ExtractSections object into one live SectionCurve object per
     section, tagged Profile (Cross-sections) or GuideRail (Rails) so Loft /
-    Sweep / SweepN auto-seed from them. Returns the new objects."""
+    Sweep / SweepN auto-seed from them.
+
+    RE-RUNNABLE: existing children are reused (never duplicated), missing
+    ones are created, and children whose index fell off the end after Count
+    was lowered are deleted -- so running it again after changing Count or
+    Direction brings the curve set back in sync. Returns the current
+    children, ordered by Index. Sets `sections_obj.SectionsSync` to a short
+    created/reused/removed summary."""
     doc = sections_obj.Document
     shp = getattr(sections_obj, "Shape", None)
     n = len(shp.Edges) if shp is not None and not shp.isNull() \
         else int(sections_obj.Count)
     role = "GuideRail" if str(sections_obj.Direction) == "Rails" else "Profile"
+    by_index = {}
+    removed = 0
+    for o in section_curve_children(sections_obj):
+        i = int(o.Index)
+        if i in by_index or not 0 <= i < n:         # duplicate or orphan
+            doc.removeObject(o.Name)
+            removed += 1
+        else:
+            by_index[i] = o
+    created = 0
     out = []
     for i in range(n):
-        o = doc.addObject("Part::FeaturePython", _LABEL["SectionCurve"])
-        SectionCurveFP(o)
-        o.Sections = sections_obj
-        o.Index = i
-        if o.ViewObject is not None:
-            _style_curve_vobj(o.ViewObject)
-        groups.add_to_group(o, "Curves")
-        set_curve_role(o, role)
+        o = by_index.get(i)
+        if o is None:
+            o = doc.addObject("Part::FeaturePython", _LABEL["SectionCurve"])
+            SectionCurveFP(o)
+            o.Sections = sections_obj
+            o.Index = i
+            _attach_sections_vp(o)
+            groups.add_to_group(o, "Curves")
+            created += 1
+        set_curve_role(o, role)                      # Direction may have changed
         out.append(o)
     doc.recompute()
+    try:
+        sections_obj.SectionsSync = "%d curve(s): %d created, %d reused, %d removed" % (
+            n, created, n - created, removed)
+    except Exception:
+        pass
     return out
 
 
@@ -1685,6 +1727,31 @@ class CurveVP(object):
             self.edit_mode.finish()
             del self.edit_mode
         return
+
+
+class SectionsVP(CurveVP):
+    """ViewProvider for ExtractSections / SectionCurve objects.
+
+    Without a Python view provider a bare Part::FeaturePython built from
+    code gets NO display mode, so the section curves were never drawn in the
+    3D view. Reuses CurveVP's attach/state handling but has its own icon and
+    does NOT open the curve point-edit panel on double-click (these curves
+    are derived from a surface; edit Count / Direction instead)."""
+
+    def getIcon(self):
+        name = "rfs_sectioncurves.svg" if getattr(self, "kind", None) == \
+            "SectionCurve" else "rfs_sections.svg"
+        return _icon(name)
+
+    def doubleClicked(self, vobj):
+        return False
+
+
+def _attach_sections_vp(obj):
+    vo = getattr(obj, "ViewObject", None)
+    if vo is not None:
+        _style_curve_vobj(vo)
+        SectionsVP(vo)
 
 
 # --------------------------------------------------------------------------- #

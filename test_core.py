@@ -1778,6 +1778,22 @@ def test_extract_sections_features_and_split():
         doc.recompute()
         assert len(sec.Shape.Edges) == 4
         assert not kids[8].Shape.Edges                  # index fell off the end
+        # re-running syncs: reuse 4, remove the 5 orphans, create nothing
+        n_before = len(doc.Objects)
+        again = parametric.make_section_curves(sec)
+        assert len(again) == 4 and all(a is k for a, k in zip(again, kids[:4]))
+        assert len(doc.Objects) == n_before - 5, (len(doc.Objects), n_before)
+        assert len(parametric.section_curve_children(sec)) == 4
+        assert "5 removed" in sec.SectionsSync, sec.SectionsSync
+        again2 = parametric.make_section_curves(sec)     # idempotent
+        assert len(again2) == 4 and len(doc.Objects) == n_before - 5
+        sec.Count = 6                                    # growing creates the new ones
+        doc.recompute()
+        assert len(parametric.make_section_curves(sec)) == 6
+        assert "2 created" in sec.SectionsSync, sec.SectionsSync
+        sec.Count = 9
+        doc.recompute()
+        parametric.make_section_curves(sec)
         sec.Direction = "Rails"
         sec.Count = 2
         doc.recompute()

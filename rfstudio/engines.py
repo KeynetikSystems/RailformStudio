@@ -351,8 +351,9 @@ def native_section_curves() -> None:
     FreeCADGui.Selection.clearSelection()
     for o in made:
         FreeCADGui.Selection.addSelection(o)
-    statusbar.flash("Created %d section curve(s) -- select them as Loft / "
-                    "SweepN profiles" % len(made))
+    statusbar.flash("Sections to curves: %s -- select them as Loft / SweepN "
+                    "profiles" % (getattr(sel[0], "SectionsSync", "") or
+                                  "%d curve(s)" % len(made)))
 
 
 def native_sketch_on_surf() -> None:

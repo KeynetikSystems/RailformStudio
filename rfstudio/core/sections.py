@@ -10,9 +10,9 @@ station) and V runs around/across the profile. So
     "Rails"           ->  constant-V iso curves   (one rail-wise curve per
                                                    profile point)
 
-For a single-rail PIPE the "Rails" direction follows points on the profile
-as the moving frame twists, so those curves can spiral; they are meaningful
-for two-/multi-rail sweeps, where V positions are pinned to the rails.
+For a single-rail PIPE the "Rails" direction gives the lines that run
+parallel to the spine (the frame is rotation-minimizing, so they stay
+within a few percent of the rail's length).
 """
 
 import Part
