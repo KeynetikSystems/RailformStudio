@@ -362,10 +362,11 @@ def enforce_bezier_handle_constraints(point_idx, which, left_handles, right_hand
     dragged, so the other one can be adjusted to match.
 
     Handle types:
-      "Auto"    - smart default: G1 at boundaries, G2 at interior points
-      "Aligned" - G1: handles opposite (180°), lengths independent
-      "Vector"  - G1: handles aligned (0°), lengths independent
-      "Free"    - no constraints
+      "Auto"     - smart default: G1 at boundaries, G2 at interior points
+      "Aligned"  - G1: handles opposite (180°), lengths independent
+      "Mirrored" - G1: handles opposite (180°), lengths equal (symmetric)
+      "Vector"   - handles point toward adjacent neighbor points (linear/sharp chords)
+      "Free"     - no constraints
       "G2"      - G2 curvature continuity (adjusts opposite handle to match G2)
       "G3"      - G3 jerk continuity (adjusts opposite handle to match G3, implies G2)
 
@@ -430,23 +431,31 @@ def enforce_bezier_handle_constraints(point_idx, which, left_handles, right_hand
                 else:
                     right_handles[point_idx] = point + chord_dir * (right - point).Length
 
-    elif htype == "Aligned":
+    elif htype in ("Aligned", "Mirrored"):
         # Aligned: Handles opposite (180 deg) but lengths can vary
+        # Mirrored: Handles opposite (180 deg) and lengths are equal (symmetric)
+        is_mirrored = (htype == "Mirrored")
         if which == 'left' and (left - point).Length > 1e-9:
             left_dir = (left - point).normalize()
-            right_handles[point_idx] = point - left_dir * (right - point).Length
+            r_len = (left - point).Length if is_mirrored else (right - point).Length
+            right_handles[point_idx] = point - left_dir * r_len
         elif which == 'right' and (right - point).Length > 1e-9:
             right_dir = (right - point).normalize()
-            left_handles[point_idx] = point - right_dir * (left - point).Length
+            l_len = (right - point).Length if is_mirrored else (left - point).Length
+            left_handles[point_idx] = point - right_dir * l_len
 
     elif htype == "Vector":
-        # Vector: Handles locked together (same angle, can scale independently)
-        if which == 'left' and (left - point).Length > 1e-9:
-            left_dir = (left - point).normalize()
-            right_handles[point_idx] = point + left_dir * (right - point).Length
-        elif which == 'right' and (right - point).Length > 1e-9:
-            right_dir = (right - point).normalize()
-            left_handles[point_idx] = point + right_dir * (left - point).Length
+        # Vector: Each handle points toward adjacent control points (sharp corner / linear lead-in)
+        if p_prev is not None:
+            v_in = p_prev - point
+            if v_in.Length > 1e-9:
+                l_len = (left - point).Length if (left - point).Length > 1e-6 else (v_in.Length / 3.0)
+                left_handles[point_idx] = point + v_in.normalize() * l_len
+        if p_next is not None:
+            v_out = p_next - point
+            if v_out.Length > 1e-9:
+                r_len = (right - point).Length if (right - point).Length > 1e-6 else (v_out.Length / 3.0)
+                right_handles[point_idx] = point + v_out.normalize() * r_len
 
     elif htype == "G2":
         # G2: Enforce curvature continuity with neighbors

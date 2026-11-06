@@ -128,22 +128,130 @@ _GORDON_CROSS_TOL = 0.02
 
 
 
+def _select_consistent_crossings(cand, order_i, order_j):
+    """Pick ONE crossing per (profile, guide) cell so the chosen grid is
+    monotone along every guide and every profile -- the fix for a network
+    where a pair crosses more than once (e.g. an S-shaped curve) and the
+    plain min-gap pick grabs the wrong lobe, scrambling the grid and folding
+    the Gordon surface (OCCT then raises Standard_ConstructionError).
+
+    `cand[i][j]` is that cell's candidate crossings as (tu, tv, gap),
+    PRE-SORTED by (gap, tu) so index 0 is the historic min-gap pick.
+    `order_i` / `order_j` are the profile / guide orderings along the shared
+    axes (from _consistent_grid). Returns (pu, pv, dd).
+
+    Method: start from the min-gap pick, fix the monotone direction of each
+    guide/profile from it, then relax (Gauss-Seidel): each multi-candidate
+    cell re-picks the candidate that least violates monotonicity against its
+    current neighbours in the ordered grid, breaking ties toward the smaller
+    gap (a truer crossing). Single-candidate cells never move, so a clean net
+    is returned unchanged. Pure arithmetic -- no FreeCAD, headless-testable.
+    """
+    nu, nv = len(cand), len(cand[0])
+    sel = [[0] * nv for _ in range(nu)]
+
+    def tv(i, j):
+        return cand[i][j][sel[i][j]][1]
+
+    def tu(i, j):
+        return cand[i][j][sel[i][j]][0]
+
+    def _dir(seq):
+        return 1.0 if (seq[-1] - seq[0]) >= 0.0 else -1.0
+
+    # Direction of increase fixed from the min-gap pick (candidate 0).
+    dir_v = [_dir([cand[order_i[a]][j][0][1] for a in range(nu)])
+             for j in range(nv)]
+    dir_u = [_dir([cand[i][order_j[b]][0][0] for b in range(nv)])
+             for i in range(nu)]
+    rank_i = {i: a for a, i in enumerate(order_i)}
+    rank_j = {j: b for b, j in enumerate(order_j)}
+
+    def _viol(key, lo, hi, d):
+        """How far `key` breaks the strict `d`-monotone bracket [lo, hi]
+        (either bound may be None at a grid edge)."""
+        p = 0.0
+        if lo is not None:
+            p += max(0.0, (lo - key) * d)
+        if hi is not None:
+            p += max(0.0, (key - hi) * d)
+        return p
+
+    for _pass in range(8):
+        changed = False
+        for i in range(nu):
+            for j in range(nv):
+                if len(cand[i][j]) == 1:
+                    continue
+                a, b = rank_i[i], rank_j[j]
+                lo_v = tv(order_i[a - 1], j) if a > 0 else None
+                hi_v = tv(order_i[a + 1], j) if a < nu - 1 else None
+                lo_u = tu(i, order_j[b - 1]) if b > 0 else None
+                hi_u = tu(i, order_j[b + 1]) if b < nv - 1 else None
+                best_k, best_cost = sel[i][j], None
+                for k, c in enumerate(cand[i][j]):
+                    v = (_viol(c[1], lo_v, hi_v, dir_v[j])
+                         + _viol(c[0], lo_u, hi_u, dir_u[i]))
+                    cost = (v, c[2])
+                    if best_cost is None or cost < best_cost:
+                        best_cost, best_k = cost, k
+                if best_k != sel[i][j]:
+                    sel[i][j] = best_k
+                    changed = True
+        if not changed:
+            break
+
+    pu = [[cand[i][j][sel[i][j]][0] for j in range(nv)] for i in range(nu)]
+    pv = [[cand[i][j][sel[i][j]][1] for j in range(nv)] for i in range(nu)]
+    dd = [[cand[i][j][sel[i][j]][2] for j in range(nv)] for i in range(nu)]
+    return pu, pv, dd
+
+
+def _consistent_grid(cand, bs_profiles, bs_guides):
+    """Order the profiles/guides along the shared axes (same normalised-
+    parameter averaging gordon_network uses) from the min-gap pick, then hand
+    the candidate grid to _select_consistent_crossings. Separated so the
+    selection is pure and headless-testable; this part needs the BSplines
+    only to compute the ordering."""
+    nu, nv = len(cand), len(cand[0])
+    pv0 = [[cand[i][j][0][1] for j in range(nv)] for i in range(nu)]
+    pu0 = [[cand[i][j][0][0] for j in range(nv)] for i in range(nu)]
+    u_bar = [sum(_norm_param(bs_guides[j], pv0[i][j]) for j in range(nv)) / nv
+             for i in range(nu)]
+    v_bar = [sum(_norm_param(bs_profiles[i], pu0[i][j]) for i in range(nu)) / nu
+             for j in range(nv)]
+    order_i = sorted(range(nu), key=lambda i: u_bar[i])
+    order_j = sorted(range(nv), key=lambda j: v_bar[j])
+    return _select_consistent_crossings(cand, order_i, order_j)
+
+
 def _intersect_grid(bs_profiles, bs_guides):
     """Best (tu, tv, gap) per (profile, guide). Ties on gap (all exact
     crossings) break on the smallest tu so the choice is deterministic.
-    NOTE: multi-crossing pairs still take the first crossing along the
-    profile; a network where that is the wrong one needs ordering by the
-    caller."""
+
+    For a network where some pair crosses MORE THAN ONCE (an S-shaped curve
+    meeting its partner on two lobes), the plain min-gap pick can grab the
+    wrong crossing and scramble the grid. When any cell has multiple
+    candidates, the selection is handed to _consistent_grid, which chooses one
+    crossing per cell so the grid stays monotone along every guide/profile.
+    A network where every pair crosses exactly once (or not at all) takes the
+    historic min-gap path unchanged."""
     nu, nv = len(bs_profiles), len(bs_guides)
-    pu = [[0.0] * nv for _ in range(nu)]
-    pv = [[0.0] * nv for _ in range(nu)]
-    dd = [[0.0] * nv for _ in range(nu)]
+    cand = [[None] * nv for _ in range(nu)]
+    multi = False
     for i in range(nu):
         for j in range(nv):
             pairs = _intersect_pair(bs_profiles[i], bs_guides[j])
-            best = min(pairs, key=lambda t: (round(t[2], 9), t[0]))
-            pu[i][j], pv[i][j], dd[i][j] = best
-    return pu, pv, dd
+            pairs = sorted(pairs, key=lambda t: (round(t[2], 9), t[0]))
+            cand[i][j] = pairs
+            if len(pairs) > 1:
+                multi = True
+    pu = [[cand[i][j][0][0] for j in range(nv)] for i in range(nu)]
+    pv = [[cand[i][j][0][1] for j in range(nv)] for i in range(nu)]
+    dd = [[cand[i][j][0][2] for j in range(nv)] for i in range(nu)]
+    if not multi:
+        return pu, pv, dd
+    return _consistent_grid(cand, bs_profiles, bs_guides)
 
 
 

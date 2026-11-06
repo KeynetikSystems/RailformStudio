@@ -204,6 +204,27 @@ def _compute_finite_difference_epsilon(parameter_range, dimension_index):
 
 
 
+def _finite_difference_first_derivative(point_func, u, v, du_sign, dv_sign, eps):
+    """Compute first derivative using one-sided forward difference along
+    (du_sign, dv_sign). Same stepping convention as the second/third
+    derivative helpers above: the stencil marches in the given sign
+    direction from (u, v).
+
+    Args:
+        point_func: Function(u, v) -> point on surface
+        u, v: Parameter coordinates
+        du_sign, dv_sign: Direction signs (+1 or -1) for u and v derivatives
+        eps: Step size for finite difference
+
+    Returns:
+        First derivative vector
+    """
+    p0 = point_func(u, v)
+    p1 = point_func(u + du_sign * eps, v + dv_sign * eps)
+    return (p1 - p0) / eps
+
+
+
 def _finite_difference_second_derivative(point_func, u, v, du_sign, dv_sign, eps):
     """Compute second derivative using central difference.
 
@@ -254,6 +275,20 @@ def _cross_tan_from_surface_tangent(du, dv, side):
         Tangent vector in the specified direction
     """
     return {0: du.negative(), 1: du, 2: dv.negative(), 3: dv}[side]
+
+
+
+def _side_sigma(side):
+    """Sign of the INTO-MATERIAL parameter step for a boundary side.
+
+    Sides 0/2 (umin/vmin) have material at increasing parameter (+1);
+    sides 1/3 (umax/vmax) have material at decreasing parameter (-1).
+    Used to step finite-difference stencils inward (onto real surface
+    instead of off-domain extrapolation) and to orient odd-order
+    derivative data (1st/3rd derivatives flip under traversal reversal;
+    2nd does not).
+    """
+    return 1.0 if side in (0, 2) else -1.0
 
 
 
@@ -326,6 +361,96 @@ def _hermite7(p0, v0, a0, j0, p1, v1, a1, j1, t):
 
 
 
+def _hermite_to_bezier(p0, v0, a0, j0, p1, v1, a1, j1, degree):
+    """Bezier poles of the degree-`degree` Hermite polynomial with the given
+    boundary data (B(0)=p0, B'(0)=v0, B''(0)=a0, B'''(0)=j0, and the same
+    at t=1). Lower-degree cases ignore the higher-order data they don't
+    use: degree 7 consumes all of it, 5 drops j0/j1, 3 drops a0/a1 too,
+    1 is just the chord. Standard Bézier derivative identities
+    (B'(0) = n(b1-b0), B''(0) = n(n-1)(b2-2b1+b0),
+    B'''(0) = n(n-1)(n-2)(b3-3b2+3b1-b0), mirrored at t=1) inverted for
+    the poles. Lets a blend be built as an EXACT Bezier instead of
+    sampling the Hermite into points and re-interpolating (which smooths
+    away the fed derivative data -- the interpolant's own boundary
+    derivatives are not the Hermite's)."""
+    if degree >= 7:
+        return [p0,
+                p0 + v0 * (1.0 / 7.0),
+                p0 + v0 * (2.0 / 7.0) + a0 * (1.0 / 42.0),
+                p0 + v0 * (3.0 / 7.0) + a0 * (1.0 / 14.0) + j0 * (1.0 / 210.0),
+                p1 - v1 * (3.0 / 7.0) + a1 * (1.0 / 14.0) - j1 * (1.0 / 210.0),
+                p1 - v1 * (2.0 / 7.0) + a1 * (1.0 / 42.0),
+                p1 - v1 * (1.0 / 7.0),
+                p1]
+    if degree >= 5:
+        return [p0,
+                p0 + v0 * 0.2,
+                p0 + v0 * 0.4 + a0 * (1.0 / 20.0),
+                p1 - v1 * 0.4 + a1 * (1.0 / 20.0),
+                p1 - v1 * 0.2,
+                p1]
+    if degree >= 3:
+        return [p0, p0 + v0 / 3.0, p1 - v1 / 3.0, p1]
+    return [p0, p1]
+
+
+
+def _bezier_row_points(poles, n):
+    """Sample one Bezier pole list at n uniform parameters (de Casteljau).
+    Fallback path for _skin_pole_rows -- reproduces the point grid the
+    pre-pole-skinning construction used."""
+    pts = [None] * n
+    for j in range(n):
+        t = j / (n - 1.0)
+        tmp = list(poles)
+        while len(tmp) > 1:
+            tmp = [tmp[i] + (tmp[i + 1] - tmp[i]) * t
+                   for i in range(len(tmp) - 1)]
+        pts[j] = tmp[0]
+    return pts
+
+
+
+def _skin_pole_rows(row_poles):
+    """Tensor-product BSpline surface over Hermite rows given as Bezier
+    poles: row_poles[k] is the pole list of row k's cross-section Bezier
+    (all rows share the degree). The v-direction is the shared single-span
+    Bezier of that degree, so each row's cross-section is reproduced
+    EXACTLY as an isoparametric curve -- the fed G1/G2/G3 boundary data
+    survives construction verbatim at every sampled row. The u-direction
+    interpolates the pole COLUMNS (not points) across the rows with shared
+    explicit uniform parameters, so every column's interpolant has the
+    identical knot vector and the poles assemble into one tensor product.
+
+    Raises on any interpolation/assembly failure; callers fall back to
+    grid_to_surface over the sampled rows (the previous approximate
+    construction)."""
+    n = len(row_poles)
+    deg_v = len(row_poles[0]) - 1
+    params = [k / (n - 1.0) for k in range(n)]
+    cols = []
+    for i in range(deg_v + 1):
+        c = Part.BSplineCurve()
+        c.interpolate(Points=[row_poles[k][i] for k in range(n)],
+                      Parameters=params)
+        cols.append(c)
+    c0 = cols[0]
+    uknots, umults, deg_u, nu = c0.getKnots(), c0.getMultiplicities(), \
+        c0.Degree, c0.NbPoles
+    for c in cols[1:]:
+        if c.getKnots() != uknots or c.getMultiplicities() != umults \
+                or c.Degree != deg_u or c.NbPoles != nu:
+            raise ValueError("_skin_pole_rows: column knot vectors diverged")
+    poles = [[cols[i].getPole(m + 1) for i in range(deg_v + 1)]
+             for m in range(nu)]
+    surf = Part.BSplineSurface()
+    surf.buildFromPolesMultsKnots(
+        poles, umults, [deg_v + 1, deg_v + 1],
+        uknots, [0.0, 1.0], False, False, deg_u, deg_v)
+    return surf.toShape()
+
+
+
 def _nearest_facing_sides(face_a, face_b):
     """Which iso-parameter side (0=umin,1=umax,2=vmin,3=vmax) of each face
     faces the other -- the boundary-pair finder shared by match_surface,
@@ -364,11 +489,17 @@ def _nearest_facing_sides(face_a, face_b):
     for d, a, b in ranked:
         va, vb = da[a], db[b]
         if va is None or vb is None:
-            return a, b, face_a.ParameterRange, face_b.ParameterRange
+            # Can't establish this pair's edge directions -- SKIP it and
+            # keep evaluating the rest of the ranking rather than
+            # early-returning on the raw distance winner (which may be a
+            # transverse corner pair that folds the seam). If EVERY pair
+            # lacks a usable direction, the ranked[0] fallback below
+            # catches it.
+            continue
         try:
             align = abs(va.dot(vb))
         except Exception:
-            return a, b, face_a.ParameterRange, face_b.ParameterRange
+            continue
         # Orientation-agnostic: antiparallel edges are fine, transverse
         # ones fold the seam (exact G0, garbage G1/G2).
         if align >= 0.5:
@@ -547,6 +678,24 @@ def _side_uv_trimmed(face, pr, side, t, edge_cache):
     except Exception:
         return _side_uv(pr, side, t)
 
+
+
+def _seam_reversed(face_a, a_pr, sa, face_b, b_pr, sb, edge_cache):
+    """True when walking face_b's matched side with increasing t runs
+    OPPOSITE to face_a's (the two boundary parametrizations are
+    antiparallel). _nearest_facing_sides accepts antiparallel edge pairs,
+    but pairing sample t with sample t then connects opposite ends and
+    twists the strip; callers use tb = 1 - t when this is True."""
+    try:
+        a0 = face_a.valueAt(*_side_uv_trimmed(face_a, a_pr, sa, 0.0, edge_cache))
+        a1 = face_a.valueAt(*_side_uv_trimmed(face_a, a_pr, sa, 1.0, edge_cache))
+        b0 = face_b.valueAt(*_side_uv_trimmed(face_b, b_pr, sb, 0.0, edge_cache))
+        b1 = face_b.valueAt(*_side_uv_trimmed(face_b, b_pr, sb, 1.0, edge_cache))
+        same = a0.distanceToPoint(b0) + a1.distanceToPoint(b1)
+        rev = a0.distanceToPoint(b1) + a1.distanceToPoint(b0)
+        return rev < same
+    except Exception:
+        return False
 
 
 def _side_is_trimmed(face, pr, side, corner_tol_rel=1e-3):
@@ -844,6 +993,7 @@ __all__ = [
     '_trimmed_boundary_edge',
     '_side_uv_trimmed',
     '_side_is_trimmed',
+    '_seam_reversed',
     'rail_to_bspline',
     'rails_to_edges',
     '_clamped_knots',

@@ -329,10 +329,41 @@ class SurfacePanel(_EditPanelBase):
         sel = [o for o in _selected_objects() if o is not self.obj]
         if not sel or not self.groups:
             return
-        g = self.groups[0]
-        g.objs = list(sel)
-        g._refresh()
-        g._commit()
+
+        # Auto-sort tagged Profiles vs GuideRails if present
+        group_map = {g.prop: g for g in self.groups}
+        p_objs = [o for o in sel if parametric.get_curve_role(o) == "Profile"]
+        r_objs = [o for o in sel if parametric.get_curve_role(o) == "GuideRail"]
+
+        if (p_objs or r_objs) and any(k in group_map for k in ("Profiles", "Rails", "GuideRails", "UCurves", "VCurves")):
+            if "Profiles" in group_map:
+                group_map["Profiles"].objs = list(p_objs)
+                group_map["Profiles"]._refresh()
+                group_map["Profiles"]._commit()
+            elif "UCurves" in group_map:
+                group_map["UCurves"].objs = list(p_objs)
+                group_map["UCurves"]._refresh()
+                group_map["UCurves"]._commit()
+
+            target_rail_group = group_map.get("Rails") or group_map.get("GuideRails") or group_map.get("VCurves")
+            if target_rail_group is not None:
+                target_rail_group.objs = list(r_objs)
+                target_rail_group._refresh()
+                target_rail_group._commit()
+
+            untagged = [o for o in sel if o not in p_objs and o not in r_objs]
+            if untagged:
+                for g in self.groups:
+                    if not g.objs:
+                        g.objs = list(untagged)
+                        g._refresh()
+                        g._commit()
+                        break
+        else:
+            g = self.groups[0]
+            g.objs = list(sel)
+            g._refresh()
+            g._commit()
 
     def recompute(self, gui=True):
         if getattr(self, "live", None) is None or self.live.isChecked():
@@ -1102,9 +1133,20 @@ class LoftPanel(_EditPanelBase):
         if self.creating:
             sel = [o for o in _selected_objects() if o is not self.obj]
             if sel:
-                self.profiles.objs.extend(sel)
+                p_objs = [o for o in sel if parametric.get_curve_role(o) == "Profile"]
+                r_objs = [o for o in sel if parametric.get_curve_role(o) == "GuideRail"]
+                if p_objs or r_objs:
+                    self.profiles.objs.extend(p_objs)
+                    self.rails.objs.extend(r_objs)
+                    untagged = [o for o in sel if o not in p_objs and o not in r_objs]
+                    if untagged and not self.profiles.objs:
+                        self.profiles.objs.extend(untagged)
+                else:
+                    self.profiles.objs.extend(sel)
                 self.profiles._refresh()
                 self.profiles._commit()
+                self.rails._refresh()
+                self.rails._commit()
         self.recompute()
 
     # ---- build ---------------------------------------------------------- #

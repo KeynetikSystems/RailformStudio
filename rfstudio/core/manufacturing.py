@@ -50,6 +50,73 @@ def thicken_surface(shape, thickness, tol=1e-3, symmetric=False):
 
 
 
+def min_curvature_radius(shape, n=7):
+    """Smallest principal radius of curvature found on a n x n sample grid
+    of every face of `shape` (inf if flat / unavailable). Used to warn
+    that a thickness larger than this will make OCCT's offset fail on the
+    concave side."""
+    best = float("inf")
+    for face in getattr(shape, "Faces", []) or []:
+        try:
+            u0, u1, v0, v1 = face.ParameterRange
+        except Exception:
+            continue
+        for i in range(n):
+            for j in range(n):
+                u = u0 + (u1 - u0) * (i + 0.5) / n
+                v = v0 + (v1 - v0) * (j + 0.5) / n
+                try:
+                    k1, k2 = face.curvatureAt(u, v)
+                except Exception:
+                    continue
+                k = max(abs(k1), abs(k2))
+                if k > 1e-12:
+                    best = min(best, 1.0 / k)
+    return best
+
+
+THICKNESS_MODES = ("Outward", "Inward", "Symmetric")
+
+
+def thicken_checked(shape, thickness, mode="Outward", tol=1e-3):
+    """Non-destructive 'virtual thickness': returns (result, status).
+
+    `result` is the thickened SOLID, or `shape` unchanged when thickness
+    is ~0, the shape is already a solid, or the offset fails/produces an
+    invalid or empty solid -- the zero-thickness surface is never lost.
+    `status` is a short human string ("OK ...", "off", "failed: ...")
+    suitable for a read-only property.
+    """
+    t = abs(float(thickness))
+    if t < 1e-9:
+        return shape, "off"
+    if getattr(shape, "Solids", None):
+        return shape, "skipped: shape is already a solid"
+    if shape is None or shape.isNull() or not getattr(shape, "Faces", None):
+        return shape, "skipped: no faces"
+    mode = mode if mode in THICKNESS_MODES else "Outward"
+    warn = ""
+    rmin = min_curvature_radius(shape)
+    reach = t / 2.0 if mode == "Symmetric" else t
+    if reach >= rmin:
+        warn = " (warning: thickness %.4g >= min curvature radius %.4g)" % (reach, rmin)
+    try:
+        if mode == "Symmetric":
+            res = thicken_surface(shape, t, tol=tol, symmetric=True)
+        elif mode == "Inward":
+            res = thicken_surface(shape, -t, tol=tol)
+        else:
+            res = thicken_surface(shape, t, tol=tol)
+        if res is None or res.isNull() or not res.isValid():
+            return shape, "failed: invalid result" + warn
+        vol = abs(getattr(res, "Volume", 0.0))
+        if not res.Solids or vol < 1e-12:
+            return shape, "failed: empty result" + warn
+        return res, "OK t=%.4g %s%s" % (t, mode, warn)
+    except Exception as exc:
+        return shape, "failed: %s%s" % (exc, warn)
+
+
 def extend_surface(face, u_first=0, u_last=0, v_first=0, v_last=0, tol=1e-3):
     """Extend a surface in U and V parametric directions.
 
@@ -1050,6 +1117,9 @@ def boolean_intersect(shapes, refine=True):
 __all__ = [
     'offset_surface',
     'thicken_surface',
+    'min_curvature_radius',
+    'thicken_checked',
+    'THICKNESS_MODES',
     'extend_surface',
     'shell_solid',
     '_polyline_wire',

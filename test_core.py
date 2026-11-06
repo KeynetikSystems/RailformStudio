@@ -176,6 +176,33 @@ def test_gordon_unequal_lengths():
     out("  gordon uneven lens OK  area=%.2f" % s.Area)
 
 
+def test_gordon_consistent_crossing_selection():
+    """A multi-crossing network (an S-shaped curve meeting its partner on two
+    lobes) must not be snapped to the wrong lobe. _select_consistent_crossings
+    takes per-cell candidate crossings and must pick the lobe that keeps each
+    guide/profile monotone, instead of the plain min-gap pick that scrambles
+    the grid and folds the surface (Standard_ConstructionError). Pure selector
+    -- no geometry, just the candidate grid it is handed."""
+    from rfstudio.core import patches as P
+    # 3 profiles x 2 guides. profile 1 x guide 0 crosses twice: the min-gap
+    # (index-0) candidate is the WRONG lobe tv=0.9, the right lobe is tv=0.5.
+    cand = [
+        [[(0.1, 0.1, 0.0)], [(0.1, 0.1, 0.0)]],
+        [[(0.5, 0.9, 0.0), (0.5, 0.5, 0.001)], [(0.5, 0.5, 0.0)]],
+        [[(0.8, 0.8, 0.0)], [(0.8, 0.8, 0.0)]],
+    ]
+    _pu, pv, _dd = P._select_consistent_crossings(cand, [0, 1, 2], [0, 1])
+    col0 = [pv[i][0] for i in range(3)]
+    assert col0[0] < col0[1] < col0[2], ("guide 0 not monotone", col0)
+    assert abs(col0[1] - 0.5) < 1e-9, ("picked the wrong lobe", col0)
+    # a clean single-crossing net must be returned unchanged (min-gap pick)
+    clean = [[[(0.0, 0.2, 0.0)], [(0.0, 0.7, 0.0)]],
+             [[(0.0, 0.3, 0.0)], [(0.0, 0.6, 0.0)]]]
+    _pu2, pv2, _dd2 = P._select_consistent_crossings(clean, [0, 1], [0, 1])
+    assert pv2 == [[0.2, 0.7], [0.3, 0.6]], pv2
+    out("  gordon xselect     OK  S-curve lobe fixed (tv=0.5); clean net kept")
+
+
 # ---- Gordon: honours curve direction (Z-fold is the user's signal) ------
 
 def test_gordon_preserves_user_direction():
@@ -1286,20 +1313,22 @@ def test_snaputil_magnet_lets_body_contact_beat_control_point():
     geometrically closer. Runs the REAL ranked-snap paths via the fake view."""
     from rfstudio import snaputil
     view = _FakeOrthoView()           # screen == world xy, 1 unit == 1 px
-    line = Part.Edge(Part.LineSegment(Vector(0, 0, 0), Vector(10, 0, 0)))
+    line = Part.Edge(Part.LineSegment(Vector(0, 0, 0), Vector(20, 0, 0)))
 
-    # (1) body contact beats a control point: cursor on the line at x=5, a
-    # control point 6px above. Edge projects to (5,0) at 0px -> edge wins.
+    # (1) body contact beats a control point: cursor on the line at x=10, a
+    # control point 6px above, the far endpoint 10px away (OUTSIDE the inner
+    # magnet radius, MAGNET_FRACTION*18 = 9px). Edge projects to (10,0) at
+    # 0px -> edge wins.
     strong = [(Vector(0, 0, 0), snaputil.SNAP_VERTEX)]   # far endpoint
-    weak = [Vector(5, 6, 0)]
+    weak = [Vector(10, 6, 0)]
     pt, kind = snaputil.nearest_snap_ranked_kind(
-        view, strong + [(weak[0], snaputil.SNAP_CONTROL)], [line], (5, 0), 18)
+        view, strong + [(weak[0], snaputil.SNAP_CONTROL)], [line], (10, 0), 18)
     assert kind == snaputil.SNAP_EDGE, kind
-    assert pt.distanceToPoint(Vector(5, 0, 0)) < 1e-6, pt
+    assert pt.distanceToPoint(Vector(10, 0, 0)) < 1e-6, pt
     # non-kinded ranker, same scenario via weak_points
     pt2 = snaputil.nearest_snap_ranked(
-        view, [Vector(0, 0, 0)], [line], (5, 0), 18, weak_points=weak)
-    assert pt2.distanceToPoint(Vector(5, 0, 0)) < 1e-6, pt2
+        view, [Vector(0, 0, 0)], [line], (10, 0), 18, weak_points=weak)
+    assert pt2.distanceToPoint(Vector(10, 0, 0)) < 1e-6, pt2
 
     # (2) endpoint stays sticky inside the magnet: cursor 2px from the end,
     # still on the line (edge dist ~0) -> the endpoint must win, not the edge.
@@ -1560,6 +1589,117 @@ def test_nearest_facing_sides_prefers_parallel_edges():
     out("  facing sides      OK  sides=(%d,%d) align=%.3f" % (sa, sb, align))
 
 
+def _blend_test_patch(x0, x1, flip_v=False):
+    """Gentle curved 7x5 interpolated patch spanning x0..x1, y 0..10."""
+    import math as _m
+    g = []
+    for i in range(7):
+        x = x0 + (x1 - x0) * i / 6.0
+        row = [Vector(x, 10.0 * j / 4.0,
+                      0.004 * x ** 3 + 0.3 * _m.sin(10.0 * j / 4.0 * 0.4))
+               for j in range(5)]
+        if flip_v:
+            row.reverse()
+        g.append(row)
+    return core.grid_to_surface(g).Faces[0]
+
+
+def test_blend_surface_antiparallel_edges_not_twisted():
+    """Edges with opposite parametrization direction must still be paired
+    end-to-end (strip area equals the parallel case), not crossed."""
+    a = _blend_test_patch(0, 10)
+    same = core.blend_surface(a, _blend_test_patch(14, 24), "G1").Faces[0]
+    flip = core.blend_surface(a, _blend_test_patch(14, 24, True), "G1").Faces[0]
+    assert abs(flip.Area - same.Area) / same.Area < 0.02, (flip.Area, same.Area)
+    out("  blend antiparallel OK  area flip=%.2f same=%.2f" % (flip.Area, same.Area))
+
+
+def test_blend_surface_g2_is_curvature_continuous():
+    """QA's graded g2 is intrinsic: a G2 blend reads far below a G1 blend
+    and classifies as G2 on both seams."""
+    a, b = _blend_test_patch(-10, 0), _blend_test_patch(3, 13)
+    g1 = core.blend_surface(a, b, "G1").Faces[0]
+    g2 = core.blend_surface(a, b, "G2").Faces[0]
+    r1 = core.surface_deviation(a, g1)
+    r2 = core.surface_deviation(a, g2)
+    assert r2["max_g1_deg"] < 0.01 and r2["max_g2"] < 2e-3, r2["max_g2"]
+    assert r2["max_g2"] < 0.2 * r1["max_g2"], (r1["max_g2"], r2["max_g2"])
+    out("  blend G2 intrinsic OK  g2(G1)=%.4f g2(G2)=%.5f"
+        % (r1["max_g2"], r2["max_g2"]))
+
+
+def test_match_surface_far_tangent_and_g2_stable():
+    """match_surface must not overshoot its far edge when the target's
+    near side is a max side (far-end tangent sign), and a G2 request on an
+    already-G2 continuation must stay close to it, not blow up."""
+    ref_l, tgt_r = _blend_test_patch(-10, 0), _blend_test_patch(0, 10)
+    ref_r, tgt_l = _blend_test_patch(0, 10), _blend_test_patch(-10, 0)
+    r = core.match_surface(ref_r, tgt_l, "G1", n=16).Faces[0]
+    assert r.BoundBox.XMin > -10.0 - 1e-3, r.BoundBox.XMin
+    r2 = core.match_surface(ref_l, tgt_r, "G2", n=16).Faces[0]
+    assert abs(r2.Area - tgt_r.Area) / tgt_r.Area < 0.05, (r2.Area, tgt_r.Area)
+    rep = core.surface_deviation(ref_l, r2)
+    assert rep["max_g1_deg"] < 0.1 and rep["max_g2"] < 1e-2, rep["max_g2"]
+    out("  match far tangent OK  xmin=%.3f area=%.2f/%.2f"
+        % (r.BoundBox.XMin, r2.Area, tgt_r.Area))
+
+
+def test_match_surface_exact_abutting_does_not_fold():
+    """Exact matchers on ABUTTING patches must keep the target on its own
+    side of the seam (reflected rows), not fold it back over the reference.
+    The identical-planes tests can't see this (coincident geometry)."""
+    ref = _blend_test_patch(-10, 0)
+    tgt = _blend_test_patch(0, 10)
+    for fn in (core.match_surface_exact_g1, core.match_surface_exact_g2):
+        f = fn(ref, tgt).Faces[0]
+        assert f.BoundBox.XMin > -1e-6, (fn.__name__, f.BoundBox.XMin)
+        assert abs(f.Area - tgt.Area) / tgt.Area < 0.05, (fn.__name__, f.Area)
+    out("  match exact abutting OK  (no fold-back)")
+
+
+def test_surface_feature_virtual_thickness():
+    """Every free-form surface feature carries Thickness/ThicknessMode/
+    ThicknessStatus: 0 leaves the plain surface, >0 builds a solid from it
+    on recompute without compounding, and going back to 0 restores the
+    surface."""
+    from rfstudio import parametric
+    doc = FreeCAD.newDocument("thick_test")
+    try:
+        def arc(p0, p1):
+            m = (p0 + p1) * 0.5 + Vector(0, 0, 2)
+            o = doc.addObject("Part::Feature", "e")
+            o.Shape = Part.Arc(p0, m, p1).toShape()
+            return o
+        a, b, c, d = Vector(0, 0, 0), Vector(20, 0, 0), Vector(20, 20, 0), Vector(0, 20, 0)
+        f = parametric.make_surface("Coons", doc)
+        f.Boundaries = [arc(a, b), arc(b, c), arc(c, d), arc(d, a)]
+        doc.recompute()
+        assert not f.Shape.Solids and f.ThicknessStatus == "off"
+        area = f.Shape.Area
+        vols = {}
+        for mode in ("Outward", "Inward", "Symmetric"):
+            f.Thickness = 1.0
+            f.ThicknessMode = mode
+            doc.recompute()
+            assert len(f.Shape.Solids) == 1 and f.Shape.isValid(), (mode, f.ThicknessStatus)
+            assert f.ThicknessStatus.startswith("OK"), f.ThicknessStatus
+            vols[mode] = f.Shape.Volume
+        assert 0.9 * area < vols["Outward"] < 1.2 * area, (vols, area)
+        f.touch(); doc.recompute()
+        assert abs(f.Shape.Volume - vols["Symmetric"]) < 1e-6      # no compounding
+        f.Thickness = 0.0
+        doc.recompute()
+        assert not f.Shape.Solids and abs(f.Shape.Area - area) < 1e-6
+        for kind in ("Loft", "Gordon", "Sweep", "SweepN", "Fill", "Match",
+                     "ExtendSurf", "BlendSurf", "BlendSurfClosed", "N_sidedPatch"):
+            o = parametric.make_surface(kind, doc)
+            assert "Thickness" in o.PropertiesList, kind
+        out("  virtual thickness  OK  vol out/in/sym=%.1f/%.1f/%.1f"
+            % (vols["Outward"], vols["Inward"], vols["Symmetric"]))
+    finally:
+        FreeCAD.closeDocument(doc.Name)
+
+
 def test_match_surface_exact_g2_curved_reference():
     """Load-bearing G2 test on CURVED geometry: planes have zero
     curvature everywhere, so G2 holds trivially on plane-plane seams
@@ -1743,11 +1883,16 @@ def test_match_surface_exact_g1_with_locally_refined_neighbor():
     differing-but-compatible knot vectors. Fixed so only a genuine
     parameter-range mismatch (see the incompatible-boundaries test above)
     still raises."""
-    grid = [[Vector(x, y, 0.4 * math.sin(x)) for y in range(4)] for x in range(4)]
+    # ABUTTING neighbours (ref x -3..0, tgt x 0..3, one smooth function):
+    # the exact matchers reflect rows through the seam, so a coincident
+    # duplicate is no longer a meaningful setup.
+    def _grid(x0):
+        return [[Vector(x0 + x, y, 0.4 * math.sin(x0 + x)) for y in range(4)]
+                for x in range(4)]
     ref_s = Part.BSplineSurface()
-    ref_s.interpolate(grid)
+    ref_s.interpolate(_grid(-3))
     tgt_s = Part.BSplineSurface()
-    tgt_s.interpolate(grid)
+    tgt_s.interpolate(_grid(0))
     # insert an extra interior knot on the target only, along the axis
     # that will run ALONG the shared edge once matched -- simulates a
     # locally-refined neighbor patch, not a from-scratch different shape.
@@ -3447,6 +3592,52 @@ def test_bezier_curvature_jerk_analytics():
     out("  bezier curvature/jerk analytics OK")
 
 
+def test_bezier_handle_constraints_mirrored_and_vector():
+    """Verify Blender/Illustrator-style handle constraints:
+    - Mirrored: collinear (180 deg) AND equal length
+    - Vector: handles point toward adjacent neighbors
+    - Aligned: collinear (180 deg) with independent lengths
+    """
+    from FreeCAD import Vector
+    from rfstudio.core.io import enforce_bezier_handle_constraints
+
+    pts = [Vector(0, 0, 0), Vector(10, 0, 0), Vector(20, 10, 0)]
+    lh = [Vector(-2, 0, 0), Vector(7, -3, 0), Vector(18, 10, 0)]
+    rh = [Vector(2, 0, 0), Vector(13, 3, 0), Vector(22, 10, 0)]
+    types = ["Auto", "Mirrored", "Auto"]
+
+    # Test Mirrored: drag left handle at point 1 to (6, 0, 0) -> dist = 4.0
+    lh[1] = Vector(6, 0, 0)
+    enforce_bezier_handle_constraints(1, "left", lh, rh, types, pts)
+    # Right handle should be reflected across (10, 0, 0) with equal length 4.0 -> (14, 0, 0)
+    assert (rh[1] - Vector(14, 0, 0)).Length < 1e-9, rh[1]
+    assert abs((lh[1] - pts[1]).Length - (rh[1] - pts[1]).Length) < 1e-9
+
+    # Test Vector: handles point toward neighbors
+    types[1] = "Vector"
+    enforce_bezier_handle_constraints(1, "left", lh, rh, types, pts)
+    # Left handle should point toward pts[0] (0, 0, 0), i.e. in -X direction from pts[1]
+    v_left = (lh[1] - pts[1]).normalize()
+    assert (v_left - Vector(-1, 0, 0)).Length < 1e-9, v_left
+    # Right handle should point toward pts[2] (20, 10, 0)
+    v_right = (rh[1] - pts[1]).normalize()
+    expected_v_right = (pts[2] - pts[1]).normalize()
+    assert (v_right - expected_v_right).Length < 1e-9, v_right
+
+    # Test Aligned: opposite directions, independent lengths
+    types[1] = "Aligned"
+    lh[1] = pts[1] + Vector(-3, -4, 0)  # len = 5
+    rh[1] = pts[1] + Vector(10, 0, 0)   # len = 10
+    enforce_bezier_handle_constraints(1, "left", lh, rh, types, pts)
+    # Right handle should point opposite to (lh[1] - pts[1]) while keeping its length 10
+    expected_rh_dir = (pts[1] - lh[1]).normalize()
+    actual_rh_dir = (rh[1] - pts[1]).normalize()
+    assert (actual_rh_dir - expected_rh_dir).Length < 1e-9, actual_rh_dir
+    assert abs((rh[1] - pts[1]).Length - 10.0) < 1e-9
+
+    out("  bezier mirrored & vector handles OK")
+
+
 def test_rail_roundtrip_clamped():
     rail = {"degree": 3,
             "poles": [[0, 0, 0], [3, 5, 0], [7, 5, 0], [10, 0, 0]],
@@ -3743,10 +3934,118 @@ def test_mirror_shape():
     out("  mirror_shape        OK")
 
 
+def test_interpolate_curve_parameterizations():
+    # Unevenly spaced points where uniform parameterization exhibits overshoot
+    pts = [Vector(0, 0, 0), Vector(1, 0, 0), Vector(1.5, 0.5, 0), Vector(10, 0, 0)]
+    s_centripetal = core.interpolate_curve(pts, parameterization="centripetal")
+    s_chord = core.interpolate_curve(pts, parameterization="chord")
+    s_uniform = core.interpolate_curve(pts, parameterization="uniform")
+
+    assert s_centripetal is not None and len(s_centripetal.Edges) == 1
+    assert s_chord is not None and len(s_chord.Edges) == 1
+    assert s_uniform is not None and len(s_uniform.Edges) == 1
+
+    # Centripetal arc length is tighter (less overshoot loop) than uniform
+    l_centripetal = s_centripetal.Edges[0].Length
+    l_uniform = s_uniform.Edges[0].Length
+    assert l_centripetal < l_uniform, "Centripetal length (%f) should be less than uniform (%f)" % (l_centripetal, l_uniform)
+
+    # Periodic / closed test
+    closed_pts = [Vector(0, 0, 0), Vector(2, 0, 0), Vector(2, 2, 0), Vector(0, 2, 0)]
+    s_closed = core.interpolate_curve(closed_pts, closed=True, parameterization="centripetal")
+    assert s_closed is not None and len(s_closed.Edges) == 1
+    out("  interpolate_curve_parameterizations OK")
+
+
+def test_elevate_curve_degree_preserves_geometry():
+    poles = [Vector(0, 0, 0), Vector(2, 4, 1), Vector(6, 4, -1), Vector(8, 0, 0)]
+    c_orig = core.control_poly_curve(poles, degree=3)
+    e_orig = c_orig.Edges[0]
+    orig_curve = e_orig.Curve
+
+    # Elevate degree 3 -> 4
+    res = core.elevate_curve_degree(e_orig, target_degree=4)
+    assert res["degree"] == 4
+    assert len(res["poles"]) == 5
+    e_elev = res["shape"].Edges[0]
+    elev_curve = e_elev.Curve
+
+    # Geometry preservation check: sample points across [FirstParameter, LastParameter]
+    u_first = orig_curve.FirstParameter
+    u_last = orig_curve.LastParameter
+    for i in range(21):
+        u = u_first + (u_last - u_first) * (i / 20.0)
+        p_orig = orig_curve.value(u)
+        p_elev = elev_curve.value(u)
+        diff = (p_orig - p_elev).Length
+        assert diff < 1e-12, "Degree elevation altered geometry at u=%f (diff=%e)" % (u, diff)
+
+    # Consecutive elevation 4 -> 5
+    res2 = core.elevate_curve_degree(e_elev, target_degree=5)
+    assert res2["degree"] == 5
+    assert len(res2["poles"]) == 6
+    out("  elevate_curve_degree_preserves_geometry OK")
+
+
+def test_fair_curve_reduces_strain_energy():
+    # Baseline line with a sharp wobble / bump in the middle
+    pts = [
+        Vector(0, 0, 0),
+        Vector(1, 0, 0),
+        Vector(2, 2.5, 0),  # wobble
+        Vector(3, -1.5, 0), # wobble
+        Vector(4, 0, 0),
+        Vector(5, 0, 0),
+    ]
+
+    def strain_energy(plist):
+        se = 0.0
+        for i in range(1, len(plist) - 1):
+            d2 = plist[i - 1] - plist[i] * 2.0 + plist[i + 1]
+            se += d2.Length ** 2
+        return se
+
+    e_init = strain_energy(pts)
+    faired = core.fair_curve(pts, iterations=10, strength=0.5, fix_endpoints=True, energy="strain")
+    e_faired = strain_energy(faired)
+
+    # Endpoints strictly preserved
+    assert (faired[0] - pts[0]).Length < 1e-9
+    assert (faired[-1] - pts[-1]).Length < 1e-9
+    # Strain energy strictly decreased
+    assert e_faired < e_init * 0.25, "Faired energy (%f) should be significantly lower than initial (%f)" % (e_faired, e_init)
+
+    # Also test jerk minimization
+    faired_jerk = core.fair_curve(pts, iterations=8, strength=0.5, fix_endpoints=True, energy="jerk")
+    assert (faired_jerk[0] - pts[0]).Length < 1e-9
+    assert (faired_jerk[-1] - pts[-1]).Length < 1e-9
+    out("  fair_curve_reduces_strain_energy OK")
+
+
+def test_curve_role_tagging():
+    import FreeCAD
+    from rfstudio import parametric
+    doc = FreeCAD.ActiveDocument or FreeCAD.newDocument("TestRoleDoc")
+    c1 = parametric.make_curve("InterpCurve", doc=doc)
+    assert parametric.get_curve_role(c1) == "None"
+
+    parametric.set_curve_role(c1, "Profile")
+    assert parametric.get_curve_role(c1) == "Profile"
+
+    c2 = parametric.make_curve("ControlCurve", doc=doc)
+    parametric.set_curve_role(c2, "GuideRail")
+    assert parametric.get_curve_role(c2) == "GuideRail"
+
+    parametric.set_curve_role(c1, "None")
+    assert parametric.get_curve_role(c1) == "None"
+    out("  curve_role_tagging OK")
+
+
 if __name__ == "__main__" or True:  # freecadcmd may not set __main__
     for t in (test_loft_fallback, test_coons_patch,
               test_gordon_rectangular_3x3, test_gordon_rectangular_5x5,
               test_gordon_angled_network, test_gordon_unequal_lengths,
+              test_gordon_consistent_crossing_selection,
               test_gordon_preserves_user_direction,
               test_gordon_too_few_curves,
               test_gordon_rails_pass_through,
@@ -3814,6 +4113,7 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_wire_corner_chamfer_open_polyline,
               test_sketch3d_wire_bezier_run,
               test_bezier_curvature_jerk_analytics,
+              test_bezier_handle_constraints_mirrored_and_vector,
               test_report_single_points_of_failure,
               test_match_surface_exact_g1_identical_planes,
               test_match_surface_exact_g1_incompatible_raises,
@@ -3822,6 +4122,11 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_match_surface_exact_g2_incompatible_raises,
               test_match_surface_to_references_reports_exact_g2,
               test_nearest_facing_sides_prefers_parallel_edges,
+              test_blend_surface_antiparallel_edges_not_twisted,
+              test_blend_surface_g2_is_curvature_continuous,
+              test_match_surface_far_tangent_and_g2_stable,
+              test_match_surface_exact_abutting_does_not_fold,
+              test_surface_feature_virtual_thickness,
               test_match_surface_fp_execute_uses_references,
               test_match_surface_to_references_prefers_exact_g1,
               test_match_surface_to_references_reports_method,
@@ -3909,7 +4214,11 @@ if __name__ == "__main__" or True:  # freecadcmd may not set __main__
               test_plane_base_normal,
               test_mirror_point,
               test_find_symmetric_pairs,
-              test_mirror_shape):
+              test_mirror_shape,
+              test_interpolate_curve_parameterizations,
+              test_elevate_curve_degree_preserves_geometry,
+              test_fair_curve_reduces_strain_energy,
+              test_curve_role_tagging):
         try:
             t()
         except Exception as e:
