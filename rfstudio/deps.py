@@ -16,16 +16,18 @@ Curves' command ids registered until the user visits it once.
 """
 
 import os
+from typing import Dict, Set
+
 import FreeCAD
 
 # Mod folder name -> (workbench registration name used by activateWorkbench)
-ENGINES = {
+ENGINES: Dict[str, str] = {
     "Curves": "CurvesWorkbench",
 }
 
 
-def _mod_roots():
-    roots = []
+def _mod_roots() -> list[str]:
+    roots: list[str] = []
     for getter in ("getUserAppDataDir", "getResourceDir", "getHomePath"):
         try:
             d = getattr(FreeCAD, getter)()
@@ -36,22 +38,22 @@ def _mod_roots():
     return roots
 
 
-def installed(mod_name):
+def installed(mod_name: str) -> bool:
     """True if a Mod/<mod_name> folder exists in any FreeCAD mod root.
     Gui-free, so it works under freecadcmd too."""
     return any(os.path.isdir(os.path.join(r, mod_name)) for r in _mod_roots())
 
 
-def status():
+def status() -> Dict[str, bool]:
     """{'Curves': bool} -- which optional engines are present."""
     return {name: installed(name) for name in ENGINES}
 
 
 # --- lazy command registration (GUI only) --------------------------------- #
-_loaded = set()
+_loaded: Set[str] = set()
 
 
-def ensure_engine_commands(mod_name):
+def ensure_engine_commands(mod_name: str) -> None:
     """Force <mod_name>'s commands to register by bouncing its workbench once.
 
     Activating a workbench runs its Initialize() (-> addCommand). We flip to the
@@ -73,13 +75,13 @@ def ensure_engine_commands(mod_name):
             % (mod_name, exc))
 
 
-def command_available(cmd_id):
+def command_available(cmd_id: str) -> bool:
     """True if a command id is currently registered with the Gui."""
     import FreeCADGui
     return cmd_id in FreeCADGui.listCommands()
 
 
-def verify_delegations(delegations):
+def verify_delegations(delegations: Dict[str, tuple[str, str]]) -> list[tuple[str, str, str]]:
     """Check every curated delegation up front and return the broken ones.
 
     Without this, a renamed/removed upstream command (e.g. Curves dropping
@@ -103,9 +105,8 @@ def verify_delegations(delegations):
     were loaded. Delegations whose engine isn't installed at all are
     skipped (that's already reported separately by `status()`).
     """
-    broken = []
-    mods_needed = {mod for mod, _target in delegations.values()
-                   if installed(mod)}
+    broken: list[tuple[str, str, str]] = []
+    mods_needed = {mod for mod, _target in delegations.values() if installed(mod)}
     for mod in mods_needed:
         ensure_engine_commands(mod)
     for cmd_id, (mod, target) in delegations.items():
@@ -122,7 +123,7 @@ def verify_delegations(delegations):
     return broken
 
 
-def report_single_points_of_failure(providers):
+def report_single_points_of_failure(providers: Dict[str, list[tuple]]) -> list[str]:
     """Curated actions whose ENTIRE provider chain (engines.PROVIDERS) is
     engine-only, with no native fallback -- i.e. if the optional Curves
     engine drops or renames that command, the button is permanently dead

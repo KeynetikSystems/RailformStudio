@@ -12,13 +12,27 @@ There is no Silk dependency any more: every Silk-backed action
 module and runs entirely from OCCT.
 """
 
+from typing import Any, Callable, Literal, Optional
+import sys
+
 import FreeCAD
 
 from rfstudio import deps
 from rfstudio import groups
 
+# Type aliases for provider chains
+ProviderKind = Literal["engine", "native"]
+EngineProvider = tuple[Literal["engine"], str, str]
+NativeProvider = tuple[Literal["native"], str]
+Provider = EngineProvider | NativeProvider
+ProviderChain = list[Provider]
+ProvidersDict = dict[str, ProviderChain]
+DelegationsDict = dict[str, tuple[str, str]]
 
-def run_engine_command(mod_name, cmd_id):
+NativeProviderName = str
+
+
+def run_engine_command(mod_name: str, cmd_id: str) -> bool:
     """Pre-load <mod_name>'s commands then run <cmd_id>. Returns True if fired."""
     import FreeCADGui
     if not deps.installed(mod_name):
@@ -50,7 +64,7 @@ def run_engine_command(mod_name, cmd_id):
 # deps.verify_delegations() for the startup health check -- but it is no
 # longer the *only* way to satisfy an action; see PROVIDERS below.
 # NOTE: this is now a CURVES-ONLY fallback map.
-DELEGATIONS = {
+DELEGATIONS: DelegationsDict = {
     # ---- Surface --------------------------------------------------------
     "RFS_BlendSurf":    ("Curves", "Curves_BlendSurf2"),
     "RFS_Trim":         ("Curves", "Trim"),
@@ -94,7 +108,7 @@ DELEGATIONS = {
 # falls through to the still-installed engine command instead of silently
 # doing nothing -- see the "silent no-op" discussion in the project SWOT
 # for why that distinction matters.
-NATIVE_OVERRIDES = {
+NATIVE_OVERRIDES: ProvidersDict = {
     "RFS_MultiLoft":    [("native", "native_multiloft")],
     "RFS_Trim":         [("native", "native_trim"),
                          ("engine", "Curves", "Trim")],
@@ -122,10 +136,12 @@ NATIVE_OVERRIDES["RFS_BooleanIntersect"] = [("native", "native_boolean_intersect
 NATIVE_OVERRIDES["RFS_MeshToSurface"] = [("native", "native_mesh_to_surface")]
 NATIVE_OVERRIDES["RFS_HiddenLineExport"] = [
     ("native", "native_hidden_line_export")]
+NATIVE_OVERRIDES["RFS_TagProfile"] = [("native", "native_tag_profile")]
+NATIVE_OVERRIDES["RFS_TagRail"] = [("native", "native_tag_rail")]
 
 
-def _build_providers():
-    chains = {}
+def _build_providers() -> ProvidersDict:
+    chains: ProvidersDict = {}
     for cmd_id, (mod, target) in DELEGATIONS.items():
         chains[cmd_id] = NATIVE_OVERRIDES.get(cmd_id, [("engine", mod, target)])
     for cmd_id, chain in NATIVE_OVERRIDES.items():
@@ -133,10 +149,10 @@ def _build_providers():
     return chains
 
 
-PROVIDERS = _build_providers()
+PROVIDERS: ProvidersDict = _build_providers()
 
 
-def missing_engine_for(cmd_id):
+def missing_engine_for(cmd_id: str) -> Optional[str]:
     """Name of the engine a curated command NEEDS but which isn't
     installed, or None if the command can run right now.
 
@@ -154,7 +170,7 @@ def missing_engine_for(cmd_id):
     chain = PROVIDERS.get(cmd_id)
     if not chain:
         return None
-    needed = None
+    needed: Optional[str] = None
     for p in chain:
         if p[0] == "native":
             return None
@@ -167,7 +183,7 @@ def missing_engine_for(cmd_id):
     return needed
 
 
-def _add_feature_with_undo(doc, label, shape):
+def _add_feature_with_undo(doc: Any, label: str, shape: Any) -> Any:
     """Add a Part::Feature carrying `shape`, wrapped in an undo transaction
     so Ctrl+Z reverts the creation. Raises on failure (transaction aborted)."""
     doc.openTransaction("Railform Studio: " + label)
@@ -185,7 +201,7 @@ def _add_feature_with_undo(doc, label, shape):
     return obj
 
 
-def _with_undo(doc, label, fn):
+def _with_undo(doc: Any, label: str, fn: Callable[[], Any]) -> Any:
     """Run `fn` inside an undo transaction so Ctrl+Z reverts its document
     mutations (object creation, Shape changes, group membership, etc.).
     Raises on failure (transaction aborted)."""
@@ -203,7 +219,7 @@ def _with_undo(doc, label, fn):
 
 
 # --- native providers ------------------------------------------------------ #
-def native_multiloft():
+def native_multiloft() -> None:
     """Native provider for RFS_MultiLoft.
 
     This is the first concrete instance of "fix the no-native-fallback
@@ -227,7 +243,7 @@ def native_multiloft():
     FreeCADGui.Control.showDialog(taskpanels.LoftPanel())
 
 
-def _face_and_wire_from_selection(need_label):
+def _face_and_wire_from_selection(need_label: str) -> tuple[Any, Any]:
     """Shared selection parsing for native_trim / native_sketch_on_surf:
     exactly one face and at least one edge (chained into a wire) selected.
     Raises ValueError (not a silent return) on anything else, so the
@@ -256,7 +272,7 @@ def _face_and_wire_from_selection(need_label):
     return face, wire
 
 
-def native_trim():
+def native_trim() -> None:
     """Native provider for RFS_Trim -- opens the guided TrimSoSPanel (Face /
     boundary-curve slots) rather than firing blind off the current
     selection, matching native_blend_surface's panel pattern. The panel
@@ -266,7 +282,7 @@ def native_trim():
     _open_trim_sos_panel("Trim")
 
 
-def _open_trim_sos_panel(mode):
+def _open_trim_sos_panel(mode: str) -> None:
     import FreeCAD
     import FreeCADGui
     from rfstudio import taskpanels
@@ -280,7 +296,7 @@ def _open_trim_sos_panel(mode):
     FreeCADGui.Control.showDialog(taskpanels.TrimSoSPanel(mode=mode))
 
 
-def native_blend_surface():
+def native_blend_surface() -> None:
     """Native provider for RFS_BlendSurf -- replaces the previously
     pure-Curves delegation (Curves_BlendSurf2) with core.blend_surface,
     the quintic-Hermite cross-section skin already used by match_surface.
@@ -300,7 +316,7 @@ def native_blend_surface():
     FreeCADGui.Control.showDialog(taskpanels.BlendSurfPanel())
 
 
-def native_sketch_on_surf():
+def native_sketch_on_surf() -> None:
     """Native provider for RFS_SketchOnSurf -- opens the guided TrimSoSPanel
     (target Face / curve-to-project slots) rather than firing blind off the
     current selection. The panel calls core.project_wire_onto_face
@@ -310,28 +326,28 @@ def native_sketch_on_surf():
 
 
 # --- booleans / mesh-to-surface / hidden-line drafting export ------------ #
-def native_boolean_union():
+def native_boolean_union() -> None:
     """Native provider for RFS_BooleanUnion -- opens BooleanPanel
     pre-set to Union. Wraps core.boolean_union (Part.Shape.fuse,
     chained)."""
     _open_boolean_panel("Union")
 
 
-def native_boolean_subtract():
+def native_boolean_subtract() -> None:
     """Native provider for RFS_BooleanSubtract -- opens BooleanPanel
     pre-set to Subtract. Wraps core.boolean_subtract (Part.Shape.cut,
     chained)."""
     _open_boolean_panel("Subtract")
 
 
-def native_boolean_intersect():
+def native_boolean_intersect() -> None:
     """Native provider for RFS_BooleanIntersect -- opens BooleanPanel
     pre-set to Intersect. Wraps core.boolean_intersect
     (Part.Shape.common, chained)."""
     _open_boolean_panel("Intersect")
 
 
-def _open_boolean_panel(operation):
+def _open_boolean_panel(operation: str) -> None:
     import FreeCAD
     import FreeCADGui
     from rfstudio import taskpanels
@@ -345,7 +361,7 @@ def _open_boolean_panel(operation):
     FreeCADGui.Control.showDialog(taskpanels.BooleanPanel(operation=operation))
 
 
-def native_mesh_to_surface():
+def native_mesh_to_surface() -> None:
     """Native provider for RFS_MeshToSurface -- opens MeshToSurfacePanel
     (Source mesh/point object / grid resolution / projection normal).
     Wraps core.fit_surface_to_scan; see that function's docstring for
@@ -363,7 +379,7 @@ def native_mesh_to_surface():
     FreeCADGui.Control.showDialog(taskpanels.MeshToSurfacePanel())
 
 
-def native_hidden_line_export():
+def native_hidden_line_export() -> None:
     """Native provider for RFS_HiddenLineExport -- opens
     HiddenLineExportPanel (Sources / projection direction / Export SVG
     button). Wraps core.hidden_line_projection + core.export_svg_drawing."""
@@ -380,7 +396,38 @@ def native_hidden_line_export():
     FreeCADGui.Control.showDialog(taskpanels.HiddenLineExportPanel())
 
 
-def validate_providers(providers=None, engines_module=None):
+def native_tag_profile() -> None:
+    """Tag selected curve(s) as Profile role for surface loft/sweep auto-seeding."""
+    import FreeCADGui
+    from rfstudio import parametric, statusbar
+    sel = FreeCADGui.Selection.getSelection()
+    if not sel:
+        statusbar.flash("Tag Profile: select one or more curves first", error=True)
+        return
+    count = 0
+    for obj in sel:
+        parametric.set_curve_role(obj, "Profile")
+        count += 1
+    statusbar.flash("Tagged %d curve(s) as Profile (Blue)" % count)
+
+
+def native_tag_rail() -> None:
+    """Tag selected curve(s) as Guide Rail role for surface loft/sweep auto-seeding."""
+    import FreeCADGui
+    from rfstudio import parametric, statusbar
+    sel = FreeCADGui.Selection.getSelection()
+    if not sel:
+        statusbar.flash("Tag Guide Rail: select one or more curves first", error=True)
+        return
+    count = 0
+    for obj in sel:
+        parametric.set_curve_role(obj, "GuideRail")
+        count += 1
+    statusbar.flash("Tagged %d curve(s) as Guide Rail (Amber)" % count)
+
+
+def validate_providers(providers: ProvidersDict | None = None, 
+                       engines_module: Any = None) -> list[str]:
     """Static sanity check of the provider-chain wiring, runnable
     headlessly (no FreeCADGui needed) so it can be exercised by
     test_core.py and catches dead buttons at test time instead of at
