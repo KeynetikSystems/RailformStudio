@@ -10,6 +10,8 @@ fresh `Unreleased` section above it.
 
 ## Unreleased
 
+## 0.1.1 - 2026-11-07
+
 ### Added (Section extraction)
 - `core.extract_iso_curves` + **Extract sections** (`RFS_ExtractSections`): live cross-section (constant-U) or rail-wise (constant-V) curves from any sweep, loft or pipe; even in parameter or arc length, optional end curves. **Sections to curves** (`RFS_SectionCurves`) splits them into live `SectionCurve` objects tagged Profile / GuideRail for Loft / SweepN. Round trip through the N-rail sweep is exact (~1e-5) for 3+ rails.
 
@@ -22,7 +24,6 @@ fresh `Unreleased` section above it.
 - `_rail_tangent` took an ARC FRACTION as a curve parameter; on a chord-length-parametrized rail the tangent was up to ~20 deg off the spine. It now maps through the arc table.
 - **2-rail / N-rail sweep with several profiles**: the profile-direction test compared nearest-point parameters and could reverse a correctly oriented profile on non-parallel rails (bulge mirrored, ~4 mm error in a 40 mm test). Now decided by which end lies on which rail (`_profile_runs_far_to_base`), parameters only as a tie-break. Shared with the non-Gordon multi-rail path.
 
-## 0.1.1 - 2026-11-06
 
 ### Fixed (Surface blend / match correctness)
 - `blend_surface` / `match_surface` now pair antiparallel boundary edges end-to-end (`_seam_reversed`) instead of twisting the strip; the exact G1/G2 matchers refuse such pairs and fall back to the sampled path.

@@ -3,7 +3,7 @@
   <name>Railform Studio</name>
   <description>Curated curve-to-surface workbench for automotive-grade modeling. Ships native OCCT implementations of every curated action, so it runs fully standalone; the Curves workbench is an optional fallback engine for a few selections. Adds a workflow-ordered UX and Blender Railform rail import.</description>
   <version>0.1.1</version>
-  <date>2026-11-06</date>
+  <date>2026-11-07</date>
   <maintainer email="fkemuntoh@gmail.com">Kelvin</maintainer>
   <license file="LICENSE">GPL-3.0-or-later</license>
   <url type="repository" branch="main">https://github.com/KeynetikSystems/RailformStudio</url>
