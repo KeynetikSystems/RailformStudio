@@ -10,6 +10,59 @@ fresh `Unreleased` section above it.
 
 ## Unreleased
 
+## 0.1.1 - 2026-11-07
+
+### Added (Section extraction)
+- `core.extract_iso_curves` + **Extract sections** (`RFS_ExtractSections`): live cross-section (constant-U) or rail-wise (constant-V) curves from any sweep, loft or pipe; even in parameter or arc length, optional end curves. **Sections to curves** (`RFS_SectionCurves`) splits them into live `SectionCurve` objects tagged Profile / GuideRail for Loft / SweepN. Round trip through the N-rail sweep is exact (~1e-5) for 3+ rails.
+
+- **Extract sections / Sections to curves objects were invisible in the 3D view**: a bare `Part::FeaturePython` created from code has no display mode, so the curves were never drawn. They now carry `SectionsVP` (curve view provider with their own icons; double-click does not open the curve point editor). Found by taking a real-GUI screenshot; `test_gui_commands.py` now runs both commands and asserts a display mode.
+- **Sections to curves is re-runnable**: it reuses existing `SectionCurve` objects, creates missing ones and deletes those whose index fell off the end after Count was lowered (orphans are hidden until then); `SectionsSync` reports created / reused / removed.
+- Rails direction on a single-rail pipe no longer spirals (that was the frame-flip bug below): the curves run parallel to the spine, within a few percent of its length.
+
+### Fixed (sweep builders, found while testing section extraction)
+- **Single-rail pipe sweep on a bent rail**: the tube radius collapsed between stations (a r=0.5 test pipe had 4.6x the expected area; the old tests only sampled at station-aligned parameters). Cause: `_rmf_frames` transported the up vector with a "double reflection" built from the tangent difference, which negated ey/ez at every station whenever the seed up lay in the bend plane (always the case for a round profile, whose normal ~ the rail tangent). Replaced with a Rodrigues rotation about `prev_tan x tan`.
+- `_rail_tangent` took an ARC FRACTION as a curve parameter; on a chord-length-parametrized rail the tangent was up to ~20 deg off the spine. It now maps through the arc table.
+- **2-rail / N-rail sweep with several profiles**: the profile-direction test compared nearest-point parameters and could reverse a correctly oriented profile on non-parallel rails (bulge mirrored, ~4 mm error in a 40 mm test). Now decided by which end lies on which rail (`_profile_runs_far_to_base`), parameters only as a tie-break. Shared with the non-Gordon multi-rail path.
+
+
+### Fixed (Surface blend / match correctness)
+- `blend_surface` / `match_surface` now pair antiparallel boundary edges end-to-end (`_seam_reversed`) instead of twisting the strip; the exact G1/G2 matchers refuse such pairs and fall back to the sampled path.
+- `match_surface`: far-end tangent now points outward on max-u/v target sides (no overshoot past the far edge); G2/G3 curvature and jerk are normalised by the true cross-parameter speed (`Surface.tangent()` is unit length) so a G2 request on an already-G2 continuation no longer blows up; finite differences step inward; target far-side curvature is kept; G3 jerk sign corrected.
+- Hermite handle length is now `chord * scale` (was `chord/3`, then divided again by the Bezier degree, giving handles of chord/9, /15, /21). **Blend/match profiles change shape on recompute.**
+- `match_surface_exact_g1/g2` reflect the seam rows through the seam instead of copying them verbatim (verbatim copy folded the target back over the reference on abutting patches); G1 uses a single scale along the seam so the tangent plane matches exactly.
+- QA: `surface_deviation` `g2` is now intrinsic cross-direction normal curvature difference (1/length); the raw parametric second-derivative difference is kept as `g2_raw`. `match_surface_to_references` grades the REBUILT face (pre-match numbers under `pre_match`).
+
+### Added (Virtual thickness)
+- Every free-form surface feature (Loft, Gordon, Coons, Sweep, SweepN, Fill, Match, ExtendSurf, BlendSurf, BlendSurfClosed, N-sided) has `Thickness` (0 = plain surface), `ThicknessMode` (Outward / Inward / Symmetric) and read-only `ThicknessStatus`. Thickening runs on each recompute from the freshly built surface (no compounding) via `core.thicken_checked`, which falls back to the plain surface with a status message if the offset fails, and warns when the thickness exceeds the minimum curvature radius.
+
+### Added (Curve Authoring & Surfacing UX)
+- **Endpoint Continuity Snapping (G1 / G2 / G3 to Adjacent Edges & Faces)**:
+  - Added pure-OCCT analytic continuity snapping in `core.curves`: `evaluate_edge_at_point`, `snap_endpoint_continuity`, and `classify_endpoint_continuity`.
+  - **G1 (Tangent)**: Magnetically locks the endpoint tangent handle collinear with the adjacent curve's tangent vector ($\vec{T}_{\text{edge}}$) within a $25^\circ$ angular cone, or projects onto the surface tangent plane ($\vec{V} \cdot \vec{n}_{\text{face}} = 0$) when snapping to a solid face.
+  - **G2 (Curvature Continuity)**: Solves the exact closed-form second-derivative matching equation $(P_2 - P_1)_\perp = \frac{3}{2} L^2 \kappa \vec{N}$ to eliminate curvature steps across the seam down to machine precision ($\Delta \kappa < 10^{-16}$).
+  - **G3 (Torsion / Jerk Continuity)**: Matches third-derivative rate of curvature change via arc-length jerk vector $\vec{J} = \frac{d^3 P}{ds^3}$, ensuring C2-continuous curvature comb flow.
+  - Interactive Viewport Feedback: Real-time magenta/purple HUD badge `[G1/G2/G3 Edge Snap]` during both pen drafting (`CurvePanel`) and handle editing (`PointEditor`), with single-key cycling via the `G` key (`G1 -> G2 -> G3 -> Free`).
+- **Photoshop / Illustrator-Style Click-and-Drag Pen Tool Gesture**:
+  - Implemented intuitive click-and-drag drawing in `CurvePanel` for `BezierCurve`: clicking down places the anchor point; dragging immediately sprouts incoming and outgoing tangent handles symmetrically with live curve preview updates; releasing commits the anchor.
+  - Simple click without drag creates a sharp corner point (cusp) with retracted handles ($L_h = 0$).
+  - Holding the `Alt` key breaks handle colinearity live, producing an independent cusp angle (`HandleTypes = "Free"`), mirroring the pen tool mechanics in Photoshop, Illustrator, and Rhino.
+  - Interactive cubic Bézier rubberband: displays a 16-segment prospective Bézier curve bending smoothly from the previous anchor's outgoing handle to the mouse cursor in real time.
+- **SolidWorks-Style 3D Spline Handles & Interactive Tension / Angle HUD**:
+  - Replaced square handle markers with high-visibility diamond tips (`DIAMOND_FILLED_7_7`) connected by dashed tangent shafts (`0x00FF` pattern): Cyan for incoming left handles, Emerald/Lime for outgoing right handles, and Amber/Gold (`DIAMOND_FILLED_9_9`) on hover.
+  - Direct screen-distance picking (`self._screen(handle)`) for instantaneous, responsive handle selection without view projection drift.
+  - Live numeric tension and angle readout: dragging or hovering over a spline handle displays real-time tension ($L_h = \|H - P\|\text{ mm}$) and orientation angle ($\theta^\circ$) both on the floating cursor HUD and status bar (`Spline Handle: Point N (Left/Right) | Tension: ... mm | ∠...° | Type: Aligned/Free`).
+  - Double-click a handle tip to instantly retract it to the anchor (sharp corner); double-click an anchor point to extend tangent whiskers.
+- **Modernized Curve Authoring UIX & Progressive Disclosure**:
+  - Restructured `CurvePanel` into progressive collapsible accordion sections (`Parameters & Alignment`, `Coordinate Table`, `Curvature Combs & Quality`, `Geometric Constraints`), reducing default panel height from >900px down to ~260px and eliminating vertical sidebar scrolling.
+  - Unified canvas drawing interaction (`Canvas Drawing: Active / Paused`), eliminating the confusing dual "Pick in 3D" vs "Draw Curve" button state while preserving full backwards compatibility.
+  - Direct Viewport-Attached Heads-Up Display (HUD): Floating real-time dimension and snap badge (`L: ... mm | ∠...° | Plane [Snap]`) tracks directly alongside the mouse cursor in 3D, keeping foveal focus on the authoring point without requiring down-screen status-bar glances.
+  - Embedded Surface Role Selector: Direct inline combobox in `CurvePanel` allows switching curve surface roles (`None`, `Profile [Blue]`, `Guide Rail [Amber]`) with instant 3D viewport line color and width updates.
+- **Centripetal (Hartley-Judd) Parameterization**: Added `parameterization` parameter (`"centripetal"`, `"chord"`, `"uniform"`) to `interpolate_curve`. Centripetal knot pacing ($\Delta t_i = \sqrt{\|P_i - P_{i-1}\|}$) eliminates unwanted overshoot loops and cusps on unevenly spaced points. Parameterization is exposed as an `App::PropertyEnumeration` on `InterpCurve` and dynamically editable via a combobox in `CurvePanel`.
+- **Exact Degree Elevation ($p \to p+1$)**: Added `elevate_curve_degree` in `core.curves` and a one-click button in `CurvePanel`. Inserts additional B-Spline control poles for finer sculpting while preserving geometry bit-for-bit to machine precision ($< 10^{-14}$ deviation).
+- **Strain-Energy Curve Fairing**: Added `fair_curve` in `core.curves` and a "Fair Curve" action in `CurvePanel`. Minimizes second-difference strain energy $\int \kappa'^2 ds$ or third-difference jerk through iterative Laplacian relaxation, smoothing out hand-drawn wobbles while strictly pinning endpoints.
+- **Guide-Rail Crossing Snapper**: Integrated `snaputil.nearest_snap_ranked_kind` into `CurvePanel` pick and draw modes. Visualizes rail crossings with an amber cross marker (`CROSS_9_9`) and HUD status `"Crossing: Rail Intersection [Amber]"`, and on-curve projections with a cyan ring (`CIRCLE_LINE_9_9`), guaranteeing exact geometric intersections for Gordon surfaces and multi-rail sweeps.
+- **Profile / Guide Rail Role Tagging & Auto-Routing**: Added `RFS_TagProfile` and `RFS_TagRail` commands with viewport color styling (Electric Blue for Profiles, Amber/Gold for Guide Rails) and `RailformRole` property persistence. Surface panels (`Loft`, `Gordon`, `Sweep`, etc.) automatically detect tagged curves in selection and auto-route them into Profiles vs. Guide Rails input lists.
+
 ### Fixed (GUI)
 - **Viewpanel freeze/crash (multiloft repro): task panels no longer pump the
   Qt event loop from inside signal handlers.** Every panel change funnels

@@ -8,7 +8,7 @@ import Part
 import FreeCAD                      # Console only -- not Gui, works headless
 from FreeCAD import Vector
 
-from .util import (_compute_finite_difference_epsilon, _cross_tan_from_surface_tangent, _face_from_input, _finite_difference_second_derivative, _finite_difference_third_derivative, _hermite3, _hermite5, _hermite7, _matched_edges_compatible, _nearest_facing_sides, _side_is_trimmed, _side_uv_trimmed, grid_to_surface)
+from .util import (_bezier_row_points, _compute_finite_difference_epsilon, _cross_tan_from_surface_tangent, _face_from_input, _finite_difference_first_derivative, _finite_difference_second_derivative, _finite_difference_third_derivative, _hermite3, _hermite5, _hermite7, _hermite_to_bezier, _matched_edges_compatible, _nearest_facing_sides, _seam_reversed, _side_is_trimmed, _side_sigma, _side_uv_trimmed, _skin_pole_rows, grid_to_surface)
 from .qa import (adjacency_graph, classify_continuity, network_continuity_report, surface_deviation)
 
 
@@ -42,9 +42,9 @@ def blend_surface_closed(face_list, continuity="G2", n=24, scale=1.0):
                  boundaries; the caller is responsible for the ordering
                  (the typical "click faces in order around the hole"
                  FreeCAD selection gives this naturally).
-    `continuity`: "G0", "G1", or "G2" -- the cross-section basis (same
-                 values blend_surface already accepts; the same
-                 Hermite-sampling limitations apply: G1/G2 are exact at
+    `continuity`: "G0", "G1", "G2", or "G3" -- the cross-section basis
+                 (same values blend_surface already accepts; the same
+                 Hermite-sampling limitations apply: G1/G2/G3 are exact at
                  the sampled points and approximate between them).
     `n`: cross-section sample count along the FULL loop (so each ring
                  member gets ~n/N samples; pick n >= N for a smooth
@@ -74,30 +74,74 @@ def blend_surface_closed(face_list, continuity="G2", n=24, scale=1.0):
             "blend_surface_closed: need >= 3 faces forming a closed loop "
             "(got %d)" % len(faces))
 
-    order = {"G0": 0, "G1": 1, "G2": 2}.get(str(continuity), 2)
+    order = {"G0": 0, "G1": 1, "G2": 2, "G3": 3}.get(str(continuity), 2)
 
     def _cross_tan(face, side, u, v):
         du, dv = face.Surface.tangent(u, v)
         return _cross_tan_from_surface_tangent(du, dv, side)
 
+    _dn_cache = {}
+
     def _cross_d2(face, pr, side, u, v):
-        # Analytic first (see _surf_dn) -- finite difference only as fallback.
+        # Analytic first (see _surf_dn) -- finite difference only as fallback,
+        # stepping INTO the face's material (sign = _side_sigma) so the
+        # stencil stays on real surface. The 2nd derivative is invariant
+        # under the step-direction reversal.
         duo, dvo = (2, 0) if side < 2 else (0, 2)
         analytic = _surf_dn(face, u, v, duo, dvo, _dn_cache)
         if analytic is not None:
             return analytic
-        # Fall back to finite differences
         eps = _compute_finite_difference_epsilon(pr, 0 if side < 2 else 1)
+        sgn = _side_sigma(side)
         if side < 2:
             # Derivative in u direction
             return _finite_difference_second_derivative(
                 lambda u, v: face.valueAt(u, v), u, v,
-                -1.0 if side == 0 else 1.0, 0.0, eps)
+                sgn, 0.0, eps)
         else:
             # Derivative in v direction
             return _finite_difference_second_derivative(
                 lambda u, v: face.valueAt(u, v), u, v,
-                0.0, -1.0 if side == 2 else 1.0, eps)
+                0.0, sgn, eps)
+
+    def _cross_d3(face, pr, side, u, v):
+        """G3 counterpart to _cross_d2 above: analytic getDN first,
+        inward-stepped FD fallback (multiplied by sigma to convert the
+        stepping-direction stencil back to the raw increasing-parameter
+        convention -- the 3rd derivative flips under traversal reversal)."""
+        duo, dvo = (3, 0) if side < 2 else (0, 3)
+        analytic = _surf_dn(face, u, v, duo, dvo, _dn_cache)
+        if analytic is not None:
+            return analytic
+        eps = _compute_finite_difference_epsilon(pr, 0 if side < 2 else 1)
+        sgn = _side_sigma(side)
+        if side < 2:
+            return _finite_difference_third_derivative(
+                lambda u, v: face.valueAt(u, v), u, v,
+                sgn, 0.0, eps) * sgn
+        else:
+            return _finite_difference_third_derivative(
+                lambda u, v: face.valueAt(u, v), u, v,
+                0.0, sgn, eps) * sgn
+
+    def _cross_speed(face, pr, side, u, v):
+        """Cross-boundary parameter speed |dP/dw| (w = u on sides 0/1,
+        v on sides 2/3) for arc-length normalization of the derivative
+        data. Analytic first, inward-stepped one-sided FD fallback;
+        only the magnitude is used."""
+        duo, dvo = (1, 0) if side < 2 else (0, 1)
+        analytic = _surf_dn(face, u, v, duo, dvo, _dn_cache)
+        if analytic is not None:
+            return max(analytic.Length, 1e-12)
+        eps = _compute_finite_difference_epsilon(pr, 0 if side < 2 else 1)
+        sgn = _side_sigma(side)
+        if side < 2:
+            d1 = _finite_difference_first_derivative(
+                lambda u, v: face.valueAt(u, v), u, v, sgn, 0.0, eps)
+        else:
+            d1 = _finite_difference_first_derivative(
+                lambda u, v: face.valueAt(u, v), u, v, 0.0, sgn, eps)
+        return max(d1.Length, 1e-12)
 
     N = len(faces)
     # Locate the facing-side pairs ONCE, up front -- each consecutive pair
@@ -120,7 +164,7 @@ def blend_surface_closed(face_list, continuity="G2", n=24, scale=1.0):
     for i in range(N):
         face_a, face_b, sa, sb, a_pr, b_pr = pair_info[i]
         ec = edge_caches[i]
-        grid = []
+        row_poles = []
         for k in range(n):
             t = k / (n - 1.0)
             ua, va = _side_uv_trimmed(face_a, a_pr, sa, t, ec)
@@ -130,25 +174,55 @@ def blend_surface_closed(face_list, continuity="G2", n=24, scale=1.0):
             chord = max((P1 - P0).Length, 1e-9)
             h = chord * scale / 3.0
             if order == 0:
-                row = [P0 + (P1 - P0) * j / (n - 1.0) for j in range(n)]
+                poles = [P0, P1]
             elif order == 1:
                 T0 = _cross_tan(face_a, sa, ua, va)
                 T0 = T0 * (h / max(T0.Length, 1e-9))
                 T1 = _cross_tan(face_b, sb, ub, vb)
                 T1 = T1 * (h / max(T1.Length, 1e-9))
-                row = [_hermite3(P0, T0, P1, T1 * -1.0, j / (n - 1.0))
-                       for j in range(n)]
-            else:
+                poles = _hermite_to_bezier(P0, T0, None, None,
+                                           P1, T1 * -1.0, None, None, 3)
+            elif order == 2:
+                # G2: same arc-length-normalized Hermite data as
+                # blend_surface's fixed G2 row -- K = raw_d2 * (h/s_u)^2,
+                # SAME positive sign at both ends (2nd derivative does
+                # not flip under traversal reversal).
                 T0 = _cross_tan(face_a, sa, ua, va)
                 T0 = T0 * (h / max(T0.Length, 1e-9))
-                K0 = _cross_d2(face_a, a_pr, sa, ua, va) * (chord * chord / 2.0)
+                s_a = _cross_speed(face_a, a_pr, sa, ua, va)
+                K0 = _cross_d2(face_a, a_pr, sa, ua, va) * (h * h / (s_a * s_a))
                 T1 = _cross_tan(face_b, sb, ub, vb)
                 T1 = T1 * (h / max(T1.Length, 1e-9))
-                K1 = _cross_d2(face_b, b_pr, sb, ub, vb) * (chord * chord / 2.0)
-                row = [_hermite5(P0, T0, K0, P1, T1 * -1.0, K1 * -1.0,
-                                j / (n - 1.0)) for j in range(n)]
-            grid.append(row)
-        sub_faces.append(grid_to_surface(grid).Faces[0])
+                s_b = _cross_speed(face_b, b_pr, sb, ub, vb)
+                K1 = _cross_d2(face_b, b_pr, sb, ub, vb) * (h * h / (s_b * s_b))
+                poles = _hermite_to_bezier(P0, T0, K0, None,
+                                           P1, T1 * -1.0, K1, None, 5)
+            else:
+                # G3: septic Hermite, side-dependent jerk signs exactly as
+                # blend_surface's fixed G3 row: J0 = -sigma_a * raw,
+                # J1 = +sigma_b * raw, both scaled by (h/s_u)^3.
+                T0 = _cross_tan(face_a, sa, ua, va)
+                T0 = T0 * (h / max(T0.Length, 1e-9))
+                s_a = _cross_speed(face_a, a_pr, sa, ua, va)
+                K0 = _cross_d2(face_a, a_pr, sa, ua, va) * (h * h / (s_a * s_a))
+                J0 = _cross_d3(face_a, a_pr, sa, ua, va) \
+                    * (-_side_sigma(sa) * h ** 3 / (s_a ** 3))
+                T1 = _cross_tan(face_b, sb, ub, vb)
+                T1 = T1 * (h / max(T1.Length, 1e-9))
+                s_b = _cross_speed(face_b, b_pr, sb, ub, vb)
+                K1 = _cross_d2(face_b, b_pr, sb, ub, vb) * (h * h / (s_b * s_b))
+                J1 = _cross_d3(face_b, b_pr, sb, ub, vb) \
+                    * (_side_sigma(sb) * h ** 3 / (s_b ** 3))
+                poles = _hermite_to_bezier(P0, T0, K0, J0,
+                                           P1, T1 * -1.0, K1, J1, 7)
+            row_poles.append(poles)
+        # Exact pole-skinned construction (see blend_surface's tail for the
+        # rationale); falls back to the old point-grid interpolation.
+        try:
+            sub_faces.append(_skin_pole_rows(row_poles).Faces[0])
+        except Exception:
+            sub_faces.append(grid_to_surface(
+                [_bezier_row_points(rp, n) for rp in row_poles]).Faces[0])
 
     # Sew the N-1 sub-strips into one Shell. As in n_sided_patch, if
     # OCCT can't sew within tolerance, return a Compound of the strips
@@ -258,7 +332,18 @@ def _surf_dn(face, u, v, du, dv, cache):
     (not an approximate value) when `face` can't be expressed as a
     BSplineSurface at all, or this FreeCAD/OCCT build's Part binding
     doesn't expose getDN, so the caller can fall back to its own
-    finite-difference path unchanged."""
+    finite-difference path unchanged.
+
+    The derivative is expressed in the FACE's own parameterization (the
+    same convention face.valueAt and the finite-difference fallback use):
+    a converted BSpline's knot range generally does NOT match the face's
+    ParameterRange (e.g. a Plane face parameterized 0..10 converts to a
+    BSpline parameterized 0..1), so the evaluation point is rescaled into
+    the BSpline's knot domain and the resulting derivative is rescaled
+    back by (du_bspline/du_face)^du (dv_bspline/dv_face)^dv. Evaluating
+    getDN directly at the face's raw (u, v) -- the previous behavior --
+    read garbage once the two ranges diverged (OCCT silently
+    extrapolates outside the knot domain)."""
     surf = _bspline_surface_cached(face, cache)
     if surf is None:
         return None
@@ -268,7 +353,16 @@ def _surf_dn(face, u, v, du, dv, cache):
         if surf.UDegree < du or surf.VDegree < dv:
             return None  # Degree too low for requested derivative
     try:
-        return surf.getDN(u, v, int(du), int(dv))
+        fu0, fu1, fv0, fv1 = face.ParameterRange
+        uk = surf.UKnots
+        vk = surf.VKnots
+        bu0, bu1 = uk[0], uk[-1]
+        bv0, bv1 = vk[0], vk[-1]
+        su = (bu1 - bu0) / max(fu1 - fu0, 1e-12)
+        sv = (bv1 - bv0) / max(fv1 - fv0, 1e-12)
+        uu = bu0 + (u - fu0) * su
+        vv = bv0 + (v - fv0) * sv
+        return surf.getDN(uu, vv, int(du), int(dv)) * (su ** du) * (sv ** dv)
     except Exception:
         return None
 
@@ -1060,14 +1154,35 @@ def balance_network_continuity(faces, references=None, target="G2",
 
 
 
+def _cross_param_speed(face, pr, side, u, v, dn_cache):
+    """|dP/dw| at the seam, w = the cross parameter (u for sides 0/1, v for
+    2/3). Surface.tangent() returns UNIT vectors, so it can't supply this;
+    analytic getDN first, else inward one-sided finite difference."""
+    duo, dvo = (1, 0) if side < 2 else (0, 1)
+    d = _surf_dn(face, u, v, duo, dvo, dn_cache)
+    if d is None:
+        eps = _compute_finite_difference_epsilon(pr, 0 if side < 2 else 1)
+        sg = _side_sigma(side)
+        d = _finite_difference_first_derivative(
+            lambda a, b: face.valueAt(a, b), u, v,
+            sg if side < 2 else 0.0, 0.0 if side < 2 else sg, eps)
+    return max(d.Length, 1e-12)
+
+
 def match_surface(ref_face, tgt_face, continuity="G2", n=24, scale=1.0):
     """Rebuild tgt_face so its edge nearest ref_face is G1/G2-continuous.
 
     Uses quintic Hermite profile skinning: the shared boundary is preserved
     exactly (G0), tangent direction matches ref_face (G1), and curvature in the
-    cross-boundary direction matches ref_face (G2). The far/side boundaries of
-    tgt_face are also preserved (the profiles anchor there). This does not modify
-    ref_face.
+    cross-boundary direction matches ref_face (G2). The far boundary's
+    position, tangent and (G2) curvature come from tgt_face. This does not
+    modify ref_face.
+
+    LIMITATION: tgt_face is REBUILT from boundary data only. Its interior
+    shape and its two side boundaries are replaced by the Hermite profiles'
+    end curves, so they are NOT preserved (only the corner points are).
+    Prefer match_surface_exact_g1/g2 (which keep tgt's net) when the
+    boundaries are knot-compatible.
     """
     ref_face = _face_from_input(ref_face)
     tgt_face = _face_from_input(tgt_face)
@@ -1103,8 +1218,15 @@ def match_surface(ref_face, tgt_face, continuity="G2", n=24, scale=1.0):
     def ref_uv(t):
         return _side_uv_trimmed(ref_face, ref_pr, rs, t, _edge_cache)
 
+    # Antiparallel boundaries: walk the target's far side in the direction
+    # that keeps each profile's start (ref) and end (tgt) on the same
+    # material line, instead of twisting the strip.
+    _rev = _seam_reversed(ref_face, ref_pr, rs, tgt_face, tgt_pr, far_side,
+                          _edge_cache)
+
     def tgt_far_uv(t):
-        return _side_uv_trimmed(tgt_face, tgt_pr, far_side, t, _edge_cache)
+        return _side_uv_trimmed(tgt_face, tgt_pr, far_side,
+                                (1.0 - t) if _rev else t, _edge_cache)
 
     ref_surf = ref_face.Surface
     tgt_surf = tgt_face.Surface
@@ -1116,53 +1238,38 @@ def match_surface(ref_face, tgt_face, continuity="G2", n=24, scale=1.0):
     _dn_cache = {}
 
     def _cross_d2(u, v):
-        # Analytic path first (exact, off ref_face's own control net) --
-        # only fall back to finite differences when no BSpline conversion
-        # is possible (see _surf_dn's docstring).
+        # Analytic first; else INWARD one-sided FD (stepping outward would
+        # extrapolate off the domain). 2nd derivative is even: no flip.
         du, dv = (2, 0) if ref_is_u else (0, 2)
         analytic = _surf_dn(ref_face, u, v, du, dv, _dn_cache)
         if analytic is not None:
             return analytic
-        # Fall back to finite differences
         eps = _compute_finite_difference_epsilon(ref_pr, 0 if ref_is_u else 1)
-        du_sign = -1.0 if (ref_is_u and rs == 0) or (not ref_is_u and rs == 2) else 1.0
-        dv_sign = -1.0 if (not ref_is_u and rs == 0) or (ref_is_u and rs == 2) else 1.0
-        # Actually, for pure u or v derivatives, one of the signs is zero
-        if ref_is_u:
-            # Derivative in u direction
-            return _finite_difference_second_derivative(
-                lambda u, v: ref_face.valueAt(u, v), u, v,
-                -1.0 if rs == 0 else 1.0, 0.0, eps)
-        else:
-            # Derivative in v direction
-            return _finite_difference_second_derivative(
-                lambda u, v: ref_face.valueAt(u, v), u, v,
-                0.0, -1.0 if rs == 2 else 1.0, eps)
+        sg = _side_sigma(rs)
+        return _finite_difference_second_derivative(
+            lambda a, b: ref_face.valueAt(a, b), u, v,
+            sg if ref_is_u else 0.0, 0.0 if ref_is_u else sg, eps)
 
     def _cross_d3(u, v):
-        """G3 counterpart to _cross_d2. Tries the exact analytic 3rd
-        derivative (BSplineSurface.getDN) first -- FreeCAD's Part API
-        does expose it once ref_face is (or is converted to) a
-        BSplineSurface, so this is no longer a finite-difference-only
-        estimate for the common case. Only falls back to stacked finite
-        differences (noisier, since it compounds atop an already-finite-
-        difference 2nd derivative) when no BSpline conversion succeeds."""
+        """Raw 3rd cross derivative (increasing-parameter convention),
+        analytic first, else inward FD (odd order: multiply by the step
+        sign to return to the increasing-parameter convention)."""
         du, dv = (3, 0) if ref_is_u else (0, 3)
         analytic = _surf_dn(ref_face, u, v, du, dv, _dn_cache)
         if analytic is not None:
             return analytic
-        # Fall back to finite differences
         eps = _compute_finite_difference_epsilon(ref_pr, 0 if ref_is_u else 1)
-        if ref_is_u:
-            # Derivative in u direction
-            return _finite_difference_third_derivative(
-                lambda u, v: ref_face.valueAt(u, v), u, v,
-                -1.0 if rs == 0 else 1.0, 0.0, eps)
-        else:
-            # Derivative in v direction
-            return _finite_difference_third_derivative(
-                lambda u, v: ref_face.valueAt(u, v), u, v,
-                0.0, -1.0 if rs == 2 else 1.0, eps)
+        sg = _side_sigma(rs)
+        return _finite_difference_third_derivative(
+            lambda a, b: ref_face.valueAt(a, b), u, v,
+            sg if ref_is_u else 0.0, 0.0 if ref_is_u else sg, eps) * sg
+
+    def _tgt_far_d2(u, v):
+        """Raw 2nd cross derivative of tgt at its far side (None if no
+        analytic path): feeds the far end of the profile so the target's
+        own far-side curvature is kept instead of forced to zero."""
+        du, dv = (2, 0) if tgt_is_u else (0, 2)
+        return _surf_dn(tgt_face, u, v, du, dv, _dn_cache)
 
     grid = []
     for k in range(n):
@@ -1172,43 +1279,43 @@ def match_surface(ref_face, tgt_face, continuity="G2", n=24, scale=1.0):
         P0 = ref_face.valueAt(r_u, r_v)
         P1 = tgt_face.valueAt(f_u, f_v)
         chord = max((P1 - P0).Length, 1e-9)
-        h = chord * scale / 3.0
+        # Hermite derivative magnitude ~ chord (a straight profile has
+        # |B'| = chord on t in [0,1]); the Bezier conversion divides by
+        # the degree, so this gives the usual chord/3-style handles.
+        h = chord * scale
 
         if order == 0:
             row = [P0 + (P1 - P0) * j / (n - 1.0) for j in range(n)]
-        elif order == 1:
-            T0 = _cross_tan(r_u, r_v)
-            T0 = T0 * (h / max(T0.Length, 1e-9))
-            du, dv = tgt_surf.tangent(f_u, f_v)
-            T1 = du if tgt_is_u else dv
-            T1 = T1 * (h / max(T1.Length, 1e-9))
+            grid.append(row)
+            continue
+
+        T0raw = _cross_tan(r_u, r_v)
+        s0 = _cross_param_speed(ref_face, ref_pr, rs, r_u, r_v, _dn_cache)
+        T0 = T0raw * (h / max(T0raw.Length, 1e-9))
+        du, dv = tgt_surf.tangent(f_u, f_v)
+        # Travel direction at the far end is OUTWARD from tgt at far_side.
+        T1raw = _cross_tan_from_surface_tangent(du, dv, far_side)
+        s1 = _cross_param_speed(tgt_face, tgt_pr, far_side, f_u, f_v, _dn_cache)
+        T1 = T1raw * (h / max(T1raw.Length, 1e-9))
+
+        if order == 1:
             row = [_hermite3(P0, T0, P1, T1, j / (n - 1.0)) for j in range(n)]
-        elif order == 2:
-            T0 = _cross_tan(r_u, r_v)
-            T0 = T0 * (h / max(T0.Length, 1e-9))
-            K0 = _cross_d2(r_u, r_v) * (chord * chord / 2.0)
-            du, dv = tgt_surf.tangent(f_u, f_v)
-            T1 = du if tgt_is_u else dv
-            T1 = T1 * (h / max(T1.Length, 1e-9))
-            row = [_hermite5(P0, T0, K0, P1, T1, Vector(0, 0, 0),
-                             j / (n - 1.0)) for j in range(n)]
         else:
-            # G3: septic Hermite -- ref side gets tangent/curvature/jerk
-            # matching (T0/K0/J0); the target's far side is only
-            # position-anchored (T1 comes from tgt_face's own tangent,
-            # and the acceleration/jerk terms on that side are zero),
-            # mirroring the existing G2 branch's asymmetric treatment
-            # above (K1 is Vector(0,0,0) there too -- match_surface only
-            # forces continuity FROM the reference, never modifies it).
-            T0 = _cross_tan(r_u, r_v)
-            T0 = T0 * (h / max(T0.Length, 1e-9))
-            K0 = _cross_d2(r_u, r_v) * (chord * chord / 2.0)
-            J0 = _cross_d3(r_u, r_v) * (chord ** 3 / 6.0)
-            du, dv = tgt_surf.tangent(f_u, f_v)
-            T1 = du if tgt_is_u else dv
-            T1 = T1 * (h / max(T1.Length, 1e-9))
-            row = [_hermite7(P0, T0, K0, J0, P1, T1, Vector(0, 0, 0),
-                            Vector(0, 0, 0), j / (n - 1.0)) for j in range(n)]
+            K0 = _cross_d2(r_u, r_v) * (h * h / (s0 * s0))
+            d2t = _tgt_far_d2(f_u, f_v)
+            K1 = (d2t * (h * h / (s1 * s1))) if d2t is not None \
+                else Vector(0, 0, 0)
+            if order == 2:
+                row = [_hermite5(P0, T0, K0, P1, T1, K1, j / (n - 1.0))
+                       for j in range(n)]
+            else:
+                # Frame runs outward from ref; raw d3 is in the increasing-
+                # parameter convention, so J0 = -sigma * raw (see
+                # blend_surface). Far end jerk left at zero.
+                J0 = _cross_d3(r_u, r_v) * (-_side_sigma(rs) * h ** 3 / (s0 ** 3))
+                row = [_hermite7(P0, T0, K0, J0, P1, T1, K1,
+                                 Vector(0, 0, 0), j / (n - 1.0))
+                       for j in range(n)]
         grid.append(row)
     return grid_to_surface(grid)
 
@@ -1278,12 +1385,21 @@ def match_surface_to_references(target_face, reference_faces, continuity="G2",
             if rebuilt is None:
                 rebuilt = match_surface(ref, target_face, continuity=continuity, n=n, scale=scale)
                 method = "sampled"
-            grade = classify_continuity(base_report)
-            score = base_score + (grade != "G2",)
+            # Grade what was actually BUILT, not the pre-match target.
+            try:
+                rb = rebuilt.Faces[0] if getattr(rebuilt, "Faces", None) else rebuilt
+                new_report = surface_deviation(rb, ref, samples=max(4, n // 2))
+            except Exception:
+                new_report = base_report
+            grade = classify_continuity(new_report)
+            score = (new_report["max_g0"], new_report["max_g1_deg"],
+                     new_report["max_g2"]) + (grade != "G2",)
             if best is None or score < best:
                 best = score
-                base_report["method"] = method
-                best_report = base_report
+                new_report["method"] = method
+                new_report["pre_match"] = {k: base_report[k] for k in
+                                           ("max_g0", "max_g1_deg", "max_g2")}
+                best_report = new_report
                 best_face = ref
                 best_shape = rebuilt
         except Exception:
@@ -1415,6 +1531,10 @@ def _exact_match_prep(ref_face, tgt_face, fname, harmonize_cross=False):
                                         tgt_face, tgt_pr, ts)
     if not ok:
         raise ValueError("%s: %s -- fall back to match_surface()" % (fname, why))
+    if _seam_reversed(ref_face, ref_pr, rs, tgt_face, tgt_pr, ts, {}):
+        raise ValueError(
+            "%s: the matched edges run in opposite directions -- the pole "
+            "rows would pair opposite ends; fall back to match_surface()" % fname)
     ref_s = _as_bspline_match(ref_face, "ref_face's", fname)
     tgt_s = _as_bspline_match(tgt_face, "tgt_face's", fname)
     ref_is_u, tgt_is_u = rs < 2, ts < 2
@@ -1567,6 +1687,12 @@ def match_surface_exact_g1(ref_face, tgt_face, n_rows=2):
             "match_surface_exact_g1: %s -- fall back to match_surface()"
             % why)
 
+    if _seam_reversed(ref_face, ref_pr, rs, tgt_face, tgt_pr, ts, {}):
+        raise ValueError(
+            "match_surface_exact_g1: the matched edges run in opposite "
+            "directions -- the pole rows would pair opposite ends; fall "
+            "back to match_surface()")
+
     def _as_bspline(face, which):
         surf = face.Surface
         if isinstance(surf, Part.BSplineSurface):
@@ -1673,12 +1799,40 @@ def match_surface_exact_g1(ref_face, tgt_face, n_rows=2):
             return (1 + along, 1 + depth)
         return (1 + along, nv - depth)
 
+    # Row 0 is shared (G0). Row 1 must be the REFLECTION of ref's row 1
+    # through the seam row -- tgt's interior lies on the opposite side of
+    # the seam from ref's, so copying ref's row verbatim would fold tgt
+    # back over ref. The reflected offset keeps tgt's own pole spacing
+    # (|t1-t0| of the original net) so only the cross-tangent DIRECTION is
+    # forced, not tgt's cross-tangent magnitude.
     n_rows = max(1, min(int(n_rows), 2))
-    for depth in range(n_rows):
+    nuR, nvR = ref_s.NbUPoles, ref_s.NbVPoles
+    nuT, nvT = tgt_s.NbUPoles, tgt_s.NbVPoles
+    # ONE scale for the whole seam: the cross derivative at a seam point is
+    # a pole-wise blend of (row1 - row0), so the reflected rows reproduce
+    # ref's tangent plane exactly only if every pole is scaled by the same
+    # factor (per-pole factors would skew the blended direction).
+    lam = 1.0
+    if n_rows >= 2:
+        sum_ref = sum_tgt = 0.0
         for along in range(n_ref):
-            ri, rj = _pole_ij(rs, depth, along, ref_s.NbUPoles, ref_s.NbVPoles)
-            ti, tj = _pole_ij(ts, depth, along, tgt_s.NbUPoles, tgt_s.NbVPoles)
-            tgt_s.setPole(ti, tj, ref_s.getPole(ri, rj))
+            ri0, rj0 = _pole_ij(rs, 0, along, nuR, nvR)
+            ri1, rj1 = _pole_ij(rs, 1, along, nuR, nvR)
+            ti0, tj0 = _pole_ij(ts, 0, along, nuT, nvT)
+            ti1, tj1 = _pole_ij(ts, 1, along, nuT, nvT)
+            sum_ref += (ref_s.getPole(ri0, rj0) - ref_s.getPole(ri1, rj1)).Length
+            sum_tgt += (tgt_s.getPole(ti1, tj1) - tgt_s.getPole(ti0, tj0)).Length
+        if sum_ref > 1e-12 and sum_tgt > 1e-12:
+            lam = sum_tgt / sum_ref
+    for along in range(n_ref):
+        ri0, rj0 = _pole_ij(rs, 0, along, nuR, nvR)
+        ti0, tj0 = _pole_ij(ts, 0, along, nuT, nvT)
+        r0 = ref_s.getPole(ri0, rj0)
+        if n_rows >= 2:
+            ri1, rj1 = _pole_ij(rs, 1, along, nuR, nvR)
+            ti1, tj1 = _pole_ij(ts, 1, along, nuT, nvT)
+            tgt_s.setPole(ti1, tj1, r0 + (r0 - ref_s.getPole(ri1, rj1)) * lam)
+        tgt_s.setPole(ti0, tj0, r0)
 
     return tgt_s.toShape()
 
@@ -1732,13 +1886,21 @@ def match_surface_exact_g2(ref_face, tgt_face):
     fname = "match_surface_exact_g2"
     ref_s, tgt_s, rs, ts, _riu, _tiu, n_along = _exact_match_prep(
         ref_face, tgt_face, fname, harmonize_cross=True)
-    for depth in range(3):
-        for along in range(n_along):
-            ri, rj = _pole_ij_match(rs, depth, along,
-                                    ref_s.NbUPoles, ref_s.NbVPoles)
-            ti, tj = _pole_ij_match(ts, depth, along,
-                                    tgt_s.NbUPoles, tgt_s.NbVPoles)
-            tgt_s.setPole(ti, tj, ref_s.getPole(ri, rj))
+    # C2 across the seam with a shared cross knot vector: tgt's cross
+    # parameter runs AWAY from the seam while ref's runs INTO ref, so the
+    # first derivative reverses and the second does not:
+    #   t1 - t0 = -(r1 - r0)            ->  t1 = 2 r0 - r1
+    #   t2 - 2 t1 + t0 = r2 - 2 r1 + r0 ->  t2 = 4 r0 - 4 r1 + r2
+    # (verbatim row copy would fold tgt back over ref).
+    nuR, nvR = ref_s.NbUPoles, ref_s.NbVPoles
+    nuT, nvT = tgt_s.NbUPoles, tgt_s.NbVPoles
+    for along in range(n_along):
+        r = [ref_s.getPole(*_pole_ij_match(rs, d, along, nuR, nvR))
+             for d in range(3)]
+        new = [r[0], r[0] * 2.0 - r[1], r[0] * 4.0 - r[1] * 4.0 + r[2]]
+        for d in range(3):
+            ti, tj = _pole_ij_match(ts, d, along, nuT, nvT)
+            tgt_s.setPole(ti, tj, new[d])
     return tgt_s.toShape()
 
 
@@ -1793,18 +1955,24 @@ def blend_surface(face_a, face_b, continuity="G2", n=24, scale=1.0):
         analytic = _surf_dn(face, u, v, duo, dvo, _dn_cache)
         if analytic is not None:
             return analytic
-        # Fall back to finite differences
+        # Fall back to finite differences, stepping INTO the face's material
+        # (the +parameter direction on sides 0/2, -parameter on 1/3) so the
+        # stencil stays on real surface instead of extrapolating off the
+        # domain -- same fix qa.surface_deviation's inline _cross_d2 got.
+        # The 2nd derivative is invariant under the step-direction reversal,
+        # so the inward estimate equals the analytic path's raw value.
         eps = _compute_finite_difference_epsilon(pr, 0 if side < 2 else 1)
+        sgn = _side_sigma(side)
         if side < 2:
             # Derivative in u direction
             return _finite_difference_second_derivative(
                 lambda u, v: face.valueAt(u, v), u, v,
-                -1.0 if side == 0 else 1.0, 0.0, eps)
+                sgn, 0.0, eps)
         else:
             # Derivative in v direction
             return _finite_difference_second_derivative(
                 lambda u, v: face.valueAt(u, v), u, v,
-                0.0, -1.0 if side == 2 else 1.0, eps)
+                0.0, sgn, eps)
 
     def _cross_d3(face, pr, side, u, v):
         """G3 counterpart to _cross_d2 above. Tries the exact analytic
@@ -1819,63 +1987,131 @@ def blend_surface(face_a, face_b, continuity="G2", n=24, scale=1.0):
         analytic = _surf_dn(face, u, v, duo, dvo, _dn_cache)
         if analytic is not None:
             return analytic
-        # Fall back to finite differences
+        # Fall back to finite differences, stepping INTO the face's material
+        # (step sign = _side_sigma) so the stencil stays on real surface.
+        # The 3rd derivative FLIPS under traversal reversal, and the FD
+        # stencil is written in the stepping direction, so the inward-
+        # stepped estimate is sigma * (raw increasing-parameter value) --
+        # multiply by sigma to match the analytic path's raw convention.
         eps = _compute_finite_difference_epsilon(pr, 0 if side < 2 else 1)
+        sgn = _side_sigma(side)
         if side < 2:
             # Derivative in u direction
             return _finite_difference_third_derivative(
                 lambda u, v: face.valueAt(u, v), u, v,
-                -1.0 if side == 0 else 1.0, 0.0, eps)
+                sgn, 0.0, eps) * sgn
         else:
             # Derivative in v direction
             return _finite_difference_third_derivative(
                 lambda u, v: face.valueAt(u, v), u, v,
-                0.0, -1.0 if side == 2 else 1.0, eps)
+                0.0, sgn, eps) * sgn
 
-    grid = []
+    def _cross_speed(face, pr, side, u, v):
+        """Cross-boundary parameter speed |dP/dw| at the seam (w = u for
+        sides 0/1, v for sides 2/3). Used to normalize raw derivative
+        data to arc-length form: d^kP/ds^k = d^kP/dw^k / |dP/dw|^k.
+        Analytic first (same _surf_dn path as _cross_d2/_cross_d3);
+        one-sided FD fallback steps INWARD (sign = _side_sigma) so the
+        stencil stays on real surface. Only the magnitude is used."""
+        duo, dvo = (1, 0) if side < 2 else (0, 1)
+        analytic = _surf_dn(face, u, v, duo, dvo, _dn_cache)
+        if analytic is not None:
+            return max(analytic.Length, 1e-12)
+        eps = _compute_finite_difference_epsilon(pr, 0 if side < 2 else 1)
+        sgn = _side_sigma(side)
+        if side < 2:
+            d1 = _finite_difference_first_derivative(
+                lambda u, v: face.valueAt(u, v), u, v, sgn, 0.0, eps)
+        else:
+            d1 = _finite_difference_first_derivative(
+                lambda u, v: face.valueAt(u, v), u, v, 0.0, sgn, eps)
+        return max(d1.Length, 1e-12)
+
+    # Antiparallel boundaries (accepted by _nearest_facing_sides): pair
+    # sample t on A with 1-t on B so the strip is not twisted.
+    _rev = _seam_reversed(face_a, a_pr, sa, face_b, b_pr, sb, _edge_cache)
+
+    row_poles = []
     for k in range(n):
         t = k / (n - 1.0)
         ua, va = _side_uv_trimmed(face_a, a_pr, sa, t, _edge_cache)
-        ub, vb = _side_uv_trimmed(face_b, b_pr, sb, t, _edge_cache)
+        ub, vb = _side_uv_trimmed(face_b, b_pr, sb,
+                                  (1.0 - t) if _rev else t, _edge_cache)
         P0 = face_a.valueAt(ua, va)
         P1 = face_b.valueAt(ub, vb)
         chord = max((P1 - P0).Length, 1e-9)
-        h = chord * scale / 3.0
+        # Hermite derivative magnitude ~ chord (a straight profile has
+        # |B'| = chord on t in [0,1]). The old chord/3 was divided AGAIN
+        # by the Bezier degree in _hermite_to_bezier, leaving handles of
+        # chord/9, /15, /21 -- far too short for a fair profile.
+        h = chord * scale
         if order == 0:
-            row = [P0 + (P1 - P0) * j / (n - 1.0) for j in range(n)]
+            poles = [P0, P1]
         elif order == 1:
             T0 = _cross_tan(face_a, sa, ua, va)
             T0 = T0 * (h / max(T0.Length, 1e-9))
             T1 = _cross_tan(face_b, sb, ub, vb)
             T1 = T1 * (h / max(T1.Length, 1e-9))
-            row = [_hermite3(P0, T0, P1, T1 * -1.0, j / (n - 1.0))
-                  for j in range(n)]
+            poles = _hermite_to_bezier(P0, T0, None, None,
+                                       P1, T1 * -1.0, None, None, 3)
         elif order == 2:
+            # G2 Hermite data, all in arc-length-normalized form:
+            # T = outward unit tangent * h (T1 negated -- 1st derivatives
+            # flip under traversal reversal); K = d2P/ds^2 * h^2 =
+            # raw_d2 * (h/s_u)^2. The 2nd derivative does NOT flip under
+            # reversal, so K keeps the SAME positive sign at both ends
+            # (the old `K1 * -1.0` was wrong). s_u = cross-parameter
+            # speed from _cross_speed, so the raw derivative off the
+            # face's own (u, v) net is converted to true arc-length form.
             T0 = _cross_tan(face_a, sa, ua, va)
             T0 = T0 * (h / max(T0.Length, 1e-9))
-            K0 = _cross_d2(face_a, a_pr, sa, ua, va) * (chord * chord / 2.0)
+            s_a = _cross_speed(face_a, a_pr, sa, ua, va)
+            K0 = _cross_d2(face_a, a_pr, sa, ua, va) * (h * h / (s_a * s_a))
             T1 = _cross_tan(face_b, sb, ub, vb)
             T1 = T1 * (h / max(T1.Length, 1e-9))
-            K1 = _cross_d2(face_b, b_pr, sb, ub, vb) * (chord * chord / 2.0)
-            row = [_hermite5(P0, T0, K0, P1, T1 * -1.0, K1 * -1.0,
-                             j / (n - 1.0)) for j in range(n)]
+            s_b = _cross_speed(face_b, b_pr, sb, ub, vb)
+            K1 = _cross_d2(face_b, b_pr, sb, ub, vb) * (h * h / (s_b * s_b))
+            poles = _hermite_to_bezier(P0, T0, K0, None,
+                                       P1, T1 * -1.0, K1, None, 5)
         else:
             # G3: septic Hermite (_hermite7) -- the surface port of
             # blend_curve's G3 path. _cross_d3 now tries the analytic
             # derivative first (see its docstring); the finite-difference
             # fallback noise caveat only applies when that fails.
+            # Jerk data: J = d3P/ds^3 * h^3 = raw_d3 * (h/s_u)^3. The 3rd
+            # derivative FLIPS under traversal reversal, and the raw
+            # derivative is in the increasing-parameter direction while
+            # the Hermite frame runs outward->inward per face, so the
+            # required signs are side-dependent: J0 = -sigma_a * raw,
+            # J1 = +sigma_b * raw (sigma = +1 on sides 0/2, -1 on 1/3).
             T0 = _cross_tan(face_a, sa, ua, va)
             T0 = T0 * (h / max(T0.Length, 1e-9))
-            K0 = _cross_d2(face_a, a_pr, sa, ua, va) * (chord * chord / 2.0)
-            J0 = _cross_d3(face_a, a_pr, sa, ua, va) * (chord ** 3 / 6.0)
+            s_a = _cross_speed(face_a, a_pr, sa, ua, va)
+            K0 = _cross_d2(face_a, a_pr, sa, ua, va) * (h * h / (s_a * s_a))
+            J0 = _cross_d3(face_a, a_pr, sa, ua, va) \
+                * (-_side_sigma(sa) * h ** 3 / (s_a ** 3))
             T1 = _cross_tan(face_b, sb, ub, vb)
             T1 = T1 * (h / max(T1.Length, 1e-9))
-            K1 = _cross_d2(face_b, b_pr, sb, ub, vb) * (chord * chord / 2.0)
-            J1 = _cross_d3(face_b, b_pr, sb, ub, vb) * (chord ** 3 / 6.0)
-            row = [_hermite7(P0, T0, K0, J0, P1, T1 * -1.0, K1 * -1.0,
-                            J1 * -1.0, j / (n - 1.0)) for j in range(n)]
-        grid.append(row)
-    return grid_to_surface(grid)
+            s_b = _cross_speed(face_b, b_pr, sb, ub, vb)
+            K1 = _cross_d2(face_b, b_pr, sb, ub, vb) * (h * h / (s_b * s_b))
+            J1 = _cross_d3(face_b, b_pr, sb, ub, vb) \
+                * (_side_sigma(sb) * h ** 3 / (s_b ** 3))
+            poles = _hermite_to_bezier(P0, T0, K0, J0,
+                                       P1, T1 * -1.0, K1, J1, 7)
+        row_poles.append(poles)
+    # Exact construction: skin the rows' Hermite Beziers by interpolating
+    # their POLES across the seam (shared uniform parameters), so every
+    # sampled row's cross-section -- and with it the fed G1/G2/G3 boundary
+    # data -- survives construction verbatim. The previous point-grid
+    # interpolation re-parameterized the strip and smoothed the fed
+    # derivatives (the interpolant's boundary jerk came out ~0.5x the fed
+    # geometric jerk). Falls back to the old grid path if the pole
+    # assembly fails for any reason.
+    try:
+        return _skin_pole_rows(row_poles)
+    except Exception:
+        return grid_to_surface(
+            [_bezier_row_points(rp, n) for rp in row_poles])
 
 __all__ = [
     'blend_surface_closed',

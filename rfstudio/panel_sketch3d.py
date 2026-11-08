@@ -814,6 +814,7 @@ class Sketch3DPanel(object):
         self._plane_normal = (0.0, 0.0, 1.0)
         self._snap_pt = None
         self._snap_cands = []
+        self._snap_weak = []
         self._snap_shapes = []
         self._snap_feedback_root = None
         self._snap_shown_pt = None
@@ -2764,8 +2765,8 @@ class Sketch3DPanel(object):
                 self._cb_move = view.addEventCallback(
                     "SoLocation2Event", self._on_move)
                 self._ensure_key_cb(view)
-                self._snap_cands = snaputil.collect_strong_snap_points(
-                    doc.Document, exclude=None)
+                self._snap_cands, self._snap_weak = \
+                    snaputil.collect_ranked_points(doc.Document, exclude=None)
                 self._snap_shapes = [e for e, _o in
                                      snaputil.collect_snap_shapes(
                                          doc.Document, exclude=None)]
@@ -2905,7 +2906,8 @@ class Sketch3DPanel(object):
                 if moved:
                     px = snaputil._snap_tolerance_mm(view, 4.0)
                     self._snap_pt = snaputil.nearest_snap_ranked(
-                        view, self._snap_cands, self._snap_shapes, pos, px)
+                        view, self._snap_cands, self._snap_shapes, pos, px,
+                        weak_points=getattr(self, "_snap_weak", None))
                     try:
                         self._last_snap_px = (pos[0], pos[1])
                     except Exception:
@@ -3093,8 +3095,9 @@ class Sketch3DPanel(object):
                 if self._plane_grid_root is not None:
                     self._setup_plane_grid()
             # Keep snap candidates fresh so the just-placed point snaps
-            self._snap_cands = snaputil.collect_strong_snap_points(
-                FreeCADGui.ActiveDocument.Document, exclude=None)
+            self._snap_cands, self._snap_weak = \
+                snaputil.collect_ranked_points(
+                    FreeCADGui.ActiveDocument.Document, exclude=None)
             self._snap_shapes = [e for e, _o in
                                  snaputil.collect_snap_shapes(
                                      FreeCADGui.ActiveDocument.Document,
@@ -3118,8 +3121,8 @@ class Sketch3DPanel(object):
                     self.place_btn.setChecked(False)
                 self._ensure_key_cb(view)
                 doc = FreeCADGui.ActiveDocument.Document
-                self._snap_cands = snaputil.collect_strong_snap_points(
-                    doc, exclude=None)
+                self._snap_cands, self._snap_weak = \
+                    snaputil.collect_ranked_points(doc, exclude=None)
                 self._snap_shapes = [e for e, _o in
                                      snaputil.collect_snap_shapes(
                                          doc, exclude=None)]
@@ -3182,7 +3185,7 @@ class Sketch3DPanel(object):
                 px = snaputil._snap_tolerance_mm(view, 4.0)
                 best = snaputil.nearest_snap_ranked(
                     view, self._snap_cands, getattr(self, "_snap_shapes", []),
-                    pos, px)
+                    pos, px, weak_points=getattr(self, "_snap_weak", None))
             except Exception:
                 best = None
             if best is not None:

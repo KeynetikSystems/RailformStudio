@@ -128,22 +128,130 @@ _GORDON_CROSS_TOL = 0.02
 
 
 
+def _select_consistent_crossings(cand, order_i, order_j):
+    """Pick ONE crossing per (profile, guide) cell so the chosen grid is
+    monotone along every guide and every profile -- the fix for a network
+    where a pair crosses more than once (e.g. an S-shaped curve) and the
+    plain min-gap pick grabs the wrong lobe, scrambling the grid and folding
+    the Gordon surface (OCCT then raises Standard_ConstructionError).
+
+    `cand[i][j]` is that cell's candidate crossings as (tu, tv, gap),
+    PRE-SORTED by (gap, tu) so index 0 is the historic min-gap pick.
+    `order_i` / `order_j` are the profile / guide orderings along the shared
+    axes (from _consistent_grid). Returns (pu, pv, dd).
+
+    Method: start from the min-gap pick, fix the monotone direction of each
+    guide/profile from it, then relax (Gauss-Seidel): each multi-candidate
+    cell re-picks the candidate that least violates monotonicity against its
+    current neighbours in the ordered grid, breaking ties toward the smaller
+    gap (a truer crossing). Single-candidate cells never move, so a clean net
+    is returned unchanged. Pure arithmetic -- no FreeCAD, headless-testable.
+    """
+    nu, nv = len(cand), len(cand[0])
+    sel = [[0] * nv for _ in range(nu)]
+
+    def tv(i, j):
+        return cand[i][j][sel[i][j]][1]
+
+    def tu(i, j):
+        return cand[i][j][sel[i][j]][0]
+
+    def _dir(seq):
+        return 1.0 if (seq[-1] - seq[0]) >= 0.0 else -1.0
+
+    # Direction of increase fixed from the min-gap pick (candidate 0).
+    dir_v = [_dir([cand[order_i[a]][j][0][1] for a in range(nu)])
+             for j in range(nv)]
+    dir_u = [_dir([cand[i][order_j[b]][0][0] for b in range(nv)])
+             for i in range(nu)]
+    rank_i = {i: a for a, i in enumerate(order_i)}
+    rank_j = {j: b for b, j in enumerate(order_j)}
+
+    def _viol(key, lo, hi, d):
+        """How far `key` breaks the strict `d`-monotone bracket [lo, hi]
+        (either bound may be None at a grid edge)."""
+        p = 0.0
+        if lo is not None:
+            p += max(0.0, (lo - key) * d)
+        if hi is not None:
+            p += max(0.0, (key - hi) * d)
+        return p
+
+    for _pass in range(8):
+        changed = False
+        for i in range(nu):
+            for j in range(nv):
+                if len(cand[i][j]) == 1:
+                    continue
+                a, b = rank_i[i], rank_j[j]
+                lo_v = tv(order_i[a - 1], j) if a > 0 else None
+                hi_v = tv(order_i[a + 1], j) if a < nu - 1 else None
+                lo_u = tu(i, order_j[b - 1]) if b > 0 else None
+                hi_u = tu(i, order_j[b + 1]) if b < nv - 1 else None
+                best_k, best_cost = sel[i][j], None
+                for k, c in enumerate(cand[i][j]):
+                    v = (_viol(c[1], lo_v, hi_v, dir_v[j])
+                         + _viol(c[0], lo_u, hi_u, dir_u[i]))
+                    cost = (v, c[2])
+                    if best_cost is None or cost < best_cost:
+                        best_cost, best_k = cost, k
+                if best_k != sel[i][j]:
+                    sel[i][j] = best_k
+                    changed = True
+        if not changed:
+            break
+
+    pu = [[cand[i][j][sel[i][j]][0] for j in range(nv)] for i in range(nu)]
+    pv = [[cand[i][j][sel[i][j]][1] for j in range(nv)] for i in range(nu)]
+    dd = [[cand[i][j][sel[i][j]][2] for j in range(nv)] for i in range(nu)]
+    return pu, pv, dd
+
+
+def _consistent_grid(cand, bs_profiles, bs_guides):
+    """Order the profiles/guides along the shared axes (same normalised-
+    parameter averaging gordon_network uses) from the min-gap pick, then hand
+    the candidate grid to _select_consistent_crossings. Separated so the
+    selection is pure and headless-testable; this part needs the BSplines
+    only to compute the ordering."""
+    nu, nv = len(cand), len(cand[0])
+    pv0 = [[cand[i][j][0][1] for j in range(nv)] for i in range(nu)]
+    pu0 = [[cand[i][j][0][0] for j in range(nv)] for i in range(nu)]
+    u_bar = [sum(_norm_param(bs_guides[j], pv0[i][j]) for j in range(nv)) / nv
+             for i in range(nu)]
+    v_bar = [sum(_norm_param(bs_profiles[i], pu0[i][j]) for i in range(nu)) / nu
+             for j in range(nv)]
+    order_i = sorted(range(nu), key=lambda i: u_bar[i])
+    order_j = sorted(range(nv), key=lambda j: v_bar[j])
+    return _select_consistent_crossings(cand, order_i, order_j)
+
+
 def _intersect_grid(bs_profiles, bs_guides):
     """Best (tu, tv, gap) per (profile, guide). Ties on gap (all exact
     crossings) break on the smallest tu so the choice is deterministic.
-    NOTE: multi-crossing pairs still take the first crossing along the
-    profile; a network where that is the wrong one needs ordering by the
-    caller."""
+
+    For a network where some pair crosses MORE THAN ONCE (an S-shaped curve
+    meeting its partner on two lobes), the plain min-gap pick can grab the
+    wrong crossing and scramble the grid. When any cell has multiple
+    candidates, the selection is handed to _consistent_grid, which chooses one
+    crossing per cell so the grid stays monotone along every guide/profile.
+    A network where every pair crosses exactly once (or not at all) takes the
+    historic min-gap path unchanged."""
     nu, nv = len(bs_profiles), len(bs_guides)
-    pu = [[0.0] * nv for _ in range(nu)]
-    pv = [[0.0] * nv for _ in range(nu)]
-    dd = [[0.0] * nv for _ in range(nu)]
+    cand = [[None] * nv for _ in range(nu)]
+    multi = False
     for i in range(nu):
         for j in range(nv):
             pairs = _intersect_pair(bs_profiles[i], bs_guides[j])
-            best = min(pairs, key=lambda t: (round(t[2], 9), t[0]))
-            pu[i][j], pv[i][j], dd[i][j] = best
-    return pu, pv, dd
+            pairs = sorted(pairs, key=lambda t: (round(t[2], 9), t[0]))
+            cand[i][j] = pairs
+            if len(pairs) > 1:
+                multi = True
+    pu = [[cand[i][j][0][0] for j in range(nv)] for i in range(nu)]
+    pv = [[cand[i][j][0][1] for j in range(nv)] for i in range(nu)]
+    dd = [[cand[i][j][0][2] for j in range(nv)] for i in range(nu)]
+    if not multi:
+        return pu, pv, dd
+    return _consistent_grid(cand, bs_profiles, bs_guides)
 
 
 
@@ -1180,6 +1288,30 @@ def _perp(v):
 
 
 
+def _profile_runs_far_to_base(cache, pro, base, far):
+    """True when `pro` runs from the FAR rail to the BASE rail (so it must be
+    sampled reversed). Decided by which end actually lies on which rail
+    (point-to-rail DISTANCES); only when that is ambiguous (both orders
+    within 0.1% of the profile's chord, e.g. a profile floating midway
+    between the rails) does it fall back to comparing nearest-point
+    parameters. The parameter comparison alone was fragile: with rails that
+    are not parallel, the nearest-point parameters of the two ends differ by
+    a tiny amount in the wrong direction and a perfectly oriented profile
+    was reversed -- its bulge came out mirrored."""
+    e0, e1 = _eval01(pro, 0.0), _eval01(pro, 1.0)
+    try:
+        d = lambda pt, rail: Part.Vertex(pt).distToShape(rail)[0]   # noqa: E731
+        straight = d(e0, base) + d(e1, far)
+        flipped = d(e1, base) + d(e0, far)
+        tol = 1e-3 * max(e0.distanceToPoint(e1), 1e-9)
+        if abs(straight - flipped) > tol:
+            return flipped < straight
+    except Exception:
+        pass
+    return (cache.param(base, e1) + cache.param(far, e0)) < \
+           (cache.param(base, e0) + cache.param(far, e1))
+
+
 def two_rail_sweep(rail1, rail2, profiles, n_rail=40, n_prof=20):
     """Skin profile curves between two rails.
 
@@ -1200,8 +1332,7 @@ def two_rail_sweep(rail1, rail2, profiles, n_rail=40, n_prof=20):
     prev_up = None
     for pro in profiles:
         e0, e1 = _eval01(pro, 0.0), _eval01(pro, 1.0)
-        flip = (cache.param(rail1, e1) + cache.param(rail2, e0)) < \
-               (cache.param(rail1, e0) + cache.param(rail2, e1))
+        flip = _profile_runs_far_to_base(cache, pro, rail1, rail2)
         samp = [_eval01(pro, (1.0 - s) if flip else s) for s in cols]
         a, b = samp[0], samp[-1]
         chord = b.sub(a)
@@ -1530,11 +1661,13 @@ def _dedupe_stations(stations, gap=1e-9):
     return out
 
 
-def _deviation_of_curves(curves, shape, samples):
-    """Worst distance from points along each curve to `shape`: both ends
-    plus `samples` midpoints. Accepts edges or BSplineCurves (edges are
-    converted trim-aware). Cost is dominated by distToShape; keep `samples`
-    modest."""
+def _py_deviation_of_curves(curves, shape, samples):
+    """(reference) Worst distance from points along each curve to `shape`:
+    both ends plus `samples` midpoints. Accepts edges or BSplineCurves
+    (edges are converted trim-aware). Cost is dominated by distToShape;
+    keep `samples` modest. This stays first-class: it is the fallback
+    whenever the compiled gate (rfstudio.native.rfs_native) cannot serve
+    the call, and the correctness oracle it must agree with."""
     worst = 0.0
     n = max(1, int(samples))
     fracs = [0.0] + [(k + 0.5) / n for k in range(n)] + [1.0]
@@ -1548,6 +1681,196 @@ def _deviation_of_curves(curves, shape, samples):
                         Part.Vertex(c.value(fp + f * (lp - fp))
                                     ).distToShape(shape)[0])
     return worst
+
+
+class _NativeUnsupported(Exception):
+    """Shape/sample data the compiled deviation gate does not cover."""
+
+
+_NATIVE = {'checked': False, 'mod': None, 'umajor': False}
+
+
+def _flat_knots(surf, is_u):
+    """Flat (multiplicity-expanded) knot sequence, length = poles+deg+1.
+
+    UKnotSequence/VKnotSequence is that flat vector in FreeCAD 1.x; rebuild
+    from getUKnots/getUMultiplicities when an older/newer build disagrees."""
+    n = surf.NbUPoles if is_u else surf.NbVPoles
+    d = surf.UDegree if is_u else surf.VDegree
+    seq = list(surf.UKnotSequence if is_u else surf.VKnotSequence)
+    if len(seq) != n + d + 1:
+        kn = surf.getUKnots() if is_u else surf.getVKnots()
+        mu = surf.getUMultiplicities() if is_u else surf.getVMultiplicities()
+        seq = []
+        for k, m in zip(kn, mu):
+            seq.extend([k] * int(m))
+    if len(seq) != n + d + 1:
+        raise ValueError('knot sequence length %d != poles+degree+1 %d'
+                         % (len(seq), n + d + 1))
+    return seq
+
+
+def _homogeneous_poles(surf):
+    """(Nu, Nv, 4) array of (x*w, y*w, z*w, w) poles, axis0 = U.
+
+    getPoles()/getWeights() are verified to be U-major (axis0 = U) once per
+    process via debug_eval against surf.value; a mismatched build falls
+    back to the Python loop."""
+    import numpy
+    nu, nv = surf.NbUPoles, surf.NbVPoles
+    poles = surf.getPoles()
+    wts = surf.getWeights()
+    rows, cols = len(poles), len(poles[0])
+    if (rows, cols) != (nu, nv):
+        raise _NativeUnsupported(
+            'poles grid (%d,%d) != (Nu,Nv) (%d,%d)' % (rows, cols, nu, nv))
+    H = numpy.empty((nu, nv, 4))
+    for i in range(nu):
+        row = poles[i]
+        wrow = wts[i]
+        for j in range(nv):
+            p = row[j]
+            H[i, j, 0] = p.x
+            H[i, j, 1] = p.y
+            H[i, j, 2] = p.z
+            H[i, j, 3] = wrow[j]
+    return H
+
+
+def _native_gate():
+    """The loaded rfs_native module after a one-time orientation probe, or
+    None (then the pure-Python gate is used). Never raises."""
+    st = _NATIVE
+    if not st['checked']:
+        st['checked'] = True
+        try:
+            import numpy
+            from rfstudio.native import rfs_native as mod
+            # Endorse the U-major pole assumption with the module's own
+            # evaluator against a freshly built surface.
+            probe = Part.BSplineSurface()
+            probe.interpolate([[FreeCAD.Vector(0.0, 0.0, 0.0),
+                                FreeCAD.Vector(1.0, 0.0, 0.6)],
+                               [FreeCAD.Vector(0.0, 3.0, 0.4),
+                                FreeCAD.Vector(1.0, 3.0, 1.3)],
+                               [FreeCAD.Vector(0.0, 6.0, 0.1),
+                                FreeCAD.Vector(1.0, 6.0, 0.8)]])
+            H = _homogeneous_poles(probe)
+            ku = _flat_knots(probe, True)
+            kv = _flat_knots(probe, False)
+            um = ku[0] + 0.44 * (ku[-1] - ku[0])
+            vm = kv[0] + 0.57 * (kv[-1] - kv[0])
+            got = mod.debug_eval(H, numpy.asarray(ku), numpy.asarray(kv),
+                                 probe.UDegree, probe.VDegree, um, vm)
+            ref = probe.value(um, vm)
+            ok = max(abs(got[i] - ref[i]) for i in range(3)) < 1e-9
+            # a flipped pole grid must NOT match (guards coincident dims)
+            Ht = numpy.transpose(H, (1, 0, 2))
+            try:
+                got2 = mod.debug_eval(Ht, numpy.asarray(ku),
+                                      numpy.asarray(kv),
+                                      probe.UDegree, probe.VDegree, um, vm)
+                ok2 = max(abs(got2[i] - ref[i]) for i in range(3)) < 1e-9
+            except Exception:
+                ok2 = False
+            if ok and not ok2:
+                st['mod'] = mod
+                st['umajor'] = True
+        except Exception:
+            pass
+    return st['mod']
+
+
+def _gate_face_data(shape):
+    """Per-face (poles (Nu,Nv,4), knots_u, knots_v, deg_u, deg_v) tuples for
+    the compiled gate, or raise _NativeUnsupported.
+
+    Supported: BSplineSurface faces spanning their surface's NATURAL
+    parameter box (boundary trim == natural bounds) and not periodic --
+    i.e. exactly the face geometry produced by the sweep/loft/gordon
+    builders. Anything else (analytic faces, trimmed interior, periodic)
+    goes back to the Python reference loop."""
+    import numpy
+    faces = None
+    if hasattr(shape, 'Faces'):
+        try:
+            faces = list(shape.Faces)
+        except Exception:
+            faces = None
+    if not faces:
+        if hasattr(shape, 'Surface'):
+            faces = [shape]
+        else:
+            raise _NativeUnsupported('shape exposes no faces')
+    out = []
+    for f in faces:
+        try:
+            surf = f.Surface
+        except Exception:
+            raise _NativeUnsupported('face without a Surface')
+        if not isinstance(surf, Part.BSplineSurface):
+            raise _NativeUnsupported('non-bspline face')
+        if surf.isUPeriodic() or surf.isVPeriodic():
+            raise _NativeUnsupported('periodic surface')
+        du_, dv_ = surf.UDegree, surf.VDegree
+        ku = _flat_knots(surf, True)
+        kv = _flat_knots(surf, False)
+        # face must cover the surface's natural parameter box
+        umin, umax, vmin, vmax = f.ParameterRange
+        if (abs(umin - ku[du_]) > 1e-9 or abs(umax - ku[-1 - du_]) > 1e-9 or
+                abs(vmin - kv[dv_]) > 1e-9 or abs(vmax - kv[-1 - dv_]) > 1e-9):
+            raise _NativeUnsupported('face trimmed inside the natural box')
+        out.append((_homogeneous_poles(surf), numpy.asarray(ku),
+                    numpy.asarray(kv), du_, dv_))
+    if not out:
+        raise _NativeUnsupported('no faces')
+    return out
+
+
+def _native_deviation(curves, shape, samples):
+    """Compiled-gate implementation of _deviation_of_curves.
+
+    Point gathering is IDENTICAL to _py_deviation_of_curves (same
+    _to_bspline conversion, same fracs); only distance measurement is
+    handed to rfs_native.max_surface_deviation."""
+    mod = _native_gate()
+    if mod is None:
+        raise _NativeUnsupported('compiled gate unavailable')
+    face_tuples = _gate_face_data(shape)
+    n = max(1, int(samples))
+    fracs = [0.0] + [(k + 0.5) / n for k in range(n)] + [1.0]
+    pts = []
+    for c in curves:
+        c = _to_bspline(c)
+        if c is None:
+            continue
+        fp, lp = c.FirstParameter, c.LastParameter
+        for f in fracs:
+            p = c.value(fp + f * (lp - fp))
+            pts.append((p.x, p.y, p.z))
+    if not pts:
+        return 0.0
+    import numpy
+    pa = numpy.asarray(pts, dtype=float)
+    if pa.shape[0] and not numpy.isfinite(pa).all():
+        raise _NativeUnsupported('non-finite sample point')
+    return float(mod.max_surface_deviation(pa, face_tuples))
+
+
+def _deviation_of_curves(curves, shape, samples):
+    """Worst distance from points along each curve to `shape`: both ends
+    plus `samples` midpoints. Accepts edges or BSplineCurves (edges are
+    converted trim-aware).
+
+    Dispatches to the compiled projection gate when rfs_native is present
+    and the faces qualify (native bspline faces on their natural box); the
+    pure-Python reference loop handles everything else. Any failure inside
+    the native path falls back silently -- gate calls must never break a
+    sweep."""
+    try:
+        return _native_deviation(curves, shape, samples)
+    except Exception:
+        return _py_deviation_of_curves(curves, shape, samples)
 
 
 def _rail_order_warning(profile_params):
@@ -1679,8 +2002,7 @@ def multi_rail_sweep(rails, profiles, n_rail=40, n_prof=20):
     prev_up = None
     for pro in profiles:
         e0, e1 = _eval01(pro, 0.0), _eval01(pro, 1.0)
-        flip = (cache.param(base, e1) + cache.param(far, e0)) < \
-               (cache.param(base, e0) + cache.param(far, e1))
+        flip = _profile_runs_far_to_base(cache, pro, base, far)
 
         def P(t, _pro=pro, _flip=flip):
             return _eval01(_pro, 1.0 - t if _flip else t)
@@ -1886,9 +2208,16 @@ def _rail_tangent(arc, s):
     """
     eps = 1.0 / max(2.0 * len(arc.acc), 4.0)
     s = min(max(s, 0.0), 1.0)
-    lo, hi = max(s - eps, 0.0), min(s + eps, 1.0)
+    # `s` is an ARC FRACTION; the edge is evaluated in normalized PARAMETER
+    # space. The two only coincide on a uniformly parametrized rail, so map
+    # through the arc table first -- otherwise on a curved/chord-length
+    # parametrized rail the tangent is taken at the wrong point, the section
+    # plane leans off the spine and the swept tube's radius dips between the
+    # stations where the two happen to agree.
+    p = arc.param_at(s)
+    lo, hi = max(p - eps, 0.0), min(p + eps, 1.0)
     if hi - lo < 1e-12:
-        lo, hi = max(s - 2.0 * eps, 0.0), 1.0
+        lo, hi = max(p - 2.0 * eps, 0.0), 1.0
     d = _eval01(arc.edge, hi).sub(_eval01(arc.edge, lo))
     if d.Length < 1e-12:
         raise ValueError("single-rail sweep: rail has no tangent at "
@@ -1914,16 +2243,25 @@ def _rmf_frames(arc, stations, up0):
         if prev_up is None:
             ey = up0
         else:
-            v1 = t.sub(prev_tan)
-            c1 = v1.dot(v1)
+            # Rotation-minimizing transport: rotate the previous up vector
+            # about the axis (prev_tan x t) by the angle between the two
+            # tangents (Rodrigues). This replaces a "double reflection"
+            # that used the TANGENT difference as the first reflection
+            # vector: that single reflection already maps prev_tan onto t
+            # but negates any up component lying in the bend plane, and the
+            # follow-up reflection never fired -- so whenever the up vector
+            # lay in the plane the rail bends in (e.g. a closed round
+            # profile, whose polygon normal is ~ the rail tangent, leaves
+            # the seed up arbitrary) the frame flipped sign at EVERY
+            # station and the swept tube collapsed between stations.
             ey = prev_up
-            if c1 > 1e-14:
-                ey = ey - v1 * (2.0 * v1.dot(ey) / c1)
-                tl = prev_tan + v1 * (2.0 * v1.dot(t) / c1)
-                v2 = t.sub(tl)
-                c2 = v2.dot(v2)
-                if c2 > 1e-14:
-                    ey = ey - v2 * (2.0 * v2.dot(ey) / c2)
+            axis = prev_tan.cross(t)
+            sin_a = axis.Length
+            if sin_a > 1e-12:
+                cos_a = prev_tan.dot(t)
+                k = axis * (1.0 / sin_a)
+                ey = (prev_up * cos_a + k.cross(prev_up) * sin_a
+                      + k * (k.dot(prev_up) * (1.0 - cos_a)))
         ey = ey.sub(t * (ey.dot(t)))
         if ey.Length < 1e-9:
             ey = _perp(t)

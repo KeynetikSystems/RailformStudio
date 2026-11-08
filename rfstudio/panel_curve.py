@@ -19,9 +19,10 @@ except Exception:                     # older shim: widgets live in QtGui
 
 from rfstudio import parametric
 from rfstudio import snaputil
+from rfstudio import core
 from rfstudio.panel_base import (
     _EditPanelBase, _selected_points, _notify_overlay_unavailable,
-    _ShortcutHintBar, drop_callbacks,
+    _ShortcutHintBar, _CollapsibleGroup, drop_callbacks,
     _style_point_table, _delete_cell_button, _muted_color,
 )
 
@@ -89,14 +90,34 @@ class CurvePanel(_EditPanelBase):
                 if self._editor.ok:
                     self._editor.on_commit = self._fill_table
                     self._editor.creating = self.creating
+                    # Back-reference so viewport box selection can sync table rows
+                    self._editor._panel = self
+                    # Start the editor on the same construction plane as the panel
+                    try:
+                        self._editor.set_plane_family(self._plane_family)
+                    except Exception:
+                        pass
                 else:
                     self._editor = None
         self._pick_count = 0        # per-pick committed transactions
         self._picking = False
         self._cbid = None
         self._cbid_mov = None       # move-event callback for draw-mode snap
+        self._cb_key = None         # keyboard-event callback for Tab/XYZ/undo/finish
+        self._plane_family = "XY"   # active construction plane family
+        self._planar_mode = True    # ON = draw on construction plane; OFF = free-form 3D
+        self._axis_lock = None      # 'X', 'Y', 'Z' or None
+        self._rubber_root = None    # Coin3D rubberband root
+        self._rubber_sw = None      # Coin3D switch for rubberband line
+        self._rubber_coords = None  # Coin3D coordinates for rubberband line
+        self._last_click_time = 0.0
+        self._last_click_pos = (0, 0)
+        self._last_cursor_pt = None
+        self._num_input = None
+        self._ctrl = False
         self._snap_pt = None        # snapped 3D point, used by next click
-        self._snap_cands = []       # cached candidates for current pick session
+        self._snap_cands = []       # cached STRONG candidates for pick session
+        self._snap_weak = []        # cached off-curve control pts (weak tier)
         self._snap_shapes = []      # cached edges for exact projection snap
         self._snap_coin_root = None # Coin3D snap indicator root
         self._active_row = None
@@ -139,6 +160,55 @@ class CurvePanel(_EditPanelBase):
         self.shortcut_bar = _ShortcutHintBar("X/Y/Z: lock  |  Tab: plane  |  Esc: drop")
         self._lay.addWidget(self.shortcut_bar)
 
+        # ---- Planar-first authoring controls ---------------------------- #
+        planar_row = QtWidgets.QHBoxLayout()
+        self.planar_cb = QtWidgets.QCheckBox("Planar Mode")
+        self.planar_cb.setChecked(self._planar_mode)
+        self.planar_cb.setToolTip(
+            "ON = click/drag projects onto the active construction plane "
+            "(Class-A orthographic workflow). OFF = free-form 3D.")
+        self.planar_cb.toggled.connect(self._toggle_planar_mode)
+        planar_row.addWidget(self.planar_cb)
+
+        plane_lbl = QtWidgets.QLabel("Plane:")
+        plane_lbl.setStyleSheet("font-weight:bold;")
+        planar_row.addWidget(plane_lbl)
+        self.plane_combo = QtWidgets.QComboBox()
+        self.plane_combo.addItems(["XY", "YZ", "ZX"])
+        self.plane_combo.setCurrentText(self._plane_family)
+        self.plane_combo.setMaximumWidth(80)
+        self.plane_combo.currentTextChanged.connect(self._set_plane_family)
+        planar_row.addWidget(self.plane_combo)
+
+        planar_row.addStretch(1)
+
+        # View buttons: reorient camera + switch construction plane to match
+        v_top = QtWidgets.QPushButton("Top")
+        v_top.setToolTip("Top view — draw on XY plane")
+        v_top.setMaximumWidth(45)
+        v_top.clicked.connect(self._set_view_top)
+        planar_row.addWidget(v_top)
+
+        v_front = QtWidgets.QPushButton("Front")
+        v_front.setToolTip("Front view — draw on XZ (ZX) plane")
+        v_front.setMaximumWidth(50)
+        v_front.clicked.connect(self._set_view_front)
+        planar_row.addWidget(v_front)
+
+        v_side = QtWidgets.QPushButton("Side")
+        v_side.setToolTip("Side view — draw on YZ plane")
+        v_side.setMaximumWidth(50)
+        v_side.clicked.connect(self._set_view_side)
+        planar_row.addWidget(v_side)
+
+        v_axo = QtWidgets.QPushButton("3D")
+        v_axo.setToolTip("Axonometric view")
+        v_axo.setMaximumWidth(35)
+        v_axo.clicked.connect(self._set_view_axometric)
+        planar_row.addWidget(v_axo)
+
+        self._lay.addLayout(planar_row)
+
         # Add curve type converter controls
         self._add_converter_controls()
 
@@ -170,13 +240,65 @@ class CurvePanel(_EditPanelBase):
         self._lay.addLayout(convert_layout)
 
     def _build(self):
+        # 1. Direct Spline Operations row (always accessible at the top):
+        ops_row = QtWidgets.QHBoxLayout()
+        if self.kind in ("ControlCurve", "BezierCurve") or hasattr(self.obj, "Degree"):
+            self.elevate_btn = QtWidgets.QPushButton("Elevate Degree (p → p+1)")
+            self.elevate_btn.setToolTip("Add control poles for finer sculpting without altering the curve shape (exact degree elevation).")
+            self.elevate_btn.clicked.connect(self._on_elevate_degree)
+            ops_row.addWidget(self.elevate_btn)
+
+        self.fair_btn = QtWidgets.QPushButton("Fair Curve")
+        self.fair_btn.setToolTip("Smooth out wobbles by minimizing strain energy (Laplacian relaxation) while preserving endpoints.")
+        self.fair_btn.clicked.connect(self._on_fair_curve)
+        ops_row.addWidget(self.fair_btn)
+        self._lay.addLayout(ops_row)
+
+        # 2. Unified Canvas Drawing master toggle:
+        self.canvas_btn = QtWidgets.QPushButton("Canvas drawing: Active (click in 3D)")
+        self.canvas_btn.setCheckable(True)
+        self.canvas_btn.setChecked(self.creating)
+        self.canvas_btn.toggled.connect(self._toggle_canvas_drawing)
+        self.pick_btn = self.canvas_btn
+        self.draw_btn = self.canvas_btn
+        self._lay.addWidget(self.canvas_btn)
+
+        # 3. Parameters & Alignment (Expanded by default)
+        self.params_group = _CollapsibleGroup("Parameters & Alignment", collapsed=False)
+        self._scalar_controls(self.params_group.content_layout)
+
+        role_row = QtWidgets.QHBoxLayout()
+        role_row.addWidget(QtWidgets.QLabel("Surface Role:"))
+        self.role_combo = QtWidgets.QComboBox()
+        self.role_combo.addItem("None (Standard)")
+        self.role_combo.addItem("Profile (Blue - U Cross-Section)")
+        self.role_combo.addItem("Guide Rail (Amber - V Guide)")
+        cur_role = parametric.get_curve_role(self.obj)
+        self.role_combo.setCurrentIndex(1 if cur_role == "Profile" else (2 if cur_role == "GuideRail" else 0))
+        self.role_combo.currentIndexChanged.connect(self._on_role_combo_changed)
+        role_row.addWidget(self.role_combo)
+        role_row.addStretch(1)
+        self.params_group.content_layout.addLayout(role_row)
+
+        self.live = QtWidgets.QCheckBox("Live preview")
+        self.live.setChecked(True)
+        self.params_group.content_layout.addWidget(self.live)
+        self._lay.addWidget(self.params_group)
+
+        # 4. Coordinate Table (Collapsed by default during active drafting or if > 4 points)
+        self.coord_group = _CollapsibleGroup(
+            "Coordinate Table (%d points)" % len(self._points()),
+            collapsed=self.creating or len(self._points()) > 4
+        )
+        c_lay = self.coord_group.content_layout
+
         header_labels = ["X", "Y", "Z", "W" if self.kind == "ControlCurve" else "", ""]
         self.table = QtWidgets.QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(header_labels)
-        self.table.setSelectionBehavior(
-            QtWidgets.QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(
-            QtWidgets.QAbstractItemView.SingleSelection)   # one row only
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.selected_rows = set()
+        self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         hh.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
@@ -190,13 +312,10 @@ class CurvePanel(_EditPanelBase):
         vh.setFixedWidth(24)
         vh.sectionClicked.connect(lambda r: self._focus_row(r))
         self.table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        self.table.setMaximumHeight(220)
+        self.table.setMaximumHeight(200)
         self.table.setMaximumWidth(300)
-        # Let the active FreeCAD theme paint the table (background, gridlines,
-        # alternating rows, spinboxes); we only add axis-coloured X/Y/Z
-        # headers. See panel_base._style_point_table.
         _style_point_table(self.table)
-        self._lay.addWidget(self.table)
+        c_lay.addWidget(self.table)
 
         row = QtWidgets.QHBoxLayout()
         for label, slot in (("Add selected", self._add_sel),
@@ -205,45 +324,25 @@ class CurvePanel(_EditPanelBase):
             b = QtWidgets.QPushButton(label)
             b.clicked.connect(slot)
             row.addWidget(b)
-        self._lay.addLayout(row)
+        c_lay.addLayout(row)
 
-        self.pick_btn = QtWidgets.QPushButton("Pick in 3D: off")
-        self.pick_btn.setCheckable(True)
-        self.pick_btn.toggled.connect(self._toggle_pick)
-        self._lay.addWidget(self.pick_btn)
-
-        # Draw mode toggle button
-        self.draw_btn = QtWidgets.QPushButton("Draw Curve: off")
-        self.draw_btn.setCheckable(True)
-        self.draw_btn.toggled.connect(self._toggle_draw_mode)
-        self._lay.addWidget(self.draw_btn)
-
-        self._scalar_controls()
-
-        # ControlCurve B-splines: extra toggle that swaps the in-viewport editor
-        # from control-point dragging to knot dragging. Only meaningful when
-        # there is a 3D editor attached AND the curve kind supports knots.
+        # ControlCurve B-splines: knot editor toggle
         if self.kind == "ControlCurve" and getattr(self, "_editor", None) is not None:
             self._knot_toggle = QtWidgets.QCheckBox("Edit knots (drag in viewport)")
             self._knot_toggle.setChecked(False)
             self._knot_toggle.toggled.connect(self._toggle_knot_editor)
-            self._lay.addWidget(self._knot_toggle)
+            c_lay.addWidget(self._knot_toggle)
             self.table.itemSelectionChanged.connect(self._sync_knot_highlight)
 
-        # Symmetric editing: model only half, drag mirrors the partner
-        # point in this SAME object. Only meaningful for point-defined
-        # curve kinds with a live 3D editor attached.
+        # Symmetric editing
         if self.kind in ("InterpCurve", "ControlCurve", "ApproxCurve", "Polyline", "BezierCurve") \
                 and getattr(self, "_editor", None) is not None:
-            # Insert-on-click toggle. Off by default: a plain viewport click
-            # selects/drags points; a segment click inserts a point only when
-            # this is on OR Shift is held (mirrors PointEditor.insert_on_click).
             self._insert_toggle = QtWidgets.QCheckBox(
                 "Insert point on segment click (else Shift+click)")
             self._insert_toggle.setChecked(
                 bool(getattr(self._editor, "insert_on_click", False)))
             self._insert_toggle.toggled.connect(self._toggle_insert_on_click)
-            self._lay.addWidget(self._insert_toggle)
+            c_lay.addWidget(self._insert_toggle)
 
             sym_row = QtWidgets.QHBoxLayout()
             self.sym_toggle = QtWidgets.QCheckBox("Symmetric editing (model half)")
@@ -259,42 +358,36 @@ class CurvePanel(_EditPanelBase):
             sym_row.addWidget(self.sym_toggle)
             sym_row.addWidget(self.sym_plane_combo)
 
-            # Add promote to MFP button
             self.promote_btn = QtWidgets.QPushButton("Promote to MFP")
             self.promote_btn.setToolTip(
                 "Convert this symmetric curve into an explicit MirrorFP pair")
             self.promote_btn.clicked.connect(self._promote_to_mfp)
             sym_row.addWidget(self.promote_btn)
+            c_lay.addLayout(sym_row)
 
-            self._lay.addLayout(sym_row)
-
-            # Bezier-specific controls
             if self.kind == "BezierCurve":
                 bezier_row = QtWidgets.QHBoxLayout()
                 bezier_row.addWidget(QtWidgets.QLabel("Handle Type:"))
                 self.handle_type_combo = QtWidgets.QComboBox()
-                self.handle_type_combo.addItems(["Auto", "Aligned", "Vector", "Free"])
+                self.handle_type_combo.addItems(["Auto", "Aligned", "Mirrored", "Vector", "Free"])
                 self.handle_type_combo.currentTextChanged.connect(self._on_handle_type_changed)
                 bezier_row.addWidget(self.handle_type_combo)
                 bezier_row.addStretch()
-                self._lay.addLayout(bezier_row)
+                c_lay.addLayout(bezier_row)
 
-                # Add button to toggle handle visibility
                 self.toggle_handles_btn = QtWidgets.QPushButton("Show Handles: On")
                 self.toggle_handles_btn.setCheckable(True)
                 self.toggle_handles_btn.setChecked(True)
                 self.toggle_handles_btn.toggled.connect(self._toggle_handle_visibility)
-                self._lay.addWidget(self.toggle_handles_btn)
-
+                c_lay.addWidget(self.toggle_handles_btn)
         else:
             self.sym_toggle = None
             self.sym_plane_combo = None
 
-        self.live = QtWidgets.QCheckBox("Live preview")
-        self.live.setChecked(True)
-        self._lay.addWidget(self.live)
+        self._lay.addWidget(self.coord_group)
 
-        # Curvature visualization controls
+        # 5. Curvature visualization controls (Collapsed by default)
+        self.curv_group = _CollapsibleGroup("Curvature Combs & Quality", collapsed=True)
         curv_layout = QtWidgets.QHBoxLayout()
         self.show_curvature_checkbox = QtWidgets.QCheckBox("Show curvature")
         self.show_curvature_checkbox.setChecked(False)
@@ -308,61 +401,94 @@ class CurvePanel(_EditPanelBase):
         self.curvature_scale_spinbox.valueChanged.connect(self._on_curvature_scale_changed)
         curv_layout.addWidget(self.curvature_scale_spinbox)
         curv_layout.addStretch()
-        self._lay.addLayout(curv_layout)
+        self.curv_group.content_layout.addLayout(curv_layout)
+        self._lay.addWidget(self.curv_group)
 
-        # Constraints section
+        # 5b. Multi-CV transform (Phase 1: collective translate/scale/rotate
+        # of selected control points; works with table multi-select and
+        # viewport Ctrl+drag box selection).
+        self.multicv_group = _CollapsibleGroup("Multi-CV Transform", collapsed=True)
+        mc_layout = QtWidgets.QVBoxLayout()
+
+        mc_info = QtWidgets.QLabel("0 points selected (Ctrl+click rows, or Ctrl+drag in viewport)")
+        mc_info.setStyleSheet("color:palette(mid);font-size:11px;padding:2px 0;")
+        self.multicv_info = mc_info
+        mc_layout.addWidget(mc_info)
+
+        # Delta XYZ translate
+        trans_row = QtWidgets.QHBoxLayout()
+        trans_row.addWidget(QtWidgets.QLabel("Move Δ (mm):"))
+        self.mc_dx = QtWidgets.QDoubleSpinBox(); self.mc_dx.setRange(-1e6, 1e6); self.mc_dx.setDecimals(3); self.mc_dx.setValue(0.0)
+        self.mc_dy = QtWidgets.QDoubleSpinBox(); self.mc_dy.setRange(-1e6, 1e6); self.mc_dy.setDecimals(3); self.mc_dy.setValue(0.0)
+        self.mc_dz = QtWidgets.QDoubleSpinBox(); self.mc_dz.setRange(-1e6, 1e6); self.mc_dz.setDecimals(3); self.mc_dz.setValue(0.0)
+        for sb in (self.mc_dx, self.mc_dy, self.mc_dz):
+            sb.setSingleStep(1.0); sb.setKeyboardTracking(False); trans_row.addWidget(sb)
+        mc_btn = QtWidgets.QPushButton("Move Selected")
+        mc_btn.setToolTip("Apply the same ΔXYZ to every selected control point")
+        mc_btn.clicked.connect(self._on_mc_move_selected)
+        trans_row.addWidget(mc_btn)
+        mc_layout.addLayout(trans_row)
+
+        # Scale around centroid
+        scale_row = QtWidgets.QHBoxLayout()
+        scale_row.addWidget(QtWidgets.QLabel("Scale about centroid:"))
+        self.mc_scale = QtWidgets.QDoubleSpinBox(); self.mc_scale.setRange(0.001, 1000.0); self.mc_scale.setDecimals(4); self.mc_scale.setValue(1.0); self.mc_scale.setSingleStep(0.1)
+        scale_row.addWidget(self.mc_scale)
+        sc_btn = QtWidgets.QPushButton("Scale Selected")
+        sc_btn.setToolTip("Scale selected control points about their centroid")
+        sc_btn.clicked.connect(self._on_mc_scale_selected)
+        scale_row.addWidget(sc_btn)
+        mc_layout.addLayout(scale_row)
+
+        # Rotate around centroid
+        rot_row = QtWidgets.QHBoxLayout()
+        rot_row.addWidget(QtWidgets.QLabel("Rotate about centroid (deg):"))
+        self.mc_rot = QtWidgets.QDoubleSpinBox(); self.mc_rot.setRange(-360.0, 360.0); self.mc_rot.setDecimals(2); self.mc_rot.setValue(0.0); self.mc_rot.setSingleStep(5.0)
+        rot_row.addWidget(self.mc_rot)
+        rt_btn = QtWidgets.QPushButton("Rotate Selected")
+        rt_btn.setToolTip("Rotate selected control points about their centroid")
+        rt_btn.clicked.connect(self._on_mc_rotate_selected)
+        rot_row.addWidget(rt_btn)
+        mc_layout.addLayout(rot_row)
+
+        self.multicv_group.content_layout.addLayout(mc_layout)
+        self._lay.addWidget(self.multicv_group)
+
+        # 6. Constraints section (Collapsed by default)
+        self.cons_group = _CollapsibleGroup("Geometric Constraints (0 active)", collapsed=True)
         constraints_layout = QtWidgets.QVBoxLayout()
-        constraints_layout.addWidget(QtWidgets.QLabel("Constraints:"))
 
-        # Constraint buttons
         btn_layout = QtWidgets.QHBoxLayout()
-        self.distance_btn = QtWidgets.QPushButton("Distance")
-        self.distance_btn.clicked.connect(self._add_distance_constraint)
-        btn_layout.addWidget(self.distance_btn)
-
-        self.horizontal_btn = QtWidgets.QPushButton("Horizontal")
-        self.horizontal_btn.clicked.connect(self._add_horizontal_constraint)
-        btn_layout.addWidget(self.horizontal_btn)
-
-        self.vertical_btn = QtWidgets.QPushButton("Vertical")
-        self.vertical_btn.clicked.connect(self._add_vertical_constraint)
-        btn_layout.addWidget(self.vertical_btn)
-
-        self.angle_btn = QtWidgets.QPushButton("Angle")
-        self.angle_btn.clicked.connect(self._add_angle_constraint)
-        btn_layout.addWidget(self.angle_btn)
-
-        self.coincide_btn = QtWidgets.QPushButton("Coincide")
-        self.coincide_btn.clicked.connect(self._add_coincidence_constraint)
-        btn_layout.addWidget(self.coincide_btn)
-
-        self.on_curve_btn = QtWidgets.QPushButton("On Curve")
-        self.on_curve_btn.setToolTip(
-            "Pin the selected point(s) onto a curve: select the point row(s) "
-            "here, then select a target edge in the 3D view, then click.")
-        self.on_curve_btn.clicked.connect(self._add_on_curve_constraint)
-        btn_layout.addWidget(self.on_curve_btn)
-
+        for name, slot, tip in [
+            ("Distance", self._add_distance_constraint, "Constrain distance between two points"),
+            ("Horizontal", self._add_horizontal_constraint, "Constrain segment horizontal"),
+            ("Vertical", self._add_vertical_constraint, "Constrain segment vertical"),
+            ("Angle", self._add_angle_constraint, "Constrain angle of segment"),
+            ("Coincide", self._add_coincidence_constraint, "Constrain two points coincident"),
+            ("On Curve", self._add_on_curve_constraint, "Pin selected point onto another curve"),
+        ]:
+            b = QtWidgets.QPushButton(name)
+            b.setToolTip(tip)
+            b.clicked.connect(slot)
+            btn_layout.addWidget(b)
         constraints_layout.addLayout(btn_layout)
 
-        # Constraint list
         self.constraint_list = QtWidgets.QListWidget()
         self.constraint_list.setMaximumHeight(100)
         constraints_layout.addWidget(self.constraint_list)
 
-        # Remove constraint button
         self.remove_constraint_btn = QtWidgets.QPushButton("Remove Selected")
         self.remove_constraint_btn.clicked.connect(self._remove_constraint)
         constraints_layout.addWidget(self.remove_constraint_btn)
 
-        # Constraint status feedback
         self.constraint_status = QtWidgets.QLabel("")
         self.constraint_status.setWordWrap(True)
         self.constraint_status.setStyleSheet(
-            "color:#9aa6b2;font-size:11px;padding:2px 0;")
+            "color:palette(mid);font-size:11px;padding:2px 0;")
         constraints_layout.addWidget(self.constraint_status)
 
-        self._lay.addLayout(constraints_layout)
+        self.cons_group.content_layout.addLayout(constraints_layout)
+        self._lay.addWidget(self.cons_group)
 
         # Viewport grid (XY, YZ, XZ planes)
         self._setup_viewport_grid()
@@ -373,7 +499,7 @@ class CurvePanel(_EditPanelBase):
         # existing curve keeps pick OFF -- a stray viewport click into an
         # edit session must not silently insert or move points.
         if self.creating:
-            self.pick_btn.setChecked(True)
+            self.canvas_btn.setChecked(True)
 
     def _on_handle_type_changed(self, htype):
         """Handle handle type selection change."""
@@ -473,8 +599,24 @@ class CurvePanel(_EditPanelBase):
                 pass
             self._curvature_overlay = None
 
+    def _on_role_combo_changed(self, idx):
+        """Update curve role (Profile / Guide Rail / None) and apply viewport styling."""
+        role = "None"
+        if idx == 1:
+            role = "Profile"
+        elif idx == 2:
+            role = "GuideRail"
+        parametric.set_curve_role(self.obj, role)
+        from rfstudio import statusbar
+        if role == "Profile":
+            statusbar.flash("Curve role: Profile (Blue, auto-routes to surface U-Profiles)")
+        elif role == "GuideRail":
+            statusbar.flash("Curve role: Guide Rail (Amber, auto-routes to surface V-Rails)")
+        else:
+            statusbar.flash("Curve role: None")
+
     # ---- per-kind scalar property controls (Closed / Degree / Tolerance) --
-    def _scalar_controls(self):
+    def _scalar_controls(self, target_layout=None):
         """Auto-generate simple controls for this curve object's own
         scalar properties -- e.g. Closed (Interp/Polyline), Degree
         (Control/Approx), Tolerance (Approx). Mirrors
@@ -484,6 +626,7 @@ class CurvePanel(_EditPanelBase):
         skipped -- it's edited via the in-viewport knot-drag editor
         (editmode.KnotEditor), not a spinbox here.
         """
+        self._target_scalar_layout = target_layout or self._lay
         obj = self.obj
         for name in obj.PropertiesList:
             if obj.getGroupOfProperty(name) != self.kind or name == "Knots":
@@ -495,13 +638,16 @@ class CurvePanel(_EditPanelBase):
                 self._add_int_ctrl(name)
             elif tid == "App::PropertyFloat":
                 self._add_float_ctrl(name)
+            elif tid == "App::PropertyEnumeration":
+                self._add_enum_ctrl(name)
 
     def _row_ctrl(self, label, widget):
         r = QtWidgets.QHBoxLayout()
         r.addWidget(QtWidgets.QLabel(label))
         r.addStretch(1)
         r.addWidget(widget)
-        self._lay.addLayout(r)
+        target = getattr(self, "_target_scalar_layout", None) or self._lay
+        target.addLayout(r)
 
     def _add_bool_ctrl(self, name):
         cb = QtWidgets.QCheckBox()
@@ -524,6 +670,28 @@ class CurvePanel(_EditPanelBase):
         sb.setValue(float(getattr(self.obj, name)))
         sb.valueChanged.connect(lambda v, n=name: self._set(n, v))
         self._row_ctrl(name, sb)
+
+    def _add_enum_ctrl(self, name):
+        cb = QtWidgets.QComboBox()
+        enums = []
+        try:
+            enums = self.obj.getEnumerationsOfProperty(name)
+        except Exception:
+            enums = []
+        if not enums:
+            val = getattr(self.obj, name, None)
+            if isinstance(val, (list, tuple)):
+                enums = list(val)
+            elif isinstance(val, str):
+                enums = [val]
+        for item in enums:
+            cb.addItem(str(item))
+        cur = str(getattr(self.obj, name, ""))
+        idx = cb.findText(cur)
+        if idx >= 0:
+            cb.setCurrentIndex(idx)
+        cb.currentTextChanged.connect(lambda v, n=name: self._set(n, v))
+        self._row_ctrl(name, cb)
 
     # ---- symmetric editing (model only half) ------------------------ #
     def _toggle_insert_on_click(self, on):
@@ -594,6 +762,8 @@ class CurvePanel(_EditPanelBase):
 
     def _fill_table(self):
         pts = self._points()
+        if hasattr(self, "coord_group"):
+            self.coord_group.setTitle("Coordinate Table (%d points)" % len(pts))
         # Ensure weights list matches points length
         if len(self._weights) < len(pts):
             self._weights.extend([1.0] * (len(pts) - len(self._weights)))
@@ -730,6 +900,100 @@ class CurvePanel(_EditPanelBase):
         if not rows and self._active_row is not None:
             rows = [self._active_row]
         return rows
+
+    def _on_table_selection_changed(self):
+        """Sync multi-CV selection between the coordinate table and viewport.
+
+        When the user Ctrl/Cmd-clicks or Shift-clicks rows in the table,
+        highlight the corresponding points in the 3D editor (yellow squares)
+        and track them in self.selected_rows for collective transforms.
+        """
+        rows = self._selected_rows()
+        self.selected_rows = set(rows)
+        if self._editor is not None and hasattr(self._editor, "highlight_points"):
+            self._editor.highlight_points(rows)
+        # Update the multi-CV info label
+        if hasattr(self, "multicv_info"):
+            n = len(rows)
+            self.multicv_info.setText(
+                "%d point%s selected (Ctrl+click rows, or Ctrl+drag in viewport)"
+                % (n, "" if n == 1 else "s"))
+
+    def _on_mc_move_selected(self):
+        """Apply the same ΔXYZ to every selected control point."""
+        if not self.selected_rows:
+            return
+        dx, dy, dz = self.mc_dx.value(), self.mc_dy.value(), self.mc_dz.value()
+        if dx == 0.0 and dy == 0.0 and dz == 0.0:
+            return
+        pts = list(self._points())
+        from FreeCAD import Vector
+        delta = Vector(dx, dy, dz)
+        for i in sorted(self.selected_rows):
+            if 0 <= i < len(pts):
+                pts[i] = pts[i] + delta
+        self._set_points(pts)
+        self.recompute()
+        self._fill_table()
+        if self._editor is not None:
+            self._editor.highlight_points(self.selected_rows)
+            self._editor.commit()
+
+    def _on_mc_scale_selected(self):
+        """Scale selected control points about their centroid."""
+        if not self.selected_rows:
+            return
+        s = self.mc_scale.value()
+        if abs(s - 1.0) < 1e-9:
+            return
+        pts = list(self._points())
+        from FreeCAD import Vector
+        sel_pts = [pts[i] for i in sorted(self.selected_rows) if 0 <= i < len(pts)]
+        if not sel_pts:
+            return
+        c = sum((Vector(p.x, p.y, p.z) for p in sel_pts), Vector(0, 0, 0)) * (1.0 / len(sel_pts))
+        for i in sorted(self.selected_rows):
+            if 0 <= i < len(pts):
+                p = Vector(pts[i].x, pts[i].y, pts[i].z)
+                pts[i] = c + (p - c) * s
+        self._set_points(pts)
+        self.recompute()
+        self._fill_table()
+        if self._editor is not None:
+            self._editor.highlight_points(self.selected_rows)
+            self._editor.commit()
+
+    def _on_mc_rotate_selected(self):
+        """Rotate selected control points about their centroid (degrees)."""
+        if not self.selected_rows:
+            return
+        deg = self.mc_rot.value()
+        if abs(deg) < 1e-9:
+            return
+        import math
+        rad = math.radians(deg)
+        ca, sa = math.cos(rad), math.sin(rad)
+        pts = list(self._points())
+        from FreeCAD import Vector
+        sel_pts = [pts[i] for i in sorted(self.selected_rows) if 0 <= i < len(pts)]
+        if not sel_pts:
+            return
+        c = sum((Vector(p.x, p.y, p.z) for p in sel_pts), Vector(0, 0, 0)) * (1.0 / len(sel_pts))
+        # Rotation axis: view direction (approximate; use Z for now)
+        for i in sorted(self.selected_rows):
+            if 0 <= i < len(pts):
+                p = Vector(pts[i].x, pts[i].y, pts[i].z)
+                d = p - c
+                # Rotate in XY plane about Z axis
+                x2 = c.x + ca * d.x - sa * d.y
+                y2 = c.y + sa * d.x + ca * d.y
+                pts[i] = Vector(x2, y2, p.z)
+        self._set_points(pts)
+        self.recompute()
+        self._fill_table()
+        if self._editor is not None:
+            self._editor.highlight_points(self.selected_rows)
+            self._editor.commit()
 
     # ---- 3D point highlight + RGB axis gizmo (Coin overlay) ---- #
     def _setup_highlight(self):
@@ -920,12 +1184,18 @@ class CurvePanel(_EditPanelBase):
             except Exception:
                 pass
             self._editor = None
+        if getattr(self, "_cbid", None) is not None:
+            self._toggle_pick(False)
+        self._remove_rubberband()
+        self._hide_numeric_input()
         self._teardown_highlight()
         self._remove_viewport_grid()
         self._hide_curvature()
+        from rfstudio import statusbar
+        statusbar.clear()
 
-    def _setup_viewport_grid(self):
-        """Set up a grid in the XY, YZ, and XZ planes for viewport reference."""
+    def _setup_viewport_grid(self, plane=None):
+        """Set up a grid in the active construction plane for viewport reference."""
         try:
             from pivy import coin
             doc = FreeCADGui.ActiveDocument
@@ -935,20 +1205,14 @@ class CurvePanel(_EditPanelBase):
             if view is None:
                 return
             sg = view.getSceneGraph()
-            # Create a root separator for the grid
             self._viewport_grid_root = coin.SoSeparator()
-            # A single, sparse XY ground grid. The old version drew THREE full
-            # planes (XY/YZ/XZ) at 0.25 spacing over 500 units -- ~2000 lines
-            # per axis on each plane. Zoomed out those lines merged into solid
-            # gray sheets that obscured the model from every angle. Now: one
-            # ground plane, two tiers (minor + major), far fewer lines.
             size = 200.0        # total extent (units)
             minor = 5.0         # fine grid spacing
             major = 25.0        # heavier reference lines
             half = size / 2.0
+            pname = plane or getattr(self, "_plane_family", "XY")
 
             def _grid_plane(step, rgb):
-                """One set of XY grid lines at `step` spacing, colour `rgb`."""
                 sep = coin.SoSeparator()
                 col = coin.SoBaseColor()
                 col.rgb = rgb
@@ -959,10 +1223,21 @@ class CurvePanel(_EditPanelBase):
                 n = int(round(size / step))
                 for i in range(n + 1):
                     c = -half + i * step
-                    verts.extend([(-half, c, 0.0), (half, c, 0.0)])   # along X
-                    nverts.append(2)
-                    verts.extend([(c, -half, 0.0), (c, half, 0.0)])   # along Y
-                    nverts.append(2)
+                    if pname == "YZ":
+                        verts.extend([(0.0, -half, c), (0.0, half, c)])
+                        nverts.append(2)
+                        verts.extend([(0.0, c, -half), (0.0, c, half)])
+                        nverts.append(2)
+                    elif pname == "ZX":
+                        verts.extend([(-half, 0.0, c), (half, 0.0, c)])
+                        nverts.append(2)
+                        verts.extend([(c, 0.0, -half), (c, 0.0, half)])
+                        nverts.append(2)
+                    else:  # XY or Camera default
+                        verts.extend([(-half, c, 0.0), (half, c, 0.0)])
+                        nverts.append(2)
+                        verts.extend([(c, -half, 0.0), (c, half, 0.0)])
+                        nverts.append(2)
                 coords.point.setValues(0, len(verts), verts)
                 lines.numVertices.setValues(0, len(nverts), nverts)
                 sep.addChild(coords)
@@ -970,13 +1245,106 @@ class CurvePanel(_EditPanelBase):
                 return sep
 
             # minor faint, major slightly brighter so scale still reads
-            self._viewport_grid_root.addChild(_grid_plane(minor, (0.28, 0.28, 0.28)))
-            self._viewport_grid_root.addChild(_grid_plane(major, (0.45, 0.45, 0.45)))
+            self._viewport_grid_root.addChild(_grid_plane(minor, (0.15, 0.15, 0.15)))
+            self._viewport_grid_root.addChild(_grid_plane(major, (0.25, 0.25, 0.25)))
             sg.addChild(self._viewport_grid_root)
         except Exception as exc:
             FreeCAD.Console.PrintWarning(
                 "Railform: Viewport grid unavailable (%s)\n" % exc)
             self._viewport_grid_root = None
+
+    def _update_plane_grid(self):
+        self._remove_viewport_grid()
+        self._setup_viewport_grid(self._plane_family)
+
+    def _set_plane_family(self, name):
+        """Switch the active construction plane and propagate to the live editor.
+
+        Called by Tab cycling, view buttons (Top/Front/Side), and the plane
+        combo. Updates the viewport grid and the PointEditor so drag stays
+        constrained to the same plane.
+        """
+        self._plane_family = name
+        self._update_plane_grid()
+        # Propagate to the live viewport editor so drags stay on-plane.
+        ed = getattr(self, "_editor", None)
+        if ed is not None and hasattr(ed, "set_plane_family"):
+            try:
+                ed.set_plane_family(name)
+            except Exception:
+                pass
+        # Refresh the cursor HUD plane badge if visible
+        try:
+            from rfstudio import statusbar
+            statusbar.flash("Plane: %s" % name)
+        except Exception:
+            pass
+
+    def _toggle_planar_mode(self, on):
+        """Enable/disable planar-first drawing.
+
+        ON  = click/drag projects onto the active construction plane (Class-A
+              orthographic workflow).
+        OFF = free-form 3D; the cursor lands at raw view depth.
+        """
+        self._planar_mode = bool(on)
+        try:
+            from rfstudio import statusbar
+            statusbar.flash("Planar Mode: %s" % ("ON" if self._planar_mode else "OFF (free 3D)"))
+        except Exception:
+            pass
+
+    def _set_view_top(self):
+        """Top view: camera down -Z, construction plane = XY."""
+        view = self._active_view()
+        if view is None:
+            return
+        try:
+            view.viewTop()
+        except Exception:
+            pass
+        self._set_plane_family("XY")
+
+    def _set_view_front(self):
+        """Front view: camera down -Y, construction plane = XZ (named ZX in our convention)."""
+        view = self._active_view()
+        if view is None:
+            return
+        try:
+            view.viewFront()
+        except Exception:
+            pass
+        self._set_plane_family("ZX")
+
+    def _set_view_side(self):
+        """Side view: camera down -X, construction plane = YZ."""
+        view = self._active_view()
+        if view is None:
+            return
+        try:
+            view.viewSide()
+        except Exception:
+            pass
+        self._set_plane_family("YZ")
+
+    def _set_view_axometric(self):
+        """Axonometric 3D view; keep current plane but allow free-form 3D hint."""
+        view = self._active_view()
+        if view is None:
+            return
+        try:
+            view.viewAxometric()
+        except Exception:
+            pass
+
+    def _active_view(self):
+        try:
+            doc = FreeCADGui.ActiveDocument
+            if doc is None:
+                return None
+            return doc.ActiveView
+        except Exception:
+            return None
 
     def _promote_to_mfp(self):
         """Promote the current symmetric curve into an explicit MFP pair."""
@@ -1174,9 +1542,98 @@ class CurvePanel(_EditPanelBase):
     def _down(self):
         self._move(1)
 
-    # ---- 3D picking (best-effort) ---- #
+    def _on_elevate_degree(self):
+        """Elevate B-Spline curve degree by 1 (p -> p+1), preserving exact shape."""
+        import Part
+        from rfstudio import core, statusbar
+        try:
+            edge = getattr(self.obj, "Shape", None)
+            source = None
+            if edge is not None and getattr(edge, "Edges", None) and len(edge.Edges) > 0:
+                first_edge = edge.Edges[0]
+                if hasattr(first_edge, "Curve") and isinstance(first_edge.Curve, Part.BSplineCurve):
+                    source = first_edge
+            if source is None:
+                source = self._points()
+
+            deg = getattr(self.obj, "Degree", None)
+            target = (deg + 1) if deg is not None else None
+            res = core.elevate_curve_degree(source, target_degree=target)
+
+            new_poles = res["poles"]
+            new_deg = res["degree"]
+
+            if hasattr(self.obj, "Degree"):
+                self.obj.Degree = new_deg
+            if hasattr(self.obj, "Weights") and "weights" in res:
+                self._weights = list(res["weights"])
+                self.obj.Weights = self._weights
+            if hasattr(self.obj, "Knots") and "knots" in res:
+                self.obj.Knots = list(res["knots"])
+            if hasattr(self.obj, "Mults") and "mults" in res:
+                self.obj.Mults = list(res["mults"])
+
+            self._set_points(new_poles)
+            self._fill_table()
+            if self._editor is not None:
+                try:
+                    self._editor._refresh_markers()
+                    self._editor._refresh_arrows()
+                except Exception:
+                    pass
+            statusbar.flash("Elevated curve degree to %d (%d poles, exact shape preserved)"
+                            % (new_deg, len(new_poles)))
+        except Exception as exc:
+            statusbar.flash("Degree elevation failed: %s" % exc, error=True)
+
+    def _on_fair_curve(self):
+        """Smooth curve points while fixing endpoints."""
+        from rfstudio import core, statusbar
+        pts = self._points()
+        if len(pts) < 4:
+            statusbar.flash("Fair curve requires at least 4 points", error=True)
+            return
+        try:
+            smoothed = core.fair_curve(pts, iterations=5, strength=0.4, fix_endpoints=True)
+            self._set_points(smoothed)
+            self._fill_table()
+            if self._editor is not None:
+                try:
+                    self._editor._refresh_markers()
+                    self._editor._refresh_arrows()
+                except Exception:
+                    pass
+            statusbar.flash("Curve faired: smoothed wobbles while preserving endpoints")
+        except Exception as exc:
+            statusbar.flash("Curve fairing failed: %s" % exc, error=True)
+
+    def _toggle_canvas_drawing(self, on):
+        """Unified canvas drawing mode for interactive point authoring."""
+        if hasattr(self, "canvas_btn"):
+            self.canvas_btn.blockSignals(True)
+            self.canvas_btn.setChecked(bool(on))
+            self.canvas_btn.setText(
+                "Canvas Drawing: Active (click in 3D | Enter to finish)" if on
+                else "Canvas Drawing: Paused (click to resume)"
+            )
+            self.canvas_btn.blockSignals(False)
+        self._toggle_pick(on)
+
+    def _toggle_draw_mode(self, on):
+        """Legacy alias routing to unified canvas drawing mode."""
+        self._toggle_canvas_drawing(on)
+
+    # ---- 3D picking & canvas drafting ---- #
     def _toggle_pick(self, on):
-        self.pick_btn.setText("Pick in 3D: on" if on else "Pick in 3D: off")
+        if hasattr(self, "canvas_btn") and self.canvas_btn.isChecked() != bool(on):
+            self.canvas_btn.blockSignals(True)
+            self.canvas_btn.setChecked(bool(on))
+            self.canvas_btn.setText(
+                "Canvas Drawing: Active (click in 3D | Enter to finish)" if on
+                else "Canvas Drawing: Paused (click to resume)"
+            )
+            self.canvas_btn.blockSignals(False)
+        self._picking = bool(on)
         try:
             doc = FreeCADGui.ActiveDocument
             if doc is None:
@@ -1185,84 +1642,122 @@ class CurvePanel(_EditPanelBase):
             if view is None:
                 raise Exception("No active view")
             if on:
+                if getattr(self, '_cbid', None) is not None:
+                    return
                 self._cbid = view.addEventCallback(
                     "SoMouseButtonEvent", self._on_click)
                 self._cbid_mov = view.addEventCallback(
                     "SoLocation2Event", self._on_move_pick)
+                self._cb_key = view.addEventCallback(
+                    "SoKeyboardEvent", self._on_key)
                 self._snap_cands = self._collect_snap_cands()
                 self._snap_shapes = self._collect_snap_shapes()
                 self._build_snap_overlay(view)
+                self._ensure_rubberband(view)
+                from rfstudio import statusbar
+                statusbar.show("Canvas active: click to place | Plane: %s (Tab) | Lock: %s (X/Y/Z) | Enter to finish | Backspace to undo"
+                               % (self._plane_family, self._axis_lock or "Free"))
             else:
                 drop_callbacks(view, (
                     ("SoMouseButtonEvent", self, "_cbid"),
                     ("SoLocation2Event", self, "_cbid_mov"),
+                    ("SoKeyboardEvent", self, "_cb_key"),
                 ))
                 self._remove_snap_overlay(view)
+                self._remove_rubberband(view)
+                self._remove_pen_overlay(view)
+                self._hide_numeric_input()
+                self._hide_cursor_hud()
                 self._snap_pt = None
                 self._snap_cands = []
+                self._snap_weak = []
                 self._snap_shapes = []
+                from rfstudio import statusbar
+                statusbar.clear()
         except Exception as exc:
-            FreeCAD.Console.PrintWarning("Railform: 3D pick unavailable (%s)\n"
+            FreeCAD.Console.PrintWarning("Railform: canvas drawing unavailable (%s)\n"
                                          % exc)
 
-    def _toggle_draw_mode(self, on):
-        """Enable/disable draw mode for continuous point placement."""
-        self.draw_btn.setText("Draw Curve: on" if on else "Draw Curve: off")
+    def _ensure_cursor_hud(self):
+        if getattr(self, "_cursor_hud", None) is None:
+            hud = QtWidgets.QLabel()
+            hud.setWindowFlags(QtCore.Qt.ToolTip | QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowDoesNotAcceptFocus)
+            hud.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
+            hud.setStyleSheet(
+                "QLabel { background: rgba(18, 24, 34, 220); color: #f0f4f8; "
+                "border: 1px solid rgba(80, 150, 230, 200); border-radius: 4px; "
+                "padding: 2px 7px; font-size: 11px; font-weight: 500; font-family: sans-serif; }"
+            )
+            self._cursor_hud = hud
+        return self._cursor_hud
+
+    def _update_cursor_hud(self, dist, angle, dx, dy, dz, snap_tag):
         try:
-            doc = FreeCADGui.ActiveDocument
-            if doc is None:
-                raise Exception("No active document")
-            view = doc.ActiveView
-            if view is None:
-                raise Exception("No active view")
-            if on:
-                # Already on -- re-registering here would leak a second,
-                # overlapping pair of Coin event callbacks (the previous
-                # pair's IDs would be overwritten and never removed), so
-                # every click/move would fire twice. See commands.py's
-                # _draw_tool_panel for the bug this guards against.
-                if getattr(self, '_drawing', False):
-                    return
-                # If pick mode is on, turn it off since these modes are exclusive
-                if getattr(self, '_cbid', None) is not None:
-                    self._toggle_pick(False)
+            hud = self._ensure_cursor_hud()
+            lock_s = "" if self._axis_lock is None else " [%s-LOCK]" % self._axis_lock
+            snap_badge = ""
+            if snap_tag:
+                if "Crossing" in snap_tag:
+                    snap_badge = " <span style='color:#ffa500;font-weight:bold;'>[Crossing]</span>"
+                elif "Contact" in snap_tag:
+                    snap_badge = " <span style='color:#00ffff;font-weight:bold;'>[Rail Contact]</span>"
+                elif "Snap" in snap_tag:
+                    snap_badge = " <span style='color:#33ff66;'>[Snap]</span>"
 
-                # Set up draw mode callbacks
-                self._draw_cb_id = view.addEventCallback(
-                    "SoMouseButtonEvent", self._on_draw_click)
-                self._draw_cb_id_mov = view.addEventCallback(
-                    "SoLocation2Event", self._on_draw_move)
-                self._snap_cands = self._collect_snap_cands()
-                self._snap_shapes = self._collect_snap_shapes()
-                self._build_snap_overlay(view)
+            text = f"<b>L:</b> {dist:.2f} mm &nbsp;|&nbsp; <b>∠</b> {angle:.1f}° &nbsp;|&nbsp; <b>{self._plane_family}</b>{lock_s}{snap_badge}"
+            hud.setText(text)
+            hud.adjustSize()
+            cpos = QtGui.QCursor.pos()
+            hud.move(cpos.x() + 18, cpos.y() - 30)
+            if not hud.isVisible():
+                hud.show()
+        except Exception:
+            pass
 
-                # Initialize drawing state
-                self._drawing = True
-                self._draw_points = []  # Temporary points for drawing
-            else:
-                # Clean up draw mode callbacks
-                drop_callbacks(view, (
-                    ("SoMouseButtonEvent", self, "_draw_cb_id"),
-                    ("SoLocation2Event", self, "_draw_cb_id_mov"),
-                ))
-                self._remove_snap_overlay(view)
-                self._snap_cands = []
-                self._snap_shapes = []
+    def _update_cursor_hud_point1(self, snap_tag):
+        try:
+            hud = self._ensure_cursor_hud()
+            lock_s = "" if self._axis_lock is None else " [%s-LOCK]" % self._axis_lock
+            snap_badge = ""
+            if snap_tag:
+                if "Crossing" in snap_tag:
+                    snap_badge = " <span style='color:#ffa500;font-weight:bold;'>[Crossing]</span>"
+                elif "Contact" in snap_tag:
+                    snap_badge = " <span style='color:#00ffff;font-weight:bold;'>[Rail Contact]</span>"
+                elif "Snap" in snap_tag:
+                    snap_badge = " <span style='color:#33ff66;'>[Snap]</span>"
 
-                # Finalize drawing
-                self._drawing = False
-        except Exception as exc:
-            FreeCAD.Console.PrintWarning("Railform: draw mode unavailable (%s)\n"
-                                         % exc)
+            text = f"Click to place point 1 &nbsp;|&nbsp; <b>{self._plane_family}</b> (Tab){lock_s}{snap_badge}"
+            hud.setText(text)
+            hud.adjustSize()
+            cpos = QtGui.QCursor.pos()
+            hud.move(cpos.x() + 18, cpos.y() - 30)
+            if not hud.isVisible():
+                hud.show()
+        except Exception:
+            pass
+
+    def _hide_cursor_hud(self):
+        if getattr(self, "_cursor_hud", None) is not None:
+            try:
+                self._cursor_hud.hide()
+            except Exception:
+                pass
 
     def _collect_snap_cands(self):
-        """EXACT high-priority discrete snap targets from all other objects
-        -- vertices, control points, knots, and true curve-curve
-        intersections (snaputil.collect_strong_snap_points), samples off.
-        These win over an on-edge projection in the ranked snap. Shared with
-        editmode.PointEditor."""
-        return snaputil.collect_strong_snap_points(self.obj.Document,
-                                                   exclude=self.obj)
+        """The magnet-eligible EXACT on-geometry snap targets -- vertices,
+        knots and true curve-curve intersections -- from all other objects.
+        Off-curve control-polygon handles are collected separately into
+        self._snap_weak (the distance-only tier), so they no longer hijack a
+        draw that is aiming at a curve body. Returns the strong list; sets
+        _snap_weak as a side effect. Shared policy with editmode.PointEditor
+        (see snaputil.collect_ranked_points / nearest_snap_ranked)."""
+        strong, weak = snaputil.collect_ranked_points(self.obj.Document,
+                                                      exclude=self.obj)
+        self._snap_weak = weak
+        self._snap_kinded = snaputil.collect_strong_snap_points_kinded(
+            self.obj.Document, exclude=self.obj)
+        return strong
 
     def _collect_snap_shapes(self):
         """Edges from all other objects, for EXACT perpendicular-
@@ -1311,6 +1806,31 @@ class CurvePanel(_EditPanelBase):
         except Exception:
             pass
 
+    def _apply_snap_visual(self, best, best_kind):
+        """Update snap marker position, symbol, and color according to snap kind."""
+        self._snap_pt = best
+        self._snap_kind = best_kind
+        if self._snap_coin_root is not None:
+            if best is not None:
+                self._snap_coord_draw.point.set1Value(0, best.x, best.y, best.z)
+                if hasattr(self, "_snap_col") and hasattr(self, "_snap_marker"):
+                    try:
+                        from pivy import coin
+                        if best_kind == snaputil.SNAP_INTERSECTION:
+                            self._snap_col.rgb = (1.0, 0.70, 0.10)  # Amber crossing indicator
+                            self._snap_marker.markerIndex = coin.SoMarkerSet.CROSS_9_9
+                        elif best_kind == snaputil.SNAP_EDGE:
+                            self._snap_col.rgb = (0.10, 0.95, 0.95)  # Cyan on-curve projection
+                            self._snap_marker.markerIndex = coin.SoMarkerSet.CIRCLE_LINE_9_9
+                        else:
+                            self._snap_col.rgb = (0.20, 0.95, 0.40)  # Lime vertex/midpoint/etc.
+                            self._snap_marker.markerIndex = coin.SoMarkerSet.CIRCLE_FILLED_9_9
+                    except Exception:
+                        pass
+                self._snap_sw.whichChild = 0
+            else:
+                self._snap_sw.whichChild = -1
+
     def _on_draw_move(self, ev):
         """Track cursor during draw mode; find and display nearest snap point."""
         try:
@@ -1322,22 +1842,17 @@ class CurvePanel(_EditPanelBase):
                 return
             pos = ev["Position"]
             snap_px = snaputil._snap_tolerance_mm(view, 4.0)
-            best = snaputil.nearest_snap_ranked(
-                view, self._snap_cands, getattr(self, "_snap_shapes", []),
+            if getattr(self, "_snap_kinded", None) is None:
+                self._snap_kinded = snaputil.collect_strong_snap_points_kinded(doc, exclude=self.obj)
+            best, best_kind = snaputil.nearest_snap_ranked_kind(
+                view, self._snap_kinded, getattr(self, "_snap_shapes", []),
                 pos, snap_px)
-            self._snap_pt = best
-            if self._snap_coin_root is not None:
-                if best is not None:
-                    self._snap_coord_draw.point.set1Value(
-                        0, best.x, best.y, best.z)
-                    self._snap_sw.whichChild = 0
-                else:
-                    self._snap_sw.whichChild = -1
+            self._apply_snap_visual(best, best_kind)
         except Exception:
             pass
 
     def _build_snap_overlay(self, view):
-        """Add a cyan Coin3D snap-indicator marker to the scene."""
+        """Add a dynamic Coin3D snap-indicator marker to the scene."""
         self._remove_snap_overlay(view)
         try:
             from pivy import coin
@@ -1347,6 +1862,7 @@ class CurvePanel(_EditPanelBase):
             sep = coin.SoSeparator()
             col = coin.SoBaseColor()
             col.rgb = (0.1, 0.95, 0.95)
+            self._snap_col = col
             self._snap_coord_draw = coin.SoCoordinate3()
             mk = coin.SoMarkerSet()
             try:
@@ -1354,6 +1870,7 @@ class CurvePanel(_EditPanelBase):
             except Exception:
                 pass
             mk.numPoints = 1
+            self._snap_marker = mk
             sep.addChild(col)
             sep.addChild(self._snap_coord_draw)
             sep.addChild(mk)
@@ -1380,9 +1897,267 @@ class CurvePanel(_EditPanelBase):
             pass
         self._snap_coin_root = None
 
+    def _ensure_rubberband(self, view):
+        self._remove_rubberband(view)
+        try:
+            from pivy import coin
+            root = coin.SoSeparator()
+            self._rubber_sw = coin.SoSwitch()
+            self._rubber_sw.whichChild = -1
+            sep = coin.SoSeparator()
+            col = coin.SoBaseColor()
+            col.rgb = (1.0, 0.85, 0.2)  # Pale yellow/gold for active rubberband
+            self._rubber_coords = coin.SoCoordinate3()
+            lines = coin.SoLineSet()
+            self._rubber_lines = lines
+            sep.addChild(col)
+            sep.addChild(self._rubber_coords)
+            sep.addChild(lines)
+            self._rubber_sw.addChild(sep)
+            root.addChild(self._rubber_sw)
+            view.getSceneGraph().addChild(root)
+            self._rubber_root = root
+        except Exception:
+            self._rubber_root = None
+            self._rubber_sw = None
+            self._rubber_coords = None
+
+    def _update_rubberband(self, view, curr_pt):
+        try:
+            if self._rubber_sw is None or self._rubber_coords is None:
+                return
+            pts = self._points()
+            if not pts or curr_pt is None:
+                self._rubber_sw.whichChild = -1
+                return
+            last_p = pts[-1]
+            if self.kind == "BezierCurve" and len(pts) >= 1:
+                # Sample a smooth prospective cubic Bezier from last_p to curr_pt
+                rh = getattr(self.obj, "RightHandles", [])
+                p0 = last_p
+                p3 = curr_pt
+                if rh and len(rh) == len(pts) and (rh[-1] - p0).Length > 1e-4:
+                    p1 = rh[-1]
+                else:
+                    p1 = p0 + (p3 - p0) * (1.0 / 3.0)
+                p2 = p3 - (p3 - p0) * (1.0 / 3.0)
+
+                samples = 16
+                curve_pts = []
+                for s in range(samples + 1):
+                    t = float(s) / samples
+                    omt = 1.0 - t
+                    pt_t = (p0 * (omt * omt * omt) +
+                            p1 * (3.0 * omt * omt * t) +
+                            p2 * (3.0 * omt * t * t) +
+                            p3 * (t * t * t))
+                    curve_pts.append((pt_t.x, pt_t.y, pt_t.z))
+
+                self._rubber_coords.point.setValues(0, len(curve_pts), curve_pts)
+                if getattr(self, "_rubber_lines", None) is not None:
+                    self._rubber_lines.numVertices.setValue(len(curve_pts))
+            else:
+                self._rubber_coords.point.setValues(
+                    0, 2, [(last_p.x, last_p.y, last_p.z), (curr_pt.x, curr_pt.y, curr_pt.z)])
+                if getattr(self, "_rubber_lines", None) is not None:
+                    self._rubber_lines.numVertices.setValue(2)
+            self._rubber_sw.whichChild = 0
+        except Exception:
+            pass
+
+    def _remove_rubberband(self, view=None):
+        if getattr(self, '_rubber_root', None) is None:
+            return
+        try:
+            if view is None:
+                doc = FreeCADGui.ActiveDocument
+                view = doc.ActiveView if doc is not None else None
+            if view is not None:
+                view.getSceneGraph().removeChild(self._rubber_root)
+        except Exception:
+            pass
+        self._rubber_root = None
+        self._rubber_sw = None
+        self._rubber_coords = None
+
+    def _ensure_pen_overlay(self, view):
+        self._remove_pen_overlay(view)
+        try:
+            from pivy import coin
+            root = coin.SoSeparator()
+            self._pen_sw = coin.SoSwitch()
+            self._pen_sw.whichChild = -1
+
+            sep = coin.SoSeparator()
+
+            # Dashed tangent whiskers
+            line_sep = coin.SoSeparator()
+            line_col = coin.SoBaseColor()
+            line_col.rgb = (0.7, 0.75, 0.85)
+            line_sep.addChild(line_col)
+            line_style = coin.SoDrawStyle()
+            line_style.lineWidth = 1
+            line_style.linePattern = 0x00FF
+            line_sep.addChild(line_style)
+            self._pen_line_coords = coin.SoCoordinate3()
+            self._pen_lines = coin.SoLineSet()
+            line_sep.addChild(self._pen_line_coords)
+            line_sep.addChild(self._pen_lines)
+            sep.addChild(line_sep)
+
+            # Left handle diamond marker (Cyan)
+            left_sep = coin.SoSeparator()
+            left_col = coin.SoBaseColor()
+            left_col.rgb = (0.1, 0.85, 1.0)
+            left_sep.addChild(left_col)
+            self._pen_left_coord = coin.SoCoordinate3()
+            self._pen_left_mk = coin.SoMarkerSet()
+            try:
+                self._pen_left_mk.markerIndex = coin.SoMarkerSet.DIAMOND_FILLED_7_7
+            except Exception:
+                self._pen_left_mk.markerIndex = coin.SoMarkerSet.SQUARE
+            left_sep.addChild(self._pen_left_coord)
+            left_sep.addChild(self._pen_left_mk)
+            sep.addChild(left_sep)
+
+            # Right handle diamond marker (Emerald)
+            right_sep = coin.SoSeparator()
+            right_col = coin.SoBaseColor()
+            right_col.rgb = (0.2, 1.0, 0.5)
+            right_sep.addChild(right_col)
+            self._pen_right_coord = coin.SoCoordinate3()
+            self._pen_right_mk = coin.SoMarkerSet()
+            try:
+                self._pen_right_mk.markerIndex = coin.SoMarkerSet.DIAMOND_FILLED_7_7
+            except Exception:
+                self._pen_right_mk.markerIndex = coin.SoMarkerSet.SQUARE
+            right_sep.addChild(self._pen_right_coord)
+            right_sep.addChild(self._pen_right_mk)
+            sep.addChild(right_sep)
+
+            # Central anchor marker (White diamond)
+            anchor_sep = coin.SoSeparator()
+            anchor_col = coin.SoBaseColor()
+            anchor_col.rgb = (1.0, 1.0, 1.0)
+            anchor_sep.addChild(anchor_col)
+            self._pen_anchor_coord = coin.SoCoordinate3()
+            self._pen_anchor_mk = coin.SoMarkerSet()
+            try:
+                self._pen_anchor_mk.markerIndex = coin.SoMarkerSet.DIAMOND_FILLED_7_7
+            except Exception:
+                self._pen_anchor_mk.markerIndex = coin.SoMarkerSet.SQUARE
+            anchor_sep.addChild(self._pen_anchor_coord)
+            anchor_sep.addChild(self._pen_anchor_mk)
+            sep.addChild(anchor_sep)
+
+            self._pen_sw.addChild(sep)
+            root.addChild(self._pen_sw)
+            view.getSceneGraph().addChild(root)
+            self._pen_overlay_root = root
+        except Exception:
+            self._pen_overlay_root = None
+            self._pen_sw = None
+
+    def _update_pen_overlay(self, view, anchor, left_h, right_h):
+        try:
+            if getattr(self, "_pen_sw", None) is None:
+                if view:
+                    self._ensure_pen_overlay(view)
+            if getattr(self, "_pen_sw", None) is None:
+                return
+
+            pts = [
+                (left_h.x, left_h.y, left_h.z),
+                (anchor.x, anchor.y, anchor.z),
+                (anchor.x, anchor.y, anchor.z),
+                (right_h.x, right_h.y, right_h.z),
+            ]
+            self._pen_line_coords.point.setValues(0, 4, pts)
+            self._pen_lines.numVertices.setValues(0, 2, [2, 2])
+
+            self._pen_left_coord.point.set1Value(0, left_h.x, left_h.y, left_h.z)
+            self._pen_left_mk.numPoints = 1
+
+            self._pen_right_coord.point.set1Value(0, right_h.x, right_h.y, right_h.z)
+            self._pen_right_mk.numPoints = 1
+
+            self._pen_anchor_coord.point.set1Value(0, anchor.x, anchor.y, anchor.z)
+            self._pen_anchor_mk.numPoints = 1
+
+            self._pen_sw.whichChild = 0
+        except Exception:
+            pass
+
+    def _hide_pen_overlay(self):
+        if getattr(self, "_pen_sw", None) is not None:
+            try:
+                self._pen_sw.whichChild = -1
+            except Exception:
+                pass
+
+    def _remove_pen_overlay(self, view=None):
+        if getattr(self, "_pen_overlay_root", None) is None:
+            return
+        try:
+            if view is None:
+                doc = FreeCADGui.ActiveDocument
+                view = doc.ActiveView if doc is not None else None
+            if view is not None:
+                view.getSceneGraph().removeChild(self._pen_overlay_root)
+        except Exception:
+            pass
+        self._pen_overlay_root = None
+        self._pen_sw = None
+        self._pen_line_coords = None
+        self._pen_lines = None
+        self._pen_left_coord = None
+        self._pen_left_mk = None
+        self._pen_right_coord = None
+        self._pen_right_mk = None
+        self._pen_anchor_coord = None
+        self._pen_anchor_mk = None
+
+    def _project_cursor(self, view, pos):
+        """Compute the 3D position from screen pos:
+        1. If magnet snapped to existing geometry, use snap point.
+        2. Else intersect camera ray with the active construction plane.
+        3. If axis lock ('X'/'Y'/'Z') is active and points exist, apply axis lock.
+        """
+        from FreeCAD import Vector
+        from rfstudio import panel_logic
+        # Planar Mode OFF -> free-form 3D: use raw view depth, no plane projection.
+        if not getattr(self, "_planar_mode", True):
+            return view.getPoint(pos[0], pos[1])
+        pt = None
+        if getattr(self, "_snap_pt", None) is not None:
+            pt = self._snap_pt
+        else:
+            ray = snaputil.pick_ray(view, pos)
+            if ray is not None:
+                ro, rd = ray
+                vd = getattr(view, "getViewDirection", lambda: (0.0, 0.0, -1.0))()
+                view_dir = (vd[0], vd[1], vd[2]) if hasattr(vd, "__getitem__") else (0.0, 0.0, -1.0)
+                norm = panel_logic.plane_normal_for(self._plane_family, view_dir)
+                origin, normal = panel_logic.construction_plane((0.0, 0.0, 0.0), norm, offset=0.0)
+                hit = panel_logic.ray_plane_intersect(
+                    (ro.x, ro.y, ro.z), (rd.x, rd.y, rd.z), origin, normal)
+                if hit is not None:
+                    pt = Vector(*hit)
+            if pt is None:
+                pt = view.getPoint(pos[0], pos[1])
+
+        if pt is not None and getattr(self, "_axis_lock", None) is not None:
+            pts = self._points()
+            if pts:
+                last_p = pts[-1]
+                locked = panel_logic.apply_axis_lock(
+                    (pt.x, pt.y, pt.z), (last_p.x, last_p.y, last_p.z), self._axis_lock)
+                pt = Vector(*locked)
+        return pt
+
     def _on_move_pick(self, ev):
-        """Track cursor during pick-mode; find and display nearest snap point."""
-        if not self._picking and not getattr(self, 'pick_btn', None):
+        """Track cursor during pick-mode; snap, rubberband preview, and HUD status."""
+        if not self._picking and not (getattr(self, 'pick_btn', None) and self.pick_btn.isChecked()):
             return
         try:
             doc = FreeCADGui.ActiveDocument
@@ -1393,25 +2168,144 @@ class CurvePanel(_EditPanelBase):
                 return
             pos = ev["Position"]
             snap_px = snaputil._snap_tolerance_mm(view, 4.0)
-            best = snaputil.nearest_snap_ranked(
-                view, self._snap_cands, getattr(self, "_snap_shapes", []),
+            if getattr(self, "_snap_kinded", None) is None:
+                self._snap_kinded = snaputil.collect_strong_snap_points_kinded(doc, exclude=self.obj)
+            best, best_kind = snaputil.nearest_snap_ranked_kind(
+                view, self._snap_kinded, getattr(self, "_snap_shapes", []),
                 pos, snap_px)
-            self._snap_pt = best
-            if self._snap_coin_root is not None:
-                if best is not None:
-                    self._snap_coord_draw.point.set1Value(
-                        0, best.x, best.y, best.z)
-                    self._snap_sw.whichChild = 0
+            self._apply_snap_visual(best, best_kind)
+
+            # Illustrator Pen Tool Drag Gesture
+            if getattr(self, "_pen_drag", False) and self.kind == "BezierCurve":
+                dx = pos[0] - self._pen_start_pos[0]
+                dy = pos[1] - self._pen_start_pos[1]
+                if (dx * dx + dy * dy) > 16:
+                    self._pen_dragged = True
+
+                curr_pt = self._project_cursor(view, pos)
+                if curr_pt is not None:
+                    p_anchor = self._pen_anchor_pt
+                    idx = self._pen_anchor_idx
+                    v_handle = curr_pt - p_anchor
+                    tension = v_handle.Length
+
+                    if self._plane_family == "XY":
+                        angle = math.degrees(math.atan2(v_handle.y, v_handle.x))
+                    elif self._plane_family == "YZ":
+                        angle = math.degrees(math.atan2(v_handle.z, v_handle.y))
+                    elif self._plane_family == "ZX":
+                        angle = math.degrees(math.atan2(v_handle.x, v_handle.z))
+                    else:
+                        angle = 0.0
+
+                    # Endpoint continuity snapping to adjacent edges
+                    c_mode = getattr(self, "_endpoint_continuity_mode", "G1")
+                    endpoint_snapped_tag = ""
+                    is_endpoint = (idx == 0 or idx == len(self._points()) - 1)
+                    if is_endpoint and c_mode != "Free" and hasattr(self, "_snap_shapes") and self._snap_shapes:
+                        best_pt, best_d, best_shape = snaputil.nearest_point_on_shapes(p_anchor, self._snap_shapes, max_dist=2.0)
+                        if best_shape is not None:
+                            info = core.evaluate_edge_at_point(best_shape, p_anchor)
+                            tan_e = info['tangent']
+                            if v_handle.Length > 1e-6:
+                                dot_val = v_handle.normalize().dot(tan_e)
+                                angle_to_tan = math.degrees(math.acos(min(1.0, max(-1.0, abs(dot_val)))))
+                                if angle_to_tan < 25.0:
+                                    snap_res = core.snap_endpoint_continuity(p_anchor, curr_pt, best_shape, continuity=c_mode)
+                                    curr_pt = snap_res['p_handle']
+                                    v_handle = curr_pt - p_anchor
+                                    tension = v_handle.Length
+                                    endpoint_snapped_tag = f" <span style='color:#e066ff;font-weight:bold;'>[{c_mode} Edge Snap]</span>"
+
+                    alt_held = self._alt_held()
+                    h_right = curr_pt
+                    h_left = p_anchor if alt_held else (p_anchor - v_handle)
+                    htype = "Free" if alt_held else "Aligned"
+
+                    lh = list(self.obj.LeftHandles)
+                    rh = list(self.obj.RightHandles)
+                    htypes = list(self.obj.HandleTypes)
+
+                    if 0 <= idx < len(lh) and 0 <= idx < len(rh):
+                        rh[idx] = h_right
+                        if not alt_held or (lh[idx] == p_anchor):
+                            lh[idx] = h_left
+                        if 0 <= idx < len(htypes):
+                            htypes[idx] = htype
+
+                        self.obj.LeftHandles = lh
+                        self.obj.RightHandles = rh
+                        self.obj.HandleTypes = htypes
+
+                    self._update_pen_overlay(view, p_anchor, lh[idx], rh[idx])
+                    self.recompute()
+
+                    # On-cursor HUD and status readout
+                    hud = self._ensure_cursor_hud()
+                    alt_badge = " <span style='color:#ffa500;font-weight:bold;'>[Alt: Cusp]</span>" if alt_held else " <span style='color:#88a0b8;'>(Alt: Cusp)</span>"
+                    text = f"<b>Tension:</b> {tension:.2f} mm &nbsp;|&nbsp; <b>∠</b> {angle:.1f}° &nbsp;|&nbsp; <b>{htype}</b>{alt_badge}{endpoint_snapped_tag}"
+                    hud.setText(text)
+                    hud.adjustSize()
+                    cpos = QtGui.QCursor.pos()
+                    hud.move(cpos.x() + 18, cpos.y() - 30)
+                    if not hud.isVisible():
+                        hud.show()
+
+                    from rfstudio import statusbar
+                    statusbar.show("Pen Handle Drag: Tension %.2f mm | ∠%.1f° | %s%s | Release to commit"
+                                   % (tension, angle, htype, " [CUSP]" if alt_held else " (Hold Alt for cusp)"))
+                    return
+
+            pt = self._project_cursor(view, pos)
+            self._last_cursor_pt = pt
+            self._update_rubberband(view, pt)
+
+            # Live HUD readout
+            pts = self._points()
+            from rfstudio import statusbar
+            snap_tag = ""
+            if best is not None:
+                if best_kind == snaputil.SNAP_INTERSECTION:
+                    snap_tag = " | Crossing: Rail Intersection [Amber]"
+                elif best_kind == snaputil.SNAP_EDGE:
+                    snap_tag = " | Rail Contact: On-curve [Cyan]"
+                elif best_kind:
+                    snap_tag = " | Snap: %s [Green]" % best_kind.capitalize()
+
+            if pts and pt is not None:
+                p_last = pts[-1]
+                dx = pt.x - p_last.x
+                dy = pt.y - p_last.y
+                dz = pt.z - p_last.z
+                dist = (dx * dx + dy * dy + dz * dz) ** 0.5
+                if self._plane_family == "XY":
+                    angle = math.degrees(math.atan2(dy, dx))
+                elif self._plane_family == "YZ":
+                    angle = math.degrees(math.atan2(dz, dy))
+                elif self._plane_family == "ZX":
+                    angle = math.degrees(math.atan2(dx, dz))
                 else:
-                    self._snap_sw.whichChild = -1
+                    angle = 0.0
+                lock_s = "[Free]" if self._axis_lock is None else "[%s-LOCKED]" % self._axis_lock
+                msg = ("L: %.2f mm | ∠%.1f° | Δ(%.2f, %.2f, %.2f) | Plane: %s (Tab) | %s%s | Enter/DblClick to finish, Backspace to undo"
+                       % (dist, angle, dx, dy, dz, self._plane_family, lock_s, snap_tag))
+                statusbar.show(msg)
+                self._update_cursor_hud(dist, angle, dx, dy, dz, snap_tag)
+            elif pt is not None:
+                lock_s = "[Free]" if self._axis_lock is None else "[%s-LOCKED]" % self._axis_lock
+                msg = ("Click to place point 1 | Plane: %s (Tab to cycle) | %s%s | Esc to cancel"
+                       % (self._plane_family, lock_s, snap_tag))
+                statusbar.show(msg)
+                self._update_cursor_hud_point1(snap_tag)
         except Exception:
             pass
 
     def _on_click(self, ev):
-        if ev.get("Type") != "SoMouseButtonEvent" or ev.get("State") != "DOWN":
+        if ev.get("Type") != "SoMouseButtonEvent":
             return
         if ev.get("Button") != "BUTTON1":
             return
+        state = ev.get("State")
         try:
             doc = FreeCADGui.ActiveDocument
             if doc is None:
@@ -1420,20 +2314,267 @@ class CurvePanel(_EditPanelBase):
             if view is None:
                 return
             pos = ev["Position"]
-            # use snapped point if one is active, else project onto view plane
-            pt = self._snap_pt if self._snap_pt is not None \
-                else view.getPoint(pos[0], pos[1])
-            # commit current transaction and open a fresh one so each
-            # clicked point is individually Ctrl+Z-able
-            self.doc.commitTransaction()
-            self._pick_count += 1
-            self.doc.openTransaction("Draw %s" % self.kind)
-            self._append_point(pt)
-            # refresh snap candidates to include the curve we just extended
-            self._snap_cands = self._collect_snap_cands()
-            self._snap_shapes = self._collect_snap_shapes()
+
+            if state == "DOWN":
+                # Double-click detection: finishes the curve if >= 2 points
+                import time
+                now = time.time()
+                dt = now - getattr(self, "_last_click_time", 0.0)
+                last_pos = getattr(self, "_last_click_pos", (0, 0))
+                self._last_click_time = now
+                self._last_click_pos = pos
+                if dt < 0.35 and abs(pos[0] - last_pos[0]) < 8 and abs(pos[1] - last_pos[1]) < 8:
+                    if len(self._points()) >= 2:
+                        self.accept()
+                        return
+
+                pt = self._project_cursor(view, pos)
+                if pt is None:
+                    return
+
+                self.doc.commitTransaction()
+                self._pick_count += 1
+                self.doc.openTransaction("Draw %s" % self.kind)
+                self._append_point(pt)
+                pts = self._points()
+
+                if self.kind == "BezierCurve":
+                    idx = len(pts) - 1
+                    lh = list(getattr(self.obj, "LeftHandles", []))
+                    rh = list(getattr(self.obj, "RightHandles", []))
+                    htypes = list(getattr(self.obj, "HandleTypes", []))
+
+                    while len(lh) < len(pts):
+                        lh.append(pts[len(lh)])
+                    while len(rh) < len(pts):
+                        rh.append(pts[len(rh)])
+                    while len(htypes) < len(pts):
+                        htypes.append("Aligned")
+
+                    lh[idx] = pt
+                    rh[idx] = pt
+                    htypes[idx] = "Aligned"
+
+                    self.obj.LeftHandles = lh
+                    self.obj.RightHandles = rh
+                    self.obj.HandleTypes = htypes
+
+                    self._pen_drag = True
+                    self._pen_anchor_pt = pt
+                    self._pen_anchor_idx = idx
+                    self._pen_start_pos = pos
+                    self._pen_dragged = False
+
+                    self._snap_cands = self._collect_snap_cands()
+                    self._snap_shapes = self._collect_snap_shapes()
+                    self._update_pen_overlay(view, pt, pt, pt)
+                else:
+                    self._snap_cands = self._collect_snap_cands()
+                    self._snap_shapes = self._collect_snap_shapes()
+                    self._update_rubberband(view, pt)
+
+            elif state == "UP":
+                if getattr(self, "_pen_drag", False):
+                    self._pen_drag = False
+                    if not getattr(self, "_pen_dragged", False):
+                        # Simple click without drag = sharp corner (cusp)
+                        idx = getattr(self, "_pen_anchor_idx", None)
+                        if idx is not None and self.kind == "BezierCurve":
+                            htypes = list(getattr(self.obj, "HandleTypes", []))
+                            if 0 <= idx < len(htypes):
+                                htypes[idx] = "Free"
+                                self.obj.HandleTypes = htypes
+                    self._hide_pen_overlay()
+                    self.recompute()
+                    self._fill_table()
+                    self._update_rubberband(view, getattr(self, "_last_cursor_pt", None))
         except Exception:
             pass
+
+    def _on_key(self, ev):
+        """Keyboard shortcuts during curve authoring:
+        - Tab: cycle construction plane family
+        - X/Y/Z: toggle axis lock through previous point
+        - Backspace / Delete / Ctrl+Z: undo last placed point
+        - Enter / Space: commit curve
+        - Esc: cancel/reject
+        - V: cycle Bezier handle type
+        - 0-9, ., D: direct numeric distance/coordinate entry
+        """
+        try:
+            if ev.get("Type") != "SoKeyboardEvent":
+                return
+            key = ev.get("Key")
+            if ev.get("State") == "DOWN":
+                if key == 17:  # Ctrl key
+                    self._ctrl = True
+                    return
+                if getattr(self, "_ctrl", False) and key in (90, 122):
+                    self._undo_last_point()
+                    return
+
+                from rfstudio import panel_logic, statusbar
+                if key == 9:  # Tab: cycle plane
+                    self._set_plane_family(panel_logic.cycle_plane(self._plane_family))
+                    statusbar.flash("Plane: %s (Tab to cycle)" % self._plane_family)
+                elif key in (88, 120):  # X / x
+                    self._axis_lock = None if self._axis_lock == "X" else "X"
+                    statusbar.flash("Axis lock: %s" % (self._axis_lock or "Free"))
+                elif key in (89, 121):  # Y / y
+                    self._axis_lock = None if self._axis_lock == "Y" else "Y"
+                    statusbar.flash("Axis lock: %s" % (self._axis_lock or "Free"))
+                elif key in (90, 122):  # Z / z
+                    self._axis_lock = None if self._axis_lock == "Z" else "Z"
+                    statusbar.flash("Axis lock: %s" % (self._axis_lock or "Free"))
+                elif key in (8, 127):  # Backspace / Delete
+                    self._undo_last_point()
+                elif key in (13, 32):  # Enter / Space
+                    if len(self._points()) >= 2:
+                        self.accept()
+                elif key == 27:  # Esc
+                    self.reject()
+                elif key in (86, 118) and self.kind == "BezierCurve":  # V / v
+                    self._cycle_bezier_handle_type()
+                elif key in (71, 103) and self.kind == "BezierCurve":  # G / g
+                    self._cycle_endpoint_continuity_mode()
+                elif (48 <= key <= 57) or key in (46, 68, 100):  # 0-9, ., D/d
+                    self._show_numeric_input(key)
+            elif ev.get("State") == "UP":
+                if key == 17:
+                    self._ctrl = False
+        except Exception:
+            pass
+
+    def _alt_held(self):
+        try:
+            from PySide import QtCore, QtGui
+            return bool(QtGui.QGuiApplication.keyboardModifiers() & QtCore.Qt.AltModifier)
+        except Exception:
+            return False
+
+    def _shift_held(self):
+        try:
+            from PySide import QtCore, QtGui
+            return bool(QtGui.QGuiApplication.keyboardModifiers() & QtCore.Qt.ShiftModifier)
+        except Exception:
+            return False
+
+    def _undo_last_point(self):
+        pts = self._points()
+        if pts:
+            pts.pop()
+            if hasattr(self, "_weights") and len(self._weights) > len(pts):
+                self._weights.pop()
+            self._set_points(pts)
+            self._fill_table()
+            from rfstudio import statusbar
+            statusbar.flash("Removed point (%d remaining)" % len(pts))
+            doc = FreeCADGui.ActiveDocument
+            view = doc.ActiveView if doc is not None else None
+            if view:
+                self._update_rubberband(view, getattr(self, "_last_cursor_pt", None))
+
+    def _cycle_endpoint_continuity_mode(self):
+        modes = ["G1", "G2", "G3", "Free"]
+        cur = getattr(self, "_endpoint_continuity_mode", "G1")
+        nxt = modes[(modes.index(cur) + 1) % len(modes)]
+        self._endpoint_continuity_mode = nxt
+        from rfstudio import statusbar
+        statusbar.flash("Endpoint Continuity Snapping: %s (G to cycle)" % nxt)
+
+    def _cycle_bezier_handle_type(self):
+        pts = self._points()
+        if not pts:
+            return
+        idx = len(pts) - 1
+        cycle = ["Auto", "Aligned", "Mirrored", "Vector", "Free"]
+        htypes = list(getattr(self.obj, "HandleTypes", ["Auto"] * len(pts)))
+        cur = htypes[idx] if idx < len(htypes) else "Auto"
+        nxt = cycle[(cycle.index(cur) + 1) % len(cycle)] if cur in cycle else "Aligned"
+        if getattr(self, "_editor", None) and hasattr(self._editor, "set_bezier_handle_type"):
+            self._editor.set_bezier_handle_type(idx, nxt)
+        else:
+            if idx < len(htypes):
+                htypes[idx] = nxt
+                self.obj.HandleTypes = htypes
+        if getattr(self, "handle_type_combo", None):
+            self.handle_type_combo.blockSignals(True)
+            self.handle_type_combo.setCurrentText(nxt)
+            self.handle_type_combo.blockSignals(False)
+        from rfstudio import statusbar
+        statusbar.flash("Point %d: Handle Type '%s' (V to cycle)" % (idx + 1, nxt))
+
+    def _show_numeric_input(self, initial_key=None):
+        """Floating input lineedit near the cursor for direct length or coordinate typing."""
+        try:
+            view = FreeCADGui.ActiveDocument.ActiveView
+            if view is None:
+                return
+            if getattr(self, "_num_input", None) is None:
+                self._num_input = QtWidgets.QLineEdit()
+                self._num_input.setPlaceholderText("Length (e.g. 50) or X, Y, Z")
+                self._num_input.setFixedWidth(160)
+                self._num_input.setStyleSheet(
+                    "QLineEdit { background: rgba(30, 35, 45, 230); color: #fff; "
+                    "border: 1px solid #3085d6; border-radius: 4px; padding: 3px; font-weight: bold; }")
+                self._num_input.returnPressed.connect(self._on_numeric_return)
+
+            init_char = chr(initial_key) if initial_key and 32 <= initial_key <= 126 and chr(initial_key).lower() != 'd' else ""
+            self._num_input.setText(init_char)
+            view_w = view.getWidget()
+            if view_w:
+                cursor_pos = QtGui.QCursor.pos()
+                self._num_input.move(cursor_pos.x() + 15, cursor_pos.y() + 15)
+                self._num_input.show()
+                self._num_input.setFocus()
+        except Exception:
+            pass
+
+    def _hide_numeric_input(self):
+        if getattr(self, "_num_input", None) is not None:
+            try:
+                self._num_input.hide()
+            except Exception:
+                pass
+
+    def _on_numeric_return(self):
+        """Parse typed numeric input: either distance 'L' or 'X, Y, Z'."""
+        try:
+            if self._num_input is None:
+                return
+            text = self._num_input.text().strip()
+            self._hide_numeric_input()
+            if not text:
+                return
+            from FreeCAD import Vector
+            from rfstudio import statusbar
+            pts = self._points()
+            if "," in text:
+                parts = [float(p.strip()) for p in text.split(",")]
+                if len(parts) == 3:
+                    pt = Vector(parts[0], parts[1], parts[2])
+                    self.doc.commitTransaction()
+                    self._pick_count += 1
+                    self.doc.openTransaction("Draw %s" % self.kind)
+                    self._append_point(pt)
+                    statusbar.flash("Placed point at (%g, %g, %g)" % (pt.x, pt.y, pt.z))
+            else:
+                dist = float(text)
+                if pts and getattr(self, "_last_cursor_pt", None) is not None:
+                    p_last = pts[-1]
+                    cur = self._last_cursor_pt
+                    d_vec = cur - p_last
+                    d_len = d_vec.Length
+                    d_norm = d_vec * (1.0 / d_len) if d_len > 1e-6 else Vector(1, 0, 0)
+                    pt = p_last + d_norm * dist
+                    self.doc.commitTransaction()
+                    self._pick_count += 1
+                    self.doc.openTransaction("Draw %s" % self.kind)
+                    self._append_point(pt)
+                    statusbar.flash("Placed point at L = %.2f mm" % dist)
+        except Exception as exc:
+            from rfstudio import statusbar
+            statusbar.flash("Invalid input: %s" % exc, error=True)
 
     # ---- settings + recompute ---- #
     def _set(self, name, value):
@@ -1448,57 +2589,15 @@ class CurvePanel(_EditPanelBase):
 
     # ---- commit/abort hooks (see _EditPanelBase) ---- #
     def _pre_accept(self):
-        # If we're in draw mode, handle drawing completion instead of pick mode
-        if getattr(self, '_drawing', False):
-            # Finalize the drawing by creating the curve from collected points
-            if hasattr(self, '_draw_points') and len(self._draw_points) >= 2:
-                # Apply the collected points to the curve object
-                # For draw mode, we use default weights (all 1.0) since weights
-                # can't be specified during drawing - they can be edited afterward
-                pts = self._draw_points
-
-                # For ControlCurve, reset weights to defaults (1.0) since we
-                # don't capture weights during drawing. Must happen BEFORE
-                # _set_points, which writes self._weights to obj.Weights.
-                if self.kind == "ControlCurve":
-                    self._weights = [1.0] * len(pts)
-
-                self._set_points(pts)
-
-                # Update the editor and table to reflect the new points.
-                # PointEditor has no setup() method -- refresh its existing
-                # markers/arrows instead (same pattern used elsewhere in
-                # this file, e.g. _on_spin_changed).
-                if self._editor is not None:
-                    try:
-                        self._editor._refresh_markers()
-                        self._editor._refresh_arrows()
-                    except Exception:
-                        pass
-                self._fill_table()
-
-                # Clean up drawing state
-                delattr(self, '_draw_points')
-
-            # Exit draw mode
-            self._toggle_draw_mode(False)
-        else:
-            # Normal pick mode behavior
-            self._toggle_pick(False)
+        self._toggle_canvas_drawing(False)
+        self._hide_cursor_hud()
+        self._hide_numeric_input()
         self._flush_pending_transaction(commit=True)
 
     def _pre_reject(self):
-        # If we're in draw mode, handle drawing cancellation instead of pick mode
-        if getattr(self, '_drawing', False):
-            # Clear the drawing points (cancel the drawing)
-            if hasattr(self, '_draw_points'):
-                delattr(self, '_draw_points')
-
-            # Exit draw mode
-            self._toggle_draw_mode(False)
-        else:
-            # Normal pick mode behavior
-            self._toggle_pick(False)
+        self._toggle_canvas_drawing(False)
+        self._hide_cursor_hud()
+        self._hide_numeric_input()
         self._flush_pending_transaction(commit=False)
 
     def _flush_pending_transaction(self, commit):

@@ -56,6 +56,13 @@ def _first_edge(obj):
     return shp.Edges[0]
 
 
+def _first_face(obj):
+    shp = getattr(obj, "Shape", None)
+    if shp is None or not shp.Faces:
+        return None
+    return shp.Faces[0]
+
+
 def _two_rail_sweep(rail1, rail2, profiles, blending="Blend",
                     profile_samples=20, rail_samples=40,
                     parametrization=0.0, extend=False):
@@ -99,6 +106,82 @@ class _BaseFP(object):
         return None
 
 
+# --------------------------------------------------------------------------- #
+# Virtual thickness: every free-form SURFACE feature can carry a Thickness
+# (default 0 = pure surface, behaviour unchanged). When > 0 the feature's
+# freshly built surface is run through core.thicken_checked and the SOLID
+# becomes obj.Shape; the zero-thickness surface is rebuilt on every recompute,
+# so the feature stays fully editable and never compounds offsets. If the
+# offset fails the surface is kept and ThicknessStatus says why.
+def _ensure_thickness_props(obj):
+    props = obj.PropertiesList
+    if "Thickness" not in props:
+        obj.addProperty("App::PropertyFloat", "Thickness", "Thickness",
+                        "Virtual wall thickness (0 = plain surface). "
+                        "Builds a solid from the surface on recompute.")
+        obj.Thickness = 0.0
+    if "ThicknessMode" not in props:
+        obj.addProperty("App::PropertyEnumeration", "ThicknessMode",
+                        "Thickness",
+                        "Which side(s) of the surface the wall grows to")
+        obj.ThicknessMode = list(core.THICKNESS_MODES)
+        obj.ThicknessMode = "Outward"
+    if "ThicknessStatus" not in props:
+        obj.addProperty("App::PropertyString", "ThicknessStatus", "Thickness",
+                        "Result of the last thickening attempt")
+        try:
+            obj.setEditorMode("ThicknessStatus", 1)     # read-only
+        except Exception:
+            pass
+
+
+def _thickness_surface_feature(cls):
+    """Class decorator: add the Thickness props in __init__, restore them
+    on old documents, and post-process execute()'s freshly built surface."""
+    orig_init, orig_exec = cls.__init__, cls.execute
+
+    def __init__(self, obj):
+        orig_init(self, obj)
+        _ensure_thickness_props(obj)
+
+    def onDocumentRestored(self, obj):
+        try:
+            _ensure_thickness_props(obj)
+        except Exception:
+            pass
+
+    def execute(self, obj):
+        try:
+            before = obj.Shape
+        except Exception:
+            before = None
+        orig_exec(self, obj)
+        if "Thickness" not in obj.PropertiesList:
+            return
+        shape = obj.Shape
+        # Only post-process a surface this execute() actually rebuilt; an
+        # early return leaves obj.Shape untouched (possibly already thick).
+        if shape is None or shape.isNull() or (
+                before is not None and not before.isNull()
+                and shape.isSame(before)):
+            return
+        result, status = core.thicken_checked(
+            shape, float(obj.Thickness), str(obj.ThicknessMode))
+        if result is not shape:
+            obj.Shape = result
+        if obj.ThicknessStatus != status:
+            obj.ThicknessStatus = status
+        if status.startswith("failed"):
+            FreeCAD.Console.PrintWarning(
+                "Railform %s: thickness %s\n" % (cls.Kind, status))
+
+    cls.__init__ = __init__
+    cls.execute = execute
+    cls.onDocumentRestored = onDocumentRestored
+    return cls
+
+
+@_thickness_surface_feature
 class LoftFP(_BaseFP):
     Kind = "Loft"
 
@@ -163,6 +246,7 @@ class LoftFP(_BaseFP):
         groups.apply_input_visibility(obj, ["Profiles", "GuideRails"])
 
 
+@_thickness_surface_feature
 class GordonFP(_BaseFP):
     Kind = "Gordon"
 
@@ -194,6 +278,7 @@ class GordonFP(_BaseFP):
             FreeCAD.Console.PrintError("Railform Gordon: %s\n" % exc)
 
 
+@_thickness_surface_feature
 class CoonsFP(_BaseFP):
     Kind = "Coons"
 
@@ -217,6 +302,7 @@ class CoonsFP(_BaseFP):
         groups.apply_input_visibility(obj, ["Boundaries"])
 
 
+@_thickness_surface_feature
 class Sweep2RailFP(_BaseFP):
     Kind = "Sweep"
 
@@ -263,6 +349,7 @@ class Sweep2RailFP(_BaseFP):
             FreeCAD.Console.PrintError("Railform Sweep: %s\n" % exc)
 
 
+@_thickness_surface_feature
 class SweepNFP(_BaseFP):
     """Multi-rail sweep: N >= 2 rails, interior rails anchor the surface too.
 
@@ -308,6 +395,7 @@ class SweepNFP(_BaseFP):
             FreeCAD.Console.PrintError("Railform Multi-rail sweep: %s\n" % exc)
 
 
+@_thickness_surface_feature
 class PlateFillFP(_BaseFP):
     """N>=3 fill using OCCT GeomPlate (G0 only)."""
     Kind = "Fill"
@@ -332,6 +420,91 @@ class PlateFillFP(_BaseFP):
             groups.apply_input_visibility(obj, ["Boundaries"])
         except Exception as exc:
             FreeCAD.Console.PrintError("Railform Fill: %s\n" % exc)
+
+
+class ExtractSectionsFP(_BaseFP):
+    """Live section curves pulled out of a sweep / loft / any surface:
+    constant-U ("Cross-sections", one profile per rail station) or
+    constant-V ("Rails") iso curves, as one compound. Pair with
+    SectionCurveFP (split into individual curve objects) to edit a pipe's
+    profiles and rebuild it with Loft / SweepN."""
+    Kind = "Sections"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        obj.addProperty("App::PropertyLink", "Source", "Sections",
+                        "Surface (sweep, loft, pipe...) to extract from")
+        obj.addProperty("App::PropertyEnumeration", "Direction", "Sections",
+                        "Cross-sections = one profile per rail station; "
+                        "Rails = rail-wise curves (best on 2-/multi-rail sweeps)")
+        obj.Direction = list(core.SECTION_DIRECTIONS)
+        obj.Direction = "Cross-sections"
+        obj.addProperty("App::PropertyIntegerConstraint", "Count", "Sections",
+                        "Number of section curves")
+        obj.Count = (9, 1, 500, 1)
+        obj.addProperty("App::PropertyEnumeration", "Spacing", "Sections",
+                        "Even in surface parameter, or even along arc length")
+        obj.Spacing = list(core.SECTION_SPACINGS)
+        obj.Spacing = "Parameter"
+        obj.addProperty("App::PropertyBool", "IncludeEnds", "Sections",
+                        "Put a curve exactly on both boundary iso lines")
+        obj.IncludeEnds = True
+        obj.addProperty("App::PropertyIntegerConstraint", "FaceIndex", "Sections",
+                        "Which face of the source to use (0 = first)")
+        obj.FaceIndex = (0, 0, 999, 1)
+        obj.addProperty("App::PropertyString", "SectionsSync", "Sections",
+                        "Result of the last 'Sections to curves' run")
+        try:
+            obj.setEditorMode("SectionsSync", 1)           # read-only
+        except Exception:
+            pass
+
+    def execute(self, obj):
+        src = obj.Source
+        shape = getattr(src, "Shape", None) if src else None
+        if shape is None or shape.isNull() or not shape.Faces:
+            return
+        try:
+            edges = core.extract_iso_curves(
+                shape, count=int(obj.Count), direction=str(obj.Direction),
+                spacing=str(obj.Spacing), include_ends=bool(obj.IncludeEnds),
+                face_index=int(obj.FaceIndex))
+            obj.Shape = Part.Compound(edges)
+            groups.apply_input_visibility(obj, ["Source"])
+        except Exception as exc:
+            FreeCAD.Console.PrintError("Railform Sections: %s\n" % exc)
+
+
+class SectionCurveFP(_BaseFP):
+    """One live curve = edge `Index` of an ExtractSections object, so it can
+    be used directly as a Profile / rail input of Loft, Sweep, SweepN..."""
+    Kind = "SectionCurve"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        obj.addProperty("App::PropertyLink", "Sections", "SectionCurve",
+                        "The Extract Sections object this curve is taken from")
+        obj.addProperty("App::PropertyInteger", "Index", "SectionCurve",
+                        "Which section (0-based)")
+        obj.Index = 0
+
+    def execute(self, obj):
+        src = obj.Sections
+        shape = getattr(src, "Shape", None) if src else None
+        if shape is None or shape.isNull():
+            return
+        edges = shape.Edges
+        i = int(obj.Index)
+        if 0 <= i < len(edges):
+            obj.Shape = edges[i]
+        else:
+            obj.Shape = Part.Shape()       # Count shrank below this index
+            vo = getattr(obj, "ViewObject", None)
+            if vo is not None:
+                try:
+                    vo.Visibility = False  # orphan: re-run 'Sections to curves'
+                except Exception:
+                    pass
 
 
 class OffsetFP(_BaseFP):
@@ -444,6 +617,7 @@ class ShellFP(_BaseFP):
             FreeCAD.Console.PrintError("Railform Shell: %s\n" % exc)
 
 
+@_thickness_surface_feature
 class ExtendSurfFP(_BaseFP):
     """Extends a surface in U and V parametric directions."""
     Kind = "ExtendSurf"
@@ -489,6 +663,7 @@ class ExtendSurfFP(_BaseFP):
             FreeCAD.Console.PrintError("Railform ExtendSurf: %s\n" % exc)
 
 
+@_thickness_surface_feature
 class BlendSurfFP(_BaseFP):
     """Native G1/G2 blend SURFACE strip between two faces -- the surface
     analog of BlendCurveFP above, and the fix for RFS_BlendSurf's
@@ -530,6 +705,46 @@ class BlendSurfFP(_BaseFP):
             FreeCAD.Console.PrintError("Railform BlendSurf: %s\n" % exc)
 
 
+@_thickness_surface_feature
+class BlendSurfClosedFP(_BaseFP):
+    """Native G1/G2/G3 CLOSED-LOOP blend strip around a ring of >= 3
+    faces -- the "fill a hole with one continuous fillet ring" tool
+    (RFS_BlendSurfClosed). Wraps core.blend_surface_closed: one
+    continuous strip wrapping every consecutive face pair in the ring,
+    sewn into a Shell."""
+    Kind = "BlendSurfClosed"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        obj.addProperty("App::PropertyLinkList", "Faces", "BlendSurfClosed",
+                        "Faces around the hole, in ring order (>= 3)")
+        obj.addProperty("App::PropertyEnumeration", "Continuity",
+                        "BlendSurfClosed", "Blend continuity")
+        obj.Continuity = ["G0", "G1", "G2", "G3"]
+        obj.Continuity = "G2"
+        obj.addProperty("App::PropertyFloat", "Scale", "BlendSurfClosed",
+                        "Tangent strength")
+        obj.Scale = 1.0
+        obj.addProperty("App::PropertyIntegerConstraint", "Samples",
+                        "BlendSurfClosed",
+                        "Cross-section sample count along the FULL loop")
+        obj.Samples = (24, 6, 200, 1)
+
+    def execute(self, obj):
+        faces = [f for f in (_first_face(o) for o in obj.Faces) if f]
+        if len(faces) < 3:
+            return
+        try:
+            obj.Shape = core.blend_surface_closed(
+                faces,
+                continuity=str(obj.Continuity),
+                n=int(obj.Samples), scale=float(obj.Scale))
+            groups.apply_input_visibility(obj, ["Faces"])
+        except Exception as exc:
+            FreeCAD.Console.PrintError("Railform BlendSurfClosed: %s\n" % exc)
+
+
+@_thickness_surface_feature
 class N_sidedPatchFP(_BaseFP):
     """N-sided patch with improved continuity (G1/G2) using star-point method."""
     Kind = "N_sidedPatch"
@@ -568,6 +783,10 @@ class InterpCurveFP(_BaseFP):
         obj.Proxy = self
         obj.addProperty("App::PropertyVectorList", "Points", "InterpCurve",
                         "Interpolation points")
+        obj.addProperty("App::PropertyEnumeration", "Parameterization", "InterpCurve",
+                        "Interpolation knot parameterization")
+        obj.Parameterization = ["Centripetal", "Chord", "Uniform"]
+        obj.Parameterization = "Centripetal"
         obj.addProperty("App::PropertyBool", "ShowInputs", "InterpCurve",
                         "Show points")
         obj.ShowInputs = False
@@ -577,14 +796,16 @@ class InterpCurveFP(_BaseFP):
         if len(points) < 2:
             return
         try:
-            obj.Shape = core.interpolate_curve(points)
+            pm = getattr(obj, "Parameterization", "Centripetal")
+            obj.Shape = core.interpolate_curve(points, parameterization=pm)
             groups.apply_input_visibility(obj, ["Points"])
         except Exception as exc:
             FreeCAD.Console.PrintError("Railform InterpCurve: %s\n" % exc)
 
     def compute(self, obj, points):
         try:
-            return core.interpolate_curve(list(points)) if len(points) >= 2 else None
+            pm = getattr(obj, "Parameterization", "Centripetal")
+            return core.interpolate_curve(list(points), parameterization=pm) if len(points) >= 2 else None
         except Exception:
             return None
 
@@ -1003,6 +1224,7 @@ class BezierCurveFP(_BaseFP):
             return None
 
 
+@_thickness_surface_feature
 class MatchSurfaceFP(_BaseFP):
     Kind = "Match"
 
@@ -1187,7 +1409,10 @@ _FP = {"Loft": LoftFP, "Gordon": GordonFP, "Coons": CoonsFP,
        "Sweep": Sweep2RailFP, "SweepN": SweepNFP, "Fill": PlateFillFP,
        "Match": MatchSurfaceFP,
        "Offset": OffsetFP, "Thicken": ThickenFP, "Shell": ShellFP,
-       "ExtendSurf": ExtendSurfFP, "BlendSurf": BlendSurfFP, "N_sidedPatch": N_sidedPatchFP,
+       "Sections": ExtractSectionsFP, "SectionCurve": SectionCurveFP,
+       "ExtendSurf": ExtendSurfFP, "BlendSurf": BlendSurfFP,
+       "BlendSurfClosed": BlendSurfClosedFP,
+       "N_sidedPatch": N_sidedPatchFP,
        "InterpCurve": InterpCurveFP, "ControlCurve": ControlCurveFP,
        "ApproxCurve": ApproxCurveFP, "Polyline": PolylineFP,
        "BezierCurve": BezierCurveFP, "PolylineFillet": PolylineFilletFP,
@@ -1200,6 +1425,8 @@ _LABEL = {"Loft": "RailformLoft", "Gordon": "RailformGordon",
           "Fill": "RailformFill", "Match": "RailformMatch",
           "Offset": "RailformOffset", "Thicken": "RailformThicken",
           "Shell": "RailformShell", "BlendSurf": "RailformBlendSurf",
+          "Sections": "RailformSections", "SectionCurve": "RailformSectionCurve",
+          "BlendSurfClosed": "RailformBlendSurfClosed",
           "N_sidedPatch": "RailformN_sidedPatch",
           "InterpCurve": "RailformInterpCurve", "ControlCurve": "RailformControlCurve",
           "ApproxCurve": "RailformApproxCurve", "Polyline": "RailformPolyline",
@@ -1224,9 +1451,11 @@ GROUPS = {
                                            "sweep)"),
                ("Profiles", "Profiles",  "Cross-section curves (≥ 1)")],
     "ExtendSurf": [("BaseSurface", "Base Surface", "Surface to extend")],
+    "BlendSurfClosed": [("Faces", "Faces",
+                         "Faces around the hole, in ring order (>= 3)")],
     "Fill":   [("Boundaries", "Boundaries", "Boundary curves (>= 3)")],
-    "Match":  [("Reference", "Reference surfaces (one or more)"),
-               ("Target",    "Target surface to rebuild (exactly 1)")],
+    "Match":  [("Reference", "Reference surfaces", "One or more reference surfaces"),
+           ("Target",    "Target",             "Surface to rebuild (exactly 1)")],
     "N_sidedPatch": [("Boundaries", "Boundaries", "Boundary curves (≥ 3)")],
     "InterpCurve": [("Points", "Points", "Interpolation points")],
     "ControlCurve": [("Points", "Points", "Control points"),
@@ -1245,6 +1474,7 @@ LIMITS = {"Loft":   {"Profiles": (2, None), "GuideRails": (0, None)},
           "Sweep":  {"Rail1": (1, 1), "Rail2": (1, 1), "Profiles": (1, None)},
           "SweepN": {"Rails": (2, None), "Profiles": (1, None)},
           "ExtendSurf": {"BaseSurface": (1, 1)},
+          "BlendSurfClosed": {"Faces": (3, None)},
           "Fill":   {"Boundaries": (3, None)},
           "Match":  {"Reference": (1, None), "Target": (1, 1)},
           "N_sidedPatch": {"Boundaries": (3, None)},
@@ -1264,6 +1494,46 @@ def _style_curve_vobj(vobj):
         vobj.LineWidth = 3.0
     except Exception:
         pass
+
+
+def set_curve_role(obj, role):
+    """Assign curve role ('Profile', 'GuideRail', or 'None') for surface auto-seeding.
+    Applies distinct color styling in the 3D viewport.
+    """
+    if obj is None:
+        return "None"
+    r = role if role in ("Profile", "GuideRail") else "None"
+    if not hasattr(obj, "RailformRole"):
+        try:
+            obj.addProperty("App::PropertyString", "RailformRole", "Railform",
+                            "Role in surfacing: Profile or GuideRail")
+        except Exception:
+            pass
+    try:
+        obj.RailformRole = r
+    except Exception:
+        pass
+    vobj = getattr(obj, "ViewObject", None)
+    if vobj is not None:
+        try:
+            if r == "Profile":
+                vobj.LineColor = (0.15, 0.65, 1.00)  # Profile cyan
+                vobj.LineWidth = 3.5
+            elif r == "GuideRail":
+                vobj.LineColor = (1.00, 0.65, 0.10)  # Rail amber/gold
+                vobj.LineWidth = 3.5
+            else:
+                _style_curve_vobj(vobj)
+        except Exception:
+            pass
+    return r
+
+
+def get_curve_role(obj):
+    """Read the assigned role of a curve ('Profile', 'GuideRail', or 'None')."""
+    if obj is None:
+        return "None"
+    return getattr(obj, "RailformRole", "None") or "None"
 
 
 def make_surface(kind, doc=None):
@@ -1293,6 +1563,74 @@ def make_curve(kind, doc=None):
         CurveVP(obj.ViewObject)
     groups.add_to_group(obj, "Curves")
     return obj
+
+
+def make_sections(source, doc=None):
+    """Create a live ExtractSections object for `source` (any surface
+    object); filed under Curves and styled like a curve."""
+    doc = doc or FreeCAD.ActiveDocument or FreeCAD.newDocument()
+    obj = doc.addObject("Part::FeaturePython", _LABEL["Sections"])
+    ExtractSectionsFP(obj)
+    if source is not None:
+        obj.Source = source
+    _attach_sections_vp(obj)
+    groups.add_to_group(obj, "Curves")
+    return obj
+
+
+def section_curve_children(sections_obj):
+    """The SectionCurve objects currently attached to `sections_obj`."""
+    return [o for o in sections_obj.Document.Objects
+            if type(getattr(o, "Proxy", None)).__name__ == "SectionCurveFP"
+            and getattr(o, "Sections", None) == sections_obj]
+
+
+def make_section_curves(sections_obj):
+    """Split an ExtractSections object into one live SectionCurve object per
+    section, tagged Profile (Cross-sections) or GuideRail (Rails) so Loft /
+    Sweep / SweepN auto-seed from them.
+
+    RE-RUNNABLE: existing children are reused (never duplicated), missing
+    ones are created, and children whose index fell off the end after Count
+    was lowered are deleted -- so running it again after changing Count or
+    Direction brings the curve set back in sync. Returns the current
+    children, ordered by Index. Sets `sections_obj.SectionsSync` to a short
+    created/reused/removed summary."""
+    doc = sections_obj.Document
+    shp = getattr(sections_obj, "Shape", None)
+    n = len(shp.Edges) if shp is not None and not shp.isNull() \
+        else int(sections_obj.Count)
+    role = "GuideRail" if str(sections_obj.Direction) == "Rails" else "Profile"
+    by_index = {}
+    removed = 0
+    for o in section_curve_children(sections_obj):
+        i = int(o.Index)
+        if i in by_index or not 0 <= i < n:         # duplicate or orphan
+            doc.removeObject(o.Name)
+            removed += 1
+        else:
+            by_index[i] = o
+    created = 0
+    out = []
+    for i in range(n):
+        o = by_index.get(i)
+        if o is None:
+            o = doc.addObject("Part::FeaturePython", _LABEL["SectionCurve"])
+            SectionCurveFP(o)
+            o.Sections = sections_obj
+            o.Index = i
+            _attach_sections_vp(o)
+            groups.add_to_group(o, "Curves")
+            created += 1
+        set_curve_role(o, role)                      # Direction may have changed
+        out.append(o)
+    doc.recompute()
+    try:
+        sections_obj.SectionsSync = "%d curve(s): %d created, %d reused, %d removed" % (
+            n, created, n - created, removed)
+    except Exception:
+        pass
+    return out
 
 
 def make_polyline_fillet(source, doc=None):
@@ -1391,6 +1729,31 @@ class CurveVP(object):
         return
 
 
+class SectionsVP(CurveVP):
+    """ViewProvider for ExtractSections / SectionCurve objects.
+
+    Without a Python view provider a bare Part::FeaturePython built from
+    code gets NO display mode, so the section curves were never drawn in the
+    3D view. Reuses CurveVP's attach/state handling but has its own icon and
+    does NOT open the curve point-edit panel on double-click (these curves
+    are derived from a surface; edit Count / Direction instead)."""
+
+    def getIcon(self):
+        name = "rfs_sectioncurves.svg" if getattr(self, "kind", None) == \
+            "SectionCurve" else "rfs_sections.svg"
+        return _icon(name)
+
+    def doubleClicked(self, vobj):
+        return False
+
+
+def _attach_sections_vp(obj):
+    vo = getattr(obj, "ViewObject", None)
+    if vo is not None:
+        _style_curve_vobj(vo)
+        SectionsVP(vo)
+
+
 # --------------------------------------------------------------------------- #
 class SurfaceVP(object):
     """Shared ViewProvider for surface objects."""
@@ -1420,10 +1783,16 @@ class SurfaceVP(object):
     def __setstate__(self, state):
         self.kind = state.get("kind") if isinstance(state, dict) else None
         return None
-
+    
     def onChanged(self, vobj, prop):
-        if prop == "ShowEdges" or prop == "ShowSamples":
-            vobj.Shape.update()
+        if prop == "ShowEdges":
+            # Edge overlay = the "Flat Lines" display mode; off = plain "Shaded".
+            try:
+                vobj.DisplayMode = "Flat Lines" if vobj.ShowEdges else "Shaded"
+            except Exception:
+                pass
+        # "ShowSamples" has no implementation yet. The old code only called a
+        # method that doesn't exist, so it is deliberately a no-op for now.
 
     def execute(self, vobj):
         return

@@ -16,6 +16,34 @@ from .util import (_nearest_facing_sides, _side_uv_trimmed, cross, dot, norm)
 # actually achieved. Class-A surfacing lives and dies on exactly that
 # number, not a visual guess -- these two functions are the measurement
 # layer that was missing.
+def _analytic_cross_dn(face, side, u, v, order, cache=None):
+    """Like _analytic_cross_d2 for any derivative order (None if unavailable).
+    `cache` (dict, optional) memoizes the BSpline conversion per face --
+    toBSpline() on an analytic plane costs seconds, so per-sample calls
+    without it make surface_deviation crawl."""
+    try:
+        key = id(face)
+        if cache is not None and key in cache:
+            surf = cache[key]
+        else:
+            surf = face.Surface
+            if not isinstance(surf, Part.BSplineSurface):
+                try:
+                    surf = surf.toBSpline()
+                except Exception:
+                    surf = None
+            if cache is not None:
+                cache[key] = surf
+        if surf is None:
+            return None
+        du, dv = (order, 0) if side < 2 else (0, order)
+        if surf.UDegree < du or surf.VDegree < dv:
+            return None
+        return surf.getDN(u, v, du, dv)
+    except Exception:
+        return None
+
+
 def _analytic_cross_d2(face, side, u, v):
     """Exact cross-boundary 2nd derivative via BSplineSurface.getDN,
     or None when the face can't provide one. Finite differences carry
@@ -40,6 +68,59 @@ def _analytic_cross_d2(face, side, u, v):
         # (+u) stepping needs no sign flip, unlike odd orders.
         return surf.getDN(u, v, du, dv)
     except Exception:
+        return None
+
+
+def _native_project_face(face, points):
+    """Project each point in `points` onto `face` using the compiled gate
+    (rfstudio.native.rfs_native), returning a list of (dist, u, v) in the
+    face's natural surface parameters -- or None when the gate can't serve
+    this face, so the caller uses the exact Part.Vertex.distToShape path.
+
+    This is the QA counterpart of patches._native_deviation: it reuses that
+    module's one-time orientation probe (_native_gate) and its homogeneous-
+    pole / natural-box face extraction (_gate_face_data), so the same strict
+    eligibility contract applies -- only a non-periodic B-spline face
+    spanning its surface's NATURAL parameter box qualifies (exactly the
+    geometry the sweep/loft/gordon/blend builders produce). A trimmed,
+    periodic, or analytic face, a non-finite query point, or a missing /
+    ABI-mismatched extension all return None.
+
+    Note: the natural-box guard is also what makes projecting onto the full
+    surface equivalent to projecting onto the (untrimmed) face, so the
+    native result matches distToShape there. `patches` is imported lazily
+    to avoid a surfacing/qa import cycle at module load.
+    """
+    try:
+        import numpy
+        from rfstudio.core import patches
+        mod = patches._native_gate()
+        if mod is None:
+            return None
+        # Raises patches._NativeUnsupported for an ineligible face.
+        poles, ku, kv, degu, degv = patches._gate_face_data(face)[0]
+        pa = numpy.asarray([[p.x, p.y, p.z] for p in points], dtype=float)
+        if pa.shape[0] == 0:
+            return []
+        if not numpy.isfinite(pa).all():
+            return None
+        batch = getattr(mod, "project_points", None)
+        if batch is not None:
+            # rfs_native >= 0.3.0: one lattice build for the whole batch.
+            res = batch(pa, poles, ku, kv, degu, degv)
+            return [(float(res[i, 0]), float(res[i, 1]), float(res[i, 2]))
+                    for i in range(res.shape[0])]
+        # Older extension without the batched entry: per-point projection
+        # (each call rebuilds the lattice, but still far cheaper than the
+        # OCCT distToShape path).
+        out = []
+        for i in range(pa.shape[0]):
+            r = mod.debug_project(poles, ku, kv, degu, degv, pa[i])
+            out.append((float(r[0]), float(r[1]), float(r[2])))
+        return out
+    except Exception:
+        # Any failure (unsupported face, numpy/extension missing, bad data)
+        # falls back silently to the exact OCCT distToShape path.
         return None
 
 
@@ -77,6 +158,7 @@ def surface_deviation(face_a, face_b, samples=24):
 
     sa, sb, a_pr, b_pr = _nearest_facing_sides(face_a, face_b)
     _edge_cache = {}
+    _bs_cache = {}
 
     def _cross_tan(face, side, u, v):
         du, dv = face.Surface.tangent(u, v)
@@ -85,7 +167,7 @@ def surface_deviation(face_a, face_b, samples=24):
     def _cross_d2(face, pr, side, u, v):
         # Analytic path first (exact, off the face's own control net);
         # finite differences only when no BSpline conversion succeeds.
-        analytic = _analytic_cross_d2(face, side, u, v)
+        analytic = _analytic_cross_dn(face, side, u, v, 2, _bs_cache)
         if analytic is not None:
             return analytic
         # One-sided finite difference stepping INTO the face material:
@@ -109,33 +191,97 @@ def surface_deviation(face_a, face_b, samples=24):
             p2 = face.valueAt(u, v + sgn * 2 * eps)
         return (p0 - p1 * 2.0 + p2) * (1.0 / (eps * eps))
 
-    rows = []
-    max_g0 = max_g1 = max_g2 = 0.0
+    def _cross_speed(face, pr, side, u, v):
+        d = _analytic_cross_dn(face, side, u, v, 1, _bs_cache)
+        if d is None:
+            u0, u1, v0, v1 = pr
+            if side < 2:
+                eps = max(1e-6, (u1 - u0) * 1e-3)
+                sg = 1.0 if side == 0 else -1.0
+                d = (face.valueAt(u + sg * eps, v) - face.valueAt(u, v)) * (1.0 / eps)
+            else:
+                eps = max(1e-6, (v1 - v0) * 1e-3)
+                sg = 1.0 if side == 2 else -1.0
+                d = (face.valueAt(u, v + sg * eps) - face.valueAt(u, v)) * (1.0 / eps)
+        return d.Length if d.Length > 1e-12 else None
+
+    # Sample face_a's side once (trim-aware), then project every sample onto
+    # face_b. The projection is the expensive step: Part.Vertex(pa)
+    # .distToShape(face_b) rebuilds an OCCT extrema context per sample
+    # (~4-13 ms each; the same cost the sweep/loft deviation gate already
+    # moved to C++). When the compiled gate is present AND face_b qualifies,
+    # the batch is projected by rfs_native instead -- pure arithmetic that
+    # also hands back the (u, v) on face_b directly, so no parameter()
+    # inversion is needed. _native_project_face returns None (and we use the
+    # exact distToShape path) whenever the gate can't serve this face.
+    a_samples = []
     for k in range(samples):
         t = k / (samples - 1.0)
         ua, va = _side_uv_trimmed(face_a, a_pr, sa, t, _edge_cache)
-        pa = face_a.valueAt(ua, va)
-        dist, pts_on, _info = Part.Vertex(pa).distToShape(face_b)
-        pb = pts_on[0][1] if pts_on else pa
-        try:
-            ub, vb = face_b.Surface.parameter(pb)
-        except Exception:
-            ub, vb = _side_uv_trimmed(face_b, b_pr, sb, t, _edge_cache)
+        a_samples.append((t, ua, va, face_a.valueAt(ua, va)))
+
+    native_proj = _native_project_face(face_b, [s[3] for s in a_samples])
+
+    rows = []
+    max_g0 = max_g1 = max_g2 = 0.0
+    for k, (t, ua, va, pa) in enumerate(a_samples):
+        if native_proj is not None:
+            dist, ub, vb = native_proj[k]
+        else:
+            dist, pts_on, _info = Part.Vertex(pa).distToShape(face_b)
+            pb = pts_on[0][1] if pts_on else pa
+            try:
+                ub, vb = face_b.Surface.parameter(pb)
+            except Exception:
+                ub, vb = _side_uv_trimmed(face_b, b_pr, sb, t, _edge_cache)
 
         Ta = _cross_tan(face_a, sa, ua, va)
         Tb = _cross_tan(face_b, sb, ub, vb)
         La, Lb = Ta.Length, Tb.Length
         if La > 1e-9 and Lb > 1e-9:
+            # Sign-blind G1 angle. _cross_tan returns OUTWARD tangents on
+            # both faces, so across a gap (or at an abutting seam) the two
+            # tangents are ANTI-parallel when the surfaces are actually
+            # G1-continuous -- a signed acos reads ~180 degrees for a
+            # perfect blend. Taking |cos| folds both orientations into one
+            # metric: 0 degrees means tangent-continuous regardless of
+            # whether the tangents point with or against each other, which
+            # is the right test for both the across-gap case (blend strip
+            # between two faces) and the same-side overlay case (match_surface).
             cosang = max(-1.0, min(1.0, Ta.dot(Tb) / (La * Lb)))
-            g1_deg = _math.degrees(_math.acos(cosang))
+            g1_deg = _math.degrees(_math.acos(abs(cosang)))
         else:
             g1_deg = 0.0
 
         Ka = _cross_d2(face_a, a_pr, sa, ua, va)
         Kb = _cross_d2(face_b, b_pr, sb, ub, vb)
-        g2 = (Ka - Kb).Length
+        # Surface.tangent() is UNIT length, so the true cross-parameter
+        # speeds |dP/dw| needed to normalise Ka/Kb come from the 1st
+        # derivative instead.
+        La = _cross_speed(face_a, a_pr, sa, ua, va) or La
+        Lb = _cross_speed(face_b, b_pr, sb, ub, vb) or Lb
+        g2_raw = (Ka - Kb).Length
+        # Intrinsic G2: cross-direction NORMAL curvature kn = S_ww.N / |S_w|^2
+        # on each side, compared with the normals sign-aligned. The raw
+        # second-derivative vector difference above is parametrization-
+        # dependent (a curvature-matched seam between faces with different
+        # cross-parameter speeds reads as huge), so it is kept only as
+        # "g2_raw" and the graded "g2" is in true curvature units (1/length).
+        g2 = g2_raw
+        try:
+            Na = face_a.normalAt(ua, va)
+            Nb = face_b.normalAt(ub, vb)
+            if La > 1e-9 and Lb > 1e-9:
+                kna = Ka.dot(Na) / (La * La)
+                knb = Kb.dot(Nb) / (Lb * Lb)
+                if Na.dot(Nb) < 0.0:
+                    knb = -knb
+                g2 = abs(kna - knb)
+        except Exception:
+            pass
 
-        rows.append({"t": t, "p": pa, "g0": dist, "g1_deg": g1_deg, "g2": g2})
+        rows.append({"t": t, "p": pa, "g0": dist, "g1_deg": g1_deg, "g2": g2,
+                     "g2_raw": g2_raw})
         max_g0 = max(max_g0, dist)
         max_g1 = max(max_g1, g1_deg)
         max_g2 = max(max_g2, g2)

@@ -26,9 +26,14 @@ class RailformStudioWorkbench(FreeCADGui.Workbench):
         from rfstudio import commands, deps, engines
 
         commands.register()
-        for toolbar_name, cmd_ids in commands.TOOLBARS:
+        # Toolbars carry a curated high-frequency subset (icon-only buttons
+        # are hard to learn en masse); the menus carry the FULL set with
+        # text labels, so nothing is more than one click away. See
+        # commands.TOOLBAR_PRIMARY vs commands.TOOLBARS.
+        for toolbar_name, cmd_ids in commands.TOOLBAR_PRIMARY:
             self.appendToolbar(toolbar_name, cmd_ids)
-            self.appendMenu(toolbar_name.replace("Railform ", ""), cmd_ids)
+        for menu_name, cmd_ids in commands.TOOLBARS:
+            self.appendMenu(menu_name.replace("Railform ", ""), cmd_ids)
 
         st = deps.status()
         missing = [k for k, v in st.items() if not v]

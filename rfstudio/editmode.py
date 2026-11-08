@@ -304,8 +304,11 @@ class PointEditor(object):
         self._watchdog = None
         self._snap_pts = []
         self._snap_shapes = []
+        self._snap_faces = []
+        self._snap_anchor_pt = None
         self._hover_pts_cache = None    # lazily built for hover-snap preview
         self._hover_shapes_cache = None
+        self._hover_faces_cache = []
         # Live drag readout (ΔXYZ / distance) on the status bar, coalesced
         # off the Coin move callback via a single pending QTimer tick.
         self._status_scheduled = False
@@ -337,6 +340,22 @@ class PointEditor(object):
         self.hover_handle = None     # (point_idx, 'left'|'right') or None
         # Tangent-to-face virtual intersection handles (issue #9)
         self._tangent_targets = {}   # point_idx -> (face_obj, face_name, sub_element)
+        # --- Phase 1: curvature comb for ALL curve types + inflection markers ---
+        self.inflection_vis_root = None   # Coin overlay: orange circle glyphs at kappa=0
+        self.inflection_coords = None
+        self.inflection_mk = None
+        self.inflection_col = None
+        # --- Phase 1: multi-CV selection / viewport box select / centroid gizmo ---
+        self._hl_switch = None      # Coin switch for highlighted (selected) points
+        self._hl_coords = None
+        self._hl_mk = None
+        self.selected_point_indices = set()   # set of point idx currently multi-selected
+        self._box_select_active = False       # Ctrl+drag on empty space = box select
+        self._box_select_start = None         # screen pos where box drag started
+        self._box_switch = None
+        self._box_coords = None
+        # --- Planar-first: active construction plane for constrained drag ---
+        self.plane_family = "XY"   # "XY", "YZ", "ZX", "Camera", or "Auto"
         try:
             from pivy import coin
             self.coin = coin
@@ -586,6 +605,17 @@ class PointEditor(object):
         self.is_bezier = (hasattr(self.obj, "Proxy") and
                          getattr(self.obj.Proxy, "Type", None) == "BezierCurve")
 
+        # Build curvature comb structure for ALL curve types (not just Bezier).
+        # Bezier segments use analytic handle math; non-Bezier curves use
+        # core.curvature_comb evaluated against obj.Shape each drag.
+        self._build_curvature_comb()
+
+        # Inflection (kappa=0) marker overlay (orange circles).
+        self._build_inflection_overlay()
+
+        # Multi-CV highlight overlay (yellow squares) + box-select rubber band.
+        self._build_multi_cv_highlight()
+
         # Initialize Bezier handle visualization if applicable
         if self.is_bezier:
             self._build_bezier_handles()
@@ -655,18 +685,54 @@ class PointEditor(object):
         self._update_cones(p, L)
 
     # ---- snap ---- #
+    def _snap_anchor(self, idx):
+        """The fixed reference point for anchor-relative constraint snaps
+        (perpendicular / tangent) while point `idx` is being dragged: its
+        neighbour on the curve. An endpoint's neighbour is the interior point
+        next to it, so dragging an END to a perpendicular/tangent foot makes
+        the END segment meet the target curve cleanly -- which is exactly the
+        'get a curve end to join another curve' case. None if there's no
+        neighbour (single-point object) or idx is out of range."""
+        pts = self._points()
+        if idx is None or not (0 <= idx < len(pts)):
+            return None
+        if idx > 0:
+            return pts[idx - 1]
+        if idx + 1 < len(pts):
+            return pts[idx + 1]
+        return None
+
     def _snap_candidates(self):
-        """EXACT high-priority discrete targets from all other objects,
-        each tagged with its snap family (vertex/control/knot ->
-        SNAP_VERTEX, curve-curve crossing -> SNAP_INTERSECTION) so the
-        indicator can show which kind engaged. Gated by the user's snap
-        toggles (rfstudio.snapsettings): a muted family isn't collected,
-        so it neither snaps nor flashes its marker. Coarse arc-length
-        samples are intentionally excluded -- the exact ray->edge path
-        already covers 'anywhere on a curve' precisely."""
-        return snaputil.collect_strong_snap_points_kinded(
-            self.obj.Document, exclude=self.obj,
-            kinds=snapsettings.enabled_kinds())
+        """EXACT high-priority discrete targets from all other objects, each
+        tagged with its snap family (vertex/control/knot -> SNAP_VERTEX,
+        midpoint -> SNAP_MIDPOINT, centre -> SNAP_CENTER, curve-curve crossing
+        -> SNAP_INTERSECTION) so the indicator can show which kind engaged,
+        PLUS the anchor-relative constraint targets (perpendicular / tangent)
+        when those families are on and a drag anchor exists. Gated by the
+        user's snap toggles (rfstudio.snapsettings): a muted family isn't
+        collected, so it neither snaps nor flashes its marker. Coarse
+        arc-length samples are intentionally excluded -- the exact ray->edge
+        path already covers 'anywhere on a curve' precisely."""
+        kinds = snapsettings.enabled_kinds()
+        doc = self.obj.Document
+        pts = snaputil.collect_strong_snap_points_kinded(
+            doc, exclude=self.obj, kinds=kinds)
+        anchor = getattr(self, "_snap_anchor_pt", None)
+        if anchor is not None and (snaputil.SNAP_PERPENDICULAR in kinds
+                                   or snaputil.SNAP_TANGENT in kinds):
+            try:
+                # Reuse the edge list already collected for on-curve
+                # projection; recollect only if 'edge' projection is off
+                # (so the constraint families still work on their own).
+                edges = getattr(self, "_snap_shapes", None)
+                if not edges:
+                    edges = [e for e, _o in snaputil.collect_snap_shapes(
+                        doc, exclude=self.obj)]
+                pts += snaputil.collect_constraint_snap_points_kinded(
+                    doc, anchor, exclude=self.obj, kinds=kinds, edges=edges)
+            except Exception:
+                pass
+        return pts
 
     def _snap_shape_candidates(self):
         """Edges from all other objects, for EXACT perpendicular-
@@ -680,17 +746,33 @@ class PointEditor(object):
                 snaputil.collect_snap_shapes(self.obj.Document,
                                              exclude=self.obj)]
 
+    def _snap_face_candidates(self):
+        """Faces from all other objects, for EXACT on-surface projection
+        snapping -- lets a dragged point land ON a reference skin, not only
+        on curves. Empty when the 'surface' snap family is off (its default),
+        so the heavier per-face scan only runs when asked for."""
+        if not snapsettings.enabled(snaputil.SNAP_SURFACE):
+            return []
+        try:
+            return snaputil.collect_snap_faces(self.obj.Document,
+                                               exclude=self.obj)
+        except Exception:
+            return []
+
     def _snap(self, pos):
         """(point, kind) snapped within self._snap_px screen pixels, or
         (None, None). Vertex/endpoint priority: an EXACT discrete target
-        (vertex, control point, knot, or curve-curve intersection) within
-        tolerance always wins over a generic on-edge projection -- only if
-        none is in range do we fall to the exact point anywhere along a
-        curve's real geometry (see snaputil.nearest_snap_ranked_kind). The
-        returned kind drives the indicator colour/glyph."""
+        (vertex, control point, knot, midpoint, centre, curve-curve
+        intersection, or a perpendicular/tangent constraint) within tolerance
+        always wins over a generic projection -- only if none is in range do
+        we fall to the exact point anywhere along a curve (on-edge) or on a
+        surface, whichever is nearer on screen (see
+        snaputil.nearest_snap_ranked_kind). The returned kind drives the
+        indicator colour/glyph."""
         return snaputil.nearest_snap_ranked_kind(
             self.view, self._snap_pts, getattr(self, "_snap_shapes", []),
-            pos, self._snap_px)
+            pos, self._snap_px,
+            face_shapes=getattr(self, "_snap_faces", []))
 
     @staticmethod
     def _resolve_snap_glyphs(coin):
@@ -728,6 +810,20 @@ class PointEditor(object):
             snaputil.SNAP_VERTEX: (idx(filled), (0.2, 0.95, 0.3)),
             snaputil.SNAP_INTERSECTION: (idx(filled), (1.0, 0.9, 0.2)),
             snaputil.SNAP_EDGE: (idx(hollow), (0.1, 0.95, 0.95)),
+            # Off-curve control handle -- green like a vertex but HOLLOW, so a
+            # weak control-point snap reads as distinct from an on-geometry
+            # vertex landing (filled).
+            snaputil.SNAP_CONTROL: (idx(hollow), (0.2, 0.95, 0.3)),
+            # Derived discrete targets (filled, like other landing snaps):
+            snaputil.SNAP_MIDPOINT: (idx(filled), (0.35, 0.7, 1.0)),
+            snaputil.SNAP_CENTER: (idx(filled), (1.0, 0.5, 0.9)),
+            # Constraint families -- filled, warm hues so a right-angle /
+            # tangential join reads differently from a plain vertex grab:
+            snaputil.SNAP_PERPENDICULAR: (idx(filled), (1.0, 0.6, 0.2)),
+            snaputil.SNAP_TANGENT: (idx(filled), (1.0, 0.85, 0.35)),
+            # On-surface projection: hollow, like the on-curve projection it
+            # competes with, in a distinct violet.
+            snaputil.SNAP_SURFACE: (idx(hollow), (0.7, 0.5, 1.0)),
         }
 
     def _show_snap_marker(self, pt, kind):
@@ -770,14 +866,16 @@ class PointEditor(object):
             statusbar.show(self._status_text)
 
     def _hover_snap_candidates(self):
-        """(shapes, points) for the hover-snap preview, built lazily and
-        cached so a hover doesn't re-scan every object each mouse move. The
-        cache is invalidated at the end of each drag (see _release), since
+        """(shapes, faces, points) for the hover-snap preview, built lazily
+        and cached so a hover doesn't re-scan every object each mouse move.
+        The cache is invalidated at the end of each drag (see _release), since
         the edited curve's geometry changes there.
 
-        Separate from the drag-time _snap_pts/_snap_shapes (which are
-        rebuilt at drag start) precisely so a preview can run BEFORE any
-        drag begins -- the whole point of the hover preview."""
+        Separate from the drag-time _snap_pts/_snap_shapes/_snap_faces (which
+        are rebuilt at drag start) precisely so a preview can run BEFORE any
+        drag begins -- the whole point of the hover preview. The constraint
+        families (perpendicular/tangent) are intentionally absent here: they
+        need a drag anchor, so they only appear once a drag is under way."""
         if self._hover_shapes_cache is None:
             try:
                 kinds = snapsettings.enabled_kinds()
@@ -785,13 +883,19 @@ class PointEditor(object):
                     [e for e, _o in snaputil.collect_snap_shapes(
                         self.obj.Document, exclude=self.obj)]
                     if snaputil.SNAP_EDGE in kinds else [])
+                self._hover_faces_cache = (
+                    snaputil.collect_snap_faces(
+                        self.obj.Document, exclude=self.obj)
+                    if snaputil.SNAP_SURFACE in kinds else [])
                 self._hover_pts_cache = \
                     snaputil.collect_strong_snap_points_kinded(
                         self.obj.Document, exclude=self.obj, kinds=kinds)
             except Exception:
                 self._hover_shapes_cache = []
+                self._hover_faces_cache = []
                 self._hover_pts_cache = []
-        return self._hover_shapes_cache, self._hover_pts_cache
+        return (self._hover_shapes_cache, self._hover_faces_cache,
+                self._hover_pts_cache)
 
     # ---- symmetric editing (model only half) ------------------------- #
     def set_symmetry(self, plane_base, plane_normal, tol=1e-4):
@@ -869,6 +973,63 @@ class PointEditor(object):
                 if self.drag:
                     self._release()
 
+                # Check for double click
+                import time
+                now = time.time()
+                dt = now - getattr(self, "_last_click_time", 0.0)
+                last_pos = getattr(self, "_last_click_pos", (0, 0))
+                self._last_click_time = now
+                self._last_click_pos = ev["Position"]
+                is_double = (dt < 0.35 and abs(ev["Position"][0] - last_pos[0]) < 8 and abs(ev["Position"][1] - last_pos[1]) < 8)
+
+                if is_double and self.is_bezier:
+                    # Double-click handle -> retract to vertex (sharp corner)
+                    handle_info = self._pick_handle(ev["Position"])
+                    if handle_info is not None:
+                        pt_idx, which = handle_info
+                        pts = self._points()
+                        if 0 <= pt_idx < len(pts):
+                            p = pts[pt_idx]
+                            lh = list(getattr(self.obj, "LeftHandles", [Vector(pt.x, pt.y, pt.z) for pt in pts]))
+                            rh = list(getattr(self.obj, "RightHandles", [Vector(pt.x, pt.y, pt.z) for pt in pts]))
+                            if which == "left":
+                                lh[pt_idx] = Vector(p.x, p.y, p.z)
+                            else:
+                                rh[pt_idx] = Vector(p.x, p.y, p.z)
+                            self.obj.LeftHandles = lh
+                            self.obj.RightHandles = rh
+                            self.obj.recompute()
+                            self._update_bezier_handles()
+                            statusbar.flash("Retracted %s handle at point %d to vertex (sharp corner)" % (which, pt_idx + 1))
+                            return
+                    # Double-click point -> if handles retracted, extend new tangent handles
+                    pt_idx = self._pick_point(ev["Position"])
+                    if pt_idx is not None:
+                        pts = self._points()
+                        if 0 <= pt_idx < len(pts):
+                            p = pts[pt_idx]
+                            lh = list(getattr(self.obj, "LeftHandles", [Vector(pt.x, pt.y, pt.z) for pt in pts]))
+                            rh = list(getattr(self.obj, "RightHandles", [Vector(pt.x, pt.y, pt.z) for pt in pts]))
+                            left_len = (lh[pt_idx] - p).Length if pt_idx < len(lh) else 0.0
+                            right_len = (rh[pt_idx] - p).Length if pt_idx < len(rh) else 0.0
+                            if left_len < 1e-4 or right_len < 1e-4:
+                                n = len(pts)
+                                prev_p = pts[pt_idx - 1] if pt_idx > 0 else (p - (pts[1] - p) if n > 1 else p - Vector(1, 0, 0))
+                                next_p = pts[pt_idx + 1] if pt_idx + 1 < n else (p + (p - pts[-2]) if n > 1 else p + Vector(1, 0, 0))
+                                tangent = (next_p - prev_p)
+                                t_len = tangent.Length
+                                if t_len > 1e-9:
+                                    t_dir = tangent * (1.0 / t_len)
+                                    span = max(t_len / 6.0, 2.0)
+                                    lh[pt_idx] = p - t_dir * span
+                                    rh[pt_idx] = p + t_dir * span
+                                    self.obj.LeftHandles = lh
+                                    self.obj.RightHandles = rh
+                                    self.obj.recompute()
+                                    self._update_bezier_handles()
+                                    statusbar.flash("Extended tangent handles at point %d" % (pt_idx + 1))
+                                    return
+
                 # Check for Ctrl+click for coordinate input
                 if self.dragging_with_ctrl and not self.drag:
                     self._show_input_field(ev["Position"])
@@ -886,7 +1047,10 @@ class PointEditor(object):
                 # Fall back to existing logic (segment, axis, point)
                 self._press(ev["Position"])
             elif ev.get("State") == "UP":
-                self._release()
+                if self._box_select_active:
+                    self._end_box_select(ev["Position"])
+                else:
+                    self._release()
         except Exception:
             pass
 
@@ -930,6 +1094,13 @@ class PointEditor(object):
             self.sel = idx
             self._refresh_arrows()
             self._begin(idx, None, pos)
+            return
+
+        # Box selection: Ctrl+LMB drag on empty space selects all points
+        # whose screen projection falls inside the drag rectangle.
+        if self._ctrl_held():
+            self._start_box_select(pos)
+            return
 
     def _shift_held(self):
         """True if Shift is currently held (live Qt modifier state)."""
@@ -940,12 +1111,73 @@ class PointEditor(object):
         except Exception:
             return False
 
+    def _alt_held(self):
+        """True if Alt is currently held (live Qt modifier state)."""
+        try:
+            from PySide import QtCore, QtGui
+            return bool(QtGui.QGuiApplication.keyboardModifiers()
+                        & QtCore.Qt.AltModifier)
+        except Exception:
+            return False
+
+    def _ctrl_held(self):
+        """True if Ctrl is currently held (live Qt modifier state)."""
+        try:
+            from PySide import QtCore, QtGui
+            return bool(QtGui.QGuiApplication.keyboardModifiers()
+                        & QtCore.Qt.ControlModifier)
+        except Exception:
+            return False
+
+    def set_plane_family(self, name):
+        """Set the active construction plane for constrained dragging.
+
+        When a principal plane (XY/YZ/ZX) is active, free drags are projected
+        onto that plane so the edited point cannot drift off-plane.
+        """
+        self.plane_family = name
+
+    def _cursor_plane_point(self, pos):
+        """Project the cursor screen position onto the active construction plane.
+
+        Returns a FreeCAD Vector lying on the plane, or None if projection
+        fails (caller should fall back to view.getPoint).
+        """
+        from FreeCAD import Vector
+        from rfstudio import panel_logic, snaputil
+
+        pf = self.plane_family
+        if pf in ("Camera", "Auto"):
+            # Free-form 3D: raw view depth
+            gp = self.view.getPoint(pos[0], pos[1])
+            return gp
+
+        ray = snaputil.pick_ray(self.view, pos)
+        if ray is None:
+            return None
+        ro, rd = ray
+        norm = panel_logic.plane_normal_for(pf)
+        origin = (0.0, 0.0, 0.0)
+        hit = panel_logic.ray_plane_intersect(
+            (ro.x, ro.y, ro.z), (rd.x, rd.y, rd.z), origin, norm)
+        if hit is not None:
+            return Vector(*hit)
+        return None
+
     def _begin(self, idx, axis, pos):
-        g0 = self.view.getPoint(pos[0], pos[1])
+        # Project the drag origin onto the active construction plane so that
+        # free drags cannot drift off-plane (planar-first workflow).
+        g0 = self._cursor_plane_point(pos)
+        if g0 is None:
+            g0 = self.view.getPoint(pos[0], pos[1])
         self.drag = {"idx": idx, "axis": axis, "g0": g0,
                      "p0": self._points()[idx]}
-        self._snap_pts = self._snap_candidates()  # cache for this drag
-        self._snap_shapes = self._snap_shape_candidates()  # cache for this drag
+        # Order matters: the constraint snaps in _snap_candidates reuse
+        # _snap_shapes and read _snap_anchor_pt, so set those first.
+        self._snap_anchor_pt = self._snap_anchor(idx)
+        self._snap_shapes = self._snap_shape_candidates()  # edges, this drag
+        self._snap_faces = self._snap_face_candidates()    # faces, this drag
+        self._snap_pts = self._snap_candidates()           # discrete + constr.
         self._start_watchdog()
 
     def _on_move(self, ev):
@@ -987,8 +1219,11 @@ class PointEditor(object):
                         else:
                             self._hide_snap_marker()
                     else:
-                        # Free drag in the view plane, with snap-to-other-curves.
-                        g = self.view.getPoint(pos[0], pos[1])
+                        # Free drag: project cursor onto the active construction
+                        # plane so the point stays on-plane (planar-first).
+                        g = self._cursor_plane_point(pos)
+                        if g is None:
+                            g = self.view.getPoint(pos[0], pos[1])
                         newp = p0 + (g - self.drag["g0"])
                         snapped, kind = self._snap(pos)
                         if snapped is not None:
@@ -1000,8 +1235,12 @@ class PointEditor(object):
                     self._queue_drag_readout(p0, newp)
                     self._live(self.drag["idx"], newp)
             else:
-                # Handle hover detection when not dragging
-                self._on_hover(pos)
+                # Box-select drag in progress: resize the rubber band.
+                if self._box_select_active:
+                    self._update_box_select(pos)
+                else:
+                    # Handle hover detection when not dragging
+                    self._on_hover(pos)
         except Exception:
             pass
 
@@ -1027,6 +1266,20 @@ class PointEditor(object):
                 # If not hovering over point or segment, check for hover over handle (for editing)
                 if self.hover_point is None and self.hover_segment is None and self.is_bezier:
                     self.hover_handle = self._pick_handle(pos)
+                    if self.hover_handle is not None:
+                        pt_idx, which = self.hover_handle
+                        pts = self._points()
+                        if 0 <= pt_idx < len(pts):
+                            anchor_pt = pts[pt_idx]
+                            handles = getattr(self.obj, "LeftHandles" if which == 'left' else "RightHandles", [])
+                            if 0 <= pt_idx < len(handles):
+                                h_vec = handles[pt_idx] - anchor_pt
+                                tension = h_vec.Length
+                                htypes = getattr(self.obj, "HandleTypes", [])
+                                htype = htypes[pt_idx] if pt_idx < len(htypes) else "Auto"
+                                from rfstudio import statusbar
+                                statusbar.show("Spline Handle: Point %d (%s) | Tension: %.2f mm | Type: %s | Drag to adjust (Alt: Cusp) | DblClick to retract"
+                                               % (pt_idx + 1, which.capitalize(), tension, htype))
 
             # Update cursor based on hover state
             self._update_cursor()
@@ -1045,9 +1298,10 @@ class PointEditor(object):
             # it doesn't fight the deletion/edit hover cues.
             if (not self.creating and self.hover_point is None
                     and self.hover_handle is None):
-                shapes, dpts = self._hover_snap_candidates()
+                shapes, faces, dpts = self._hover_snap_candidates()
                 snapped, kind = snaputil.nearest_snap_ranked_kind(
-                    self.view, dpts, shapes, pos, self._snap_px)
+                    self.view, dpts, shapes, pos, self._snap_px,
+                    face_shapes=faces)
                 if snapped is not None:
                     self._show_snap_marker(snapped, kind)
                 else:
@@ -1140,31 +1394,22 @@ class PointEditor(object):
 
     def _update_bezier_handle_highlight(self):
         """Update visual highlight for Bezier handle hover state."""
-        if not self.is_bezier or not self.handle_vis_root:
+        if not self.is_bezier or not getattr(self, "handle_vis_root", None):
             return
-
-        # Reset all highlights
-        self.left_handle_markers.numPoints = 0
-        self.right_handle_markers.numPoints = 0
+        if getattr(self, "handle_hl_markers", None) is None:
+            return
 
         if self.hover_handle is not None:
             point_idx, which = self.hover_handle
             pts = self._points()
             if 0 <= point_idx < len(pts):
-                if which == 'left':
-                    # Highlight left handle
-                    left_handles = getattr(self.obj, "LeftHandles", [Vector(0,0,0)] * len(pts))
-                    if point_idx < len(left_handles):
-                        handle_pos = left_handles[point_idx]
-                        self.left_handle_coords.point.set1Value(0, handle_pos.x, handle_pos.y, handle_pos.z)
-                        self.left_handle_markers.numPoints = 1
-                else:  # right
-                    # Highlight right handle
-                    right_handles = getattr(self.obj, "RightHandles", [Vector(0,0,0)] * len(pts))
-                    if point_idx < len(right_handles):
-                        handle_pos = right_handles[point_idx]
-                        self.right_handle_coords.point.set1Value(0, handle_pos.x, handle_pos.y, handle_pos.z)
-                        self.right_handle_markers.numPoints = 1
+                handles = getattr(self.obj, "LeftHandles" if which == 'left' else "RightHandles", [])
+                if 0 <= point_idx < len(handles):
+                    handle_pos = handles[point_idx]
+                    self.handle_hl_coords.point.set1Value(0, handle_pos.x, handle_pos.y, handle_pos.z)
+                    self.handle_hl_markers.numPoints = 1
+                    return
+        self.handle_hl_markers.numPoints = 0
 
     def _get_screen_distance(self, point1, point2):
         """Calculate screen distance between two 3D points."""
@@ -1191,25 +1436,26 @@ class PointEditor(object):
         left_handles = getattr(self.obj, "LeftHandles", [Vector(0,0,0)] * len(pts))
         right_handles = getattr(self.obj, "RightHandles", [Vector(0,0,0)] * len(pts))
 
-        # Convert screen pos to 3D point on view plane
-        view_point = self.view.getPoint(pos[0], pos[1])
-        if view_point is None:
-            return None
-
-        min_dist = float('inf')
+        min_dist = 14.0  # 14 pixel threshold for diamond handle tips
         closest = None
 
-        # Check left handles (blue)
+        # Check left handles (Cyan diamonds)
         for i, handle in enumerate(left_handles):
-            dist = self._get_screen_distance(view_point, handle)
-            if dist < min_dist and dist < 12:  # 12 pixel threshold for handles
+            sp = self._screen(handle)
+            if sp is None:
+                continue
+            dist = ((sp[0] - pos[0]) ** 2 + (sp[1] - pos[1]) ** 2) ** 0.5
+            if dist < min_dist:
                 min_dist = dist
                 closest = (i, 'left')
 
-        # Check right handles (green)
+        # Check right handles (Emerald diamonds)
         for i, handle in enumerate(right_handles):
-            dist = self._get_screen_distance(view_point, handle)
-            if dist < min_dist and dist < 12:
+            sp = self._screen(handle)
+            if sp is None:
+                continue
+            dist = ((sp[0] - pos[0]) ** 2 + (sp[1] - pos[1]) ** 2) ** 0.5
+            if dist < min_dist:
                 min_dist = dist
                 closest = (i, 'right')
 
@@ -1217,6 +1463,7 @@ class PointEditor(object):
 
     def _edit_bezier_handle(self, handle_info, pos):
         """Edit a Bezier handle based on handle type constraints."""
+        import math
         point_idx, which = handle_info  # which is 'left' or 'right'
         view_point = self.view.getPoint(pos[0], pos[1])
         if view_point is None:
@@ -1232,6 +1479,30 @@ class PointEditor(object):
             return
 
         point = points[point_idx]
+        alt_held = self._alt_held()
+
+        # Endpoint continuity snapping to adjacent edges/faces
+        is_endpoint = (point_idx == 0 and which == 'right') or (point_idx == len(points) - 1 and which == 'left')
+        c_mode = getattr(self, "_endpoint_continuity_mode", "G1")
+        endpoint_snapped_info = None
+        if is_endpoint and c_mode != "Free" and hasattr(self, "_snap_shapes") and self._snap_shapes:
+            anchor = points[point_idx]
+            best_pt, best_d, best_shape = snaputil.nearest_point_on_shapes(anchor, self._snap_shapes, max_dist=2.0)
+            if best_shape is not None:
+                info = core.evaluate_edge_at_point(best_shape, anchor)
+                tan_e = info['tangent']
+                v_cand = view_point - anchor
+                if v_cand.Length > 1e-6:
+                    dot_val = v_cand.normalize().dot(tan_e)
+                    angle_to_tan = math.degrees(math.acos(min(1.0, max(-1.0, abs(dot_val)))))
+                    if angle_to_tan < 25.0:
+                        snap_res = core.snap_endpoint_continuity(anchor, view_point, best_shape, continuity=c_mode)
+                        view_point = snap_res['p_handle']
+                        endpoint_snapped_info = f"[{c_mode} Snapped to Edge (κ={info['curvature']:.4f})]"
+
+        # If Alt is held while dragging, break symmetry into a Cusp / Free handle
+        if alt_held and point_idx < len(handle_types):
+            handle_types[point_idx] = "Free"
 
         # Update the appropriate handle
         if which == 'left':
@@ -1239,9 +1510,10 @@ class PointEditor(object):
         else:  # right
             right_handles[point_idx] = view_point
 
-        # Enforce handle type constraints (G1/G2 continuity)
-        self._enforce_bezier_handle_constraints(point_idx, which, left_handles,
-                                                right_handles, handle_types)
+        # Enforce handle type constraints (G1/G2 continuity) unless Free/Cusp
+        if not alt_held:
+            self._enforce_bezier_handle_constraints(point_idx, which, left_handles,
+                                                    right_handles, handle_types)
 
         # Apply G1/G2 continuity snapping to adjacent spans
         self._snap_bezier_continuity(point_idx, which, left_handles, right_handles, handle_types)
@@ -1256,6 +1528,19 @@ class PointEditor(object):
 
         # Update visualization
         self._update_bezier_handles()
+
+        # Compute tension and angle readout
+        anchor_pt = points[point_idx]
+        active_handle = left_handles[point_idx] if which == 'left' else right_handles[point_idx]
+        h_vec = active_handle - anchor_pt
+        tension = h_vec.Length
+        angle = math.degrees(math.atan2(h_vec.y, h_vec.x))
+        htype = handle_types[point_idx] if point_idx < len(handle_types) else "Auto"
+        from rfstudio import statusbar
+        snap_extra = f" | {endpoint_snapped_info}" if endpoint_snapped_info else ""
+        statusbar.show("Spline Handle: Point %d (%s) | Tension: %.2f mm | ∠%.1f° | %s%s%s"
+                       % (point_idx + 1, which.capitalize(), tension, angle, htype,
+                          " [Cusp/Free]" if alt_held else " (Hold Alt for Cusp)", snap_extra))
 
         # Update status bar with G2/G3 readout
         self._update_bezier_status_readout(point_idx)
@@ -1284,7 +1569,15 @@ class PointEditor(object):
         if point_idx < len(handle_types):
             handle_types[point_idx] = htype
             self.obj.HandleTypes = handle_types
+            pts = self._points()
+            lh = list(getattr(self.obj, "LeftHandles", [Vector(p.x, p.y, p.z) for p in pts]))
+            rh = list(getattr(self.obj, "RightHandles", [Vector(p.x, p.y, p.z) for p in pts]))
+            if len(lh) == len(pts) and len(rh) == len(pts):
+                self._enforce_bezier_handle_constraints(point_idx, 'left', lh, rh, handle_types)
+                self.obj.LeftHandles = lh
+                self.obj.RightHandles = rh
             self.obj.recompute()
+            self._update_bezier_handles()
             # If setting to TangentFace, prompt for face selection
             if htype == "TangentFace":
                 self._prompt_tangent_face_selection(point_idx)
@@ -1650,27 +1943,43 @@ class PointEditor(object):
                     self.dragging_with_ctrl = True
                 # Handle type shortcuts (when not creating)
                 elif not self.creating and self.is_bezier:
-                    if key == 65:  # A - Auto
-                        if self.hover_point is not None:
-                            self.set_bezier_handle_type(self.hover_point, "Auto")
-                    elif key == 76:  # L - Aligned
-                        if self.hover_point is not None:
-                            self.set_bezier_handle_type(self.hover_point, "Aligned")
-                    elif key == 86:  # V - Vector (G1)
-                        if self.hover_point is not None:
-                            self.set_bezier_handle_type(self.hover_point, "Vector")
-                    elif key == 71:  # G - G2 curvature continuity
-                        if self.hover_point is not None:
-                            self.set_bezier_handle_type(self.hover_point, "G2")
-                    elif key == 74:  # J - G3 jerk continuity
-                        if self.hover_point is not None:
-                            self.set_bezier_handle_type(self.hover_point, "G3")
-                    elif key == 70:  # F - Free
-                        if self.hover_point is not None:
-                            self.set_bezier_handle_type(self.hover_point, "Free")
-                    elif key == 84:  # T - Tangent-to-face (virtual intersection)
-                        if self.hover_point is not None:
-                            self.set_bezier_handle_type(self.hover_point, "TangentFace")
+                    target_pt = self.hover_point if self.hover_point is not None else getattr(self, "sel", None)
+                    if key in (65, 97):  # A / a - Auto
+                        if target_pt is not None:
+                            self.set_bezier_handle_type(target_pt, "Auto")
+                            statusbar.flash("Point %d: Handle Type 'Auto'" % (target_pt + 1))
+                    elif key in (76, 108):  # L / l - Aligned
+                        if target_pt is not None:
+                            self.set_bezier_handle_type(target_pt, "Aligned")
+                            statusbar.flash("Point %d: Handle Type 'Aligned'" % (target_pt + 1))
+                    elif key in (77, 109):  # M / m - Mirrored (symmetric)
+                        if target_pt is not None:
+                            self.set_bezier_handle_type(target_pt, "Mirrored")
+                            statusbar.flash("Point %d: Handle Type 'Mirrored' (symmetric)" % (target_pt + 1))
+                    elif key in (86, 118):  # V / v - Cycle handle type (Blender-style)
+                        if target_pt is not None:
+                            cycle = ["Auto", "Aligned", "Mirrored", "Vector", "Free"]
+                            htypes = list(getattr(self.obj, "HandleTypes", ["Auto"] * len(self._points())))
+                            cur_t = htypes[target_pt] if target_pt < len(htypes) else "Auto"
+                            nxt_idx = (cycle.index(cur_t) + 1) % len(cycle) if cur_t in cycle else 0
+                            nxt_t = cycle[nxt_idx]
+                            self.set_bezier_handle_type(target_pt, nxt_t)
+                            statusbar.flash("Point %d: Handle Type '%s' (V to cycle)" % (target_pt + 1, nxt_t))
+                    elif key in (71, 103):  # G / g - G2 curvature continuity
+                        if target_pt is not None:
+                            self.set_bezier_handle_type(target_pt, "G2")
+                            statusbar.flash("Point %d: Handle Type 'G2'" % (target_pt + 1))
+                    elif key in (74, 106):  # J / j - G3 jerk continuity
+                        if target_pt is not None:
+                            self.set_bezier_handle_type(target_pt, "G3")
+                            statusbar.flash("Point %d: Handle Type 'G3'" % (target_pt + 1))
+                    elif key in (70, 102):  # F / f - Free
+                        if target_pt is not None:
+                            self.set_bezier_handle_type(target_pt, "Free")
+                            statusbar.flash("Point %d: Handle Type 'Free'" % (target_pt + 1))
+                    elif key in (84, 116):  # T / t - Tangent-to-face (virtual intersection)
+                        if target_pt is not None:
+                            self.set_bezier_handle_type(target_pt, "TangentFace")
                 # Delete or Backspace key
                 elif key == 127 or key == 8:
                     if self.hover_point is not None and not self.creating:
@@ -1826,6 +2135,11 @@ class PointEditor(object):
         if self.is_bezier:
             self._update_bezier_handles()
 
+        # --- Phase 1: live curvature comb + inflection markers during drag ---
+        # Refresh every mouse move so the comb tracks the curve as the pole moves.
+        self._update_curvature_comb()
+        self._update_inflection_markers()
+
     def _set_arrows_at(self, p):
         L = self._arrow_len()
         for i, coord in enumerate(self.arrow_coords):
@@ -1851,6 +2165,7 @@ class PointEditor(object):
         # the preview rebuilds against current geometry on the next hover.
         self._hover_pts_cache = None
         self._hover_shapes_cache = None
+        self._hover_faces_cache = []
         # Persist the drag. Bezier-handle drags already wrote themselves back in
         # _edit_bezier_handle (live), so only a point/axis drag needs its final
         # marker position committed to obj.Points. (Previously _release never
@@ -1952,6 +2267,7 @@ class PointEditor(object):
         self._stop_watchdog()
         self._destroy_symmetry_preview()
         self._destroy_bezier_handles()
+        self._destroy_inflection_overlay()
         drop_callbacks(self.view, (
             ("SoMouseButtonEvent", self, "_cb_btn"),
             ("SoLocation2Event", self, "_cb_mov"),
@@ -1977,48 +2293,48 @@ class PointEditor(object):
             from pivy import coin
             self.handle_vis_root = coin.SoSeparator()
 
-            # Left handles (blue squares)
+            # Left handles (Cyan diamonds)
             left_sep = coin.SoSeparator()
             left_col = coin.SoBaseColor()
-            left_col.rgb = (0.2, 0.6, 1.0)  # Blue
+            left_col.rgb = (0.1, 0.85, 1.0)  # Cyan
             left_sep.addChild(left_col)
-            left_style = coin.SoDrawStyle()
-            left_style.pointWidth = 8
-            left_sep.addChild(left_style)
             left_coords = coin.SoCoordinate3()
             left_markers = coin.SoMarkerSet()
-            left_markers.markerIndex = coin.SoMarkerSet.SQUARE
+            try:
+                left_markers.markerIndex = coin.SoMarkerSet.DIAMOND_FILLED_7_7
+            except Exception:
+                left_markers.markerIndex = coin.SoMarkerSet.SQUARE
             left_sep.addChild(left_coords)
             left_sep.addChild(left_markers)
             self.handle_vis_root.addChild(left_sep)
             self.left_handle_coords = left_coords
             self.left_handle_markers = left_markers
 
-            # Right handles (green squares)
+            # Right handles (Emerald diamonds)
             right_sep = coin.SoSeparator()
             right_col = coin.SoBaseColor()
-            right_col.rgb = (0.2, 1.0, 0.6)  # Green
+            right_col.rgb = (0.2, 1.0, 0.5)  # Emerald
             right_sep.addChild(right_col)
-            right_style = coin.SoDrawStyle()
-            right_style.pointWidth = 8
-            right_sep.addChild(right_style)
             right_coords = coin.SoCoordinate3()
             right_markers = coin.SoMarkerSet()
-            right_markers.markerIndex = coin.SoMarkerSet.SQUARE
+            try:
+                right_markers.markerIndex = coin.SoMarkerSet.DIAMOND_FILLED_7_7
+            except Exception:
+                right_markers.markerIndex = coin.SoMarkerSet.SQUARE
             right_sep.addChild(right_coords)
             right_sep.addChild(right_markers)
             self.handle_vis_root.addChild(right_sep)
             self.right_handle_coords = right_coords
             self.right_handle_markers = right_markers
 
-            # Connect lines from points to handles (light gray)
+            # Connect lines from points to handles (dashed slate)
             line_sep = coin.SoSeparator()
             line_col = coin.SoBaseColor()
-            line_col.rgb = (0.7, 0.7, 0.7)
+            line_col.rgb = (0.65, 0.70, 0.80)
             line_sep.addChild(line_col)
             line_style = coin.SoDrawStyle()
             line_style.lineWidth = 1
-            line_style.linePattern = coin.SoDrawStyle.DOT  # Dashed
+            line_style.linePattern = 0x00FF  # Dashed pattern
             line_sep.addChild(line_style)
             line_coords = coin.SoCoordinate3()
             line_set = coin.SoLineSet()
@@ -2027,6 +2343,24 @@ class PointEditor(object):
             self.handle_vis_root.addChild(line_sep)
             self.line_coords = line_coords
             self.line_set = line_set
+
+            # Dedicated Hover Highlight node for handle tips (Amber diamond)
+            hl_sep = coin.SoSeparator()
+            hl_col = coin.SoBaseColor()
+            hl_col.rgb = (1.0, 0.75, 0.1)  # Amber / Gold hover
+            hl_sep.addChild(hl_col)
+            hl_coords = coin.SoCoordinate3()
+            hl_markers = coin.SoMarkerSet()
+            try:
+                hl_markers.markerIndex = coin.SoMarkerSet.DIAMOND_FILLED_9_9
+            except Exception:
+                hl_markers.markerIndex = coin.SoMarkerSet.DIAMOND_FILLED_7_7
+            hl_sep.addChild(hl_coords)
+            hl_sep.addChild(hl_markers)
+            self.handle_vis_root.addChild(hl_sep)
+            self.handle_hl_coords = hl_coords
+            self.handle_hl_markers = hl_markers
+            self.handle_hl_markers.numPoints = 0
 
             # Add to scene
             doc = FreeCADGui.ActiveDocument
@@ -2075,7 +2409,6 @@ class PointEditor(object):
             self.line_coords.point.setValues(0, len(line_pts), line_pts)
             # Each handle connection is 2 points, so numVertices = 2 per connection
             num_vertices = [2] * (len(pts) * 2)  # Left and right for each point
-            self.line_set.numValues = len(num_vertices)
             self.line_set.numVertices.setValues(0, len(num_vertices), num_vertices)
 
             # Update curvature comb
@@ -2198,6 +2531,14 @@ class PointEditor(object):
             except Exception:
                 pass
             self.handle_vis_root = None
+            self.left_handle_coords = None
+            self.left_handle_markers = None
+            self.right_handle_coords = None
+            self.right_handle_markers = None
+            self.line_coords = None
+            self.line_set = None
+            self.handle_hl_coords = None
+            self.handle_hl_markers = None
 
         # Destroy jerk handle visualization
         if hasattr(self, 'jerk_vis_root') and self.jerk_vis_root:
@@ -2215,8 +2556,15 @@ class PointEditor(object):
 
     # ---- Bezier G2/G3 curvature comb visualization ----
     def _build_curvature_comb(self):
-        """Build Coin visualization for G2/G3 curvature comb on Bezier segments."""
-        if not self.is_bezier or not self.coin:
+        """Build Coin visualization for curvature comb.
+
+        For Bezier curves the structure holds both G2 (magenta) and G3 (jerk)
+        line sets updated by _update_curvature_comb via analytic handle math.
+        For non-Bezier curves the same Coin nodes are reused by
+        _refresh_curvature_comb_all, which evaluates core.curvature_comb
+        against obj.Shape on each drag.
+        """
+        if not self.coin:
             return
 
         try:
@@ -2270,88 +2618,132 @@ class PointEditor(object):
                 f"Railform: Curvature comb visualization unavailable ({exc})\n")
 
     def _update_curvature_comb(self):
-        """Update G2/G3 curvature comb visualization for all Bezier segments.
+        """Update curvature comb visualization.
 
-        G2 (curvature): teeth perpendicular to tangent, length ~ curvature
-        G3 (jerk):     teeth perpendicular to tangent, length ~ jerk (rate of curvature change)
+        Bezier curves: analytic G2/G3 comb from handle math (existing path).
+        Non-Bezier curves: core.curvature_comb evaluated against obj.Shape,
+        refreshed every mouse move so the comb tracks live during drag.
         """
-        if not self.is_bezier or not self.comb_vis_root or not self.handles_visible:
+        if not self.comb_vis_root or not self.handles_visible:
             return
 
         try:
-            pts = self._points()
-            if len(pts) < 2:
-                return
-
-            left_handles = getattr(self.obj, "LeftHandles", [Vector(0, 0, 0)] * len(pts))
-            right_handles = getattr(self.obj, "RightHandles", [Vector(0, 0, 0)] * len(pts))
-
-            # Sample each segment
-            samples_per_segment = 20
-            comb_pts = []   # G2 curvature comb
-            jerk_pts = []   # G3 jerk comb
-
-            for i in range(len(pts) - 1):
-                p0 = pts[i]
-                p3 = pts[i + 1]
-                p1 = right_handles[i]
-                p2 = left_handles[i + 1]
-
-                for j in range(samples_per_segment):
-                    t = j / (samples_per_segment - 1.0)
-                    p, d1, d2, d3 = _bezier_segment_derivatives(p0, p1, p2, p3, t)
-                    speed2 = d1.dot(d1)
-                    if speed2 < 1e-12:
-                        continue
-
-                    # G2 Curvature vector: component of d2 perpendicular to tangent
-                    # k = |d1 x d2| / |d1|^3  (scalar curvature)
-                    # curvature vector = (d2 - d1*(d2·d1/|d1|^2)) / |d1|^2
-                    proj = d2 - d1 * (d2.dot(d1) / speed2)
-                    curvature_vec = proj * (1.0 / speed2)
-
-                    # G3 Jerk: component of d3 perpendicular to tangent
-                    # j = |d3_perp| / |v|^3
-                    speed = speed2 ** 0.5
-                    if speed > 1e-12:
-                        d1_norm = d1 * (1.0 / speed)
-                        d3_perp = d3 - d1_norm * d3.dot(d1_norm)
-                        jerk = d3_perp.Length / (speed2 * speed)
-                        # Jerk direction is along d3_perp
-                        jerk_dir = d3_perp * (1.0 / d3_perp.Length) if d3_perp.Length > 1e-12 else Vector(0, 0, 0)
-                    else:
-                        jerk = 0.0
-                        jerk_dir = Vector(0, 0, 0)
-
-                    # Scale for visualization
-                    scale = self._arrow_len() * 0.5
-
-                    # Curvature comb: draw from curve point along curvature vector
-                    comb_end = p + curvature_vec * scale
-                    # Jerk comb: draw from curve point along jerk direction (perpendicular)
-                    jerk_end = p + jerk_dir * jerk * scale * 0.3
-
-                    comb_pts.append((p.x, p.y, p.z))
-                    comb_pts.append((comb_end.x, comb_end.y, comb_end.z))
-                    jerk_pts.append((p.x, p.y, p.z))
-                    jerk_pts.append((jerk_end.x, jerk_end.y, jerk_end.z))
-
-            # Update Coin
-            if comb_pts:
-                self.comb_coords.point.setValues(0, len(comb_pts), comb_pts)
-                self.comb_set.numVertices.setValues(0, len(comb_pts) // 2, [2] * (len(comb_pts) // 2))
+            if self.is_bezier:
+                self._update_curvature_comb_bezier()
             else:
-                self.comb_set.numVertices.setValues(0, 0, [])
-
-            if jerk_pts:
-                self.jerk_coords.point.setValues(0, len(jerk_pts), jerk_pts)
-                self.jerk_set.numVertices.setValues(0, len(jerk_pts) // 2, [2] * (len(jerk_pts) // 2))
-            else:
-                self.jerk_set.numVertices.setValues(0, 0, [])
-
+                self._refresh_curvature_comb_all()
         except Exception as exc:
             FreeCAD.Console.PrintWarning(
                 f"Railform: Error updating curvature comb: {exc}\n")
+
+    def _update_curvature_comb_bezier(self):
+        """Bezier-specific G2/G3 curvature comb (analytic handle math)."""
+        pts = self._points()
+        if len(pts) < 2:
+            return
+
+        left_handles = getattr(self.obj, "LeftHandles", [Vector(0, 0, 0)] * len(pts))
+        right_handles = getattr(self.obj, "RightHandles", [Vector(0, 0, 0)] * len(pts))
+
+        # Sample each segment
+        samples_per_segment = 20
+        comb_pts = []   # G2 curvature comb
+        jerk_pts = []   # G3 jerk comb
+
+        for i in range(len(pts) - 1):
+            p0 = pts[i]
+            p3 = pts[i + 1]
+            p1 = right_handles[i]
+            p2 = left_handles[i + 1]
+
+            for j in range(samples_per_segment):
+                t = j / (samples_per_segment - 1.0)
+                p, d1, d2, d3 = _bezier_segment_derivatives(p0, p1, p2, p3, t)
+                speed2 = d1.dot(d1)
+                if speed2 < 1e-12:
+                    continue
+
+                # G2 Curvature vector: component of d2 perpendicular to tangent
+                # k = |d1 x d2| / |d1|^3  (scalar curvature)
+                # curvature vector = (d2 - d1*(d2·d1/|d1|^2)) / |d1|^2
+                proj = d2 - d1 * (d2.dot(d1) / speed2)
+                curvature_vec = proj * (1.0 / speed2)
+
+                # G3 Jerk: component of d3 perpendicular to tangent
+                # j = |d3_perp| / |v|^3
+                speed = speed2 ** 0.5
+                if speed > 1e-12:
+                    d1_norm = d1 * (1.0 / speed)
+                    d3_perp = d3 - d1_norm * d3.dot(d1_norm)
+                    jerk = d3_perp.Length / (speed2 * speed)
+                    # Jerk direction is along d3_perp
+                    jerk_dir = d3_perp * (1.0 / d3_perp.Length) if d3_perp.Length > 1e-12 else Vector(0, 0, 0)
+                else:
+                    jerk = 0.0
+                    jerk_dir = Vector(0, 0, 0)
+
+                # Scale for visualization
+                scale = self._arrow_len() * 0.5
+
+                # Curvature comb: draw from curve point along curvature vector
+                comb_end = p + curvature_vec * scale
+                # Jerk comb: draw from curve point along jerk direction (perpendicular)
+                jerk_end = p + jerk_dir * jerk * scale * 0.3
+
+                comb_pts.append((p.x, p.y, p.z))
+                comb_pts.append((comb_end.x, comb_end.y, comb_end.z))
+                jerk_pts.append((p.x, p.y, p.z))
+                jerk_pts.append((jerk_end.x, jerk_end.y, jerk_end.z))
+
+        # Update Coin
+        if comb_pts:
+            self.comb_coords.point.setValues(0, len(comb_pts), comb_pts)
+            self.comb_set.numVertices.setValues(0, len(comb_pts) // 2, [2] * (len(comb_pts) // 2))
+        else:
+            self.comb_set.numVertices.setValues(0, 0, [])
+
+        if jerk_pts:
+            self.jerk_coords.point.setValues(0, len(jerk_pts), jerk_pts)
+            self.jerk_set.numVertices.setValues(0, len(jerk_pts) // 2, [2] * (len(jerk_pts) // 2))
+        else:
+            self.jerk_set.numVertices.setValues(0, 0, [])
+
+    def _refresh_curvature_comb_all(self):
+        """Curvature comb for any non-Bezier curve type, rebuilt from obj.Shape.
+
+        Uses core.curvature_comb (headless-tested) to produce a compound of
+        line 'teeth' whose length is proportional to curvature. Updated every
+        mouse move so the comb tracks live during drag.
+        """
+        if not self.comb_vis_root:
+            return
+        try:
+            from rfstudio import core
+            shape = self.obj.Shape
+            if not shape or not shape.Edges:
+                self.comb_set.numVertices.setValues(0, 0, [])
+                self.jerk_set.numVertices.setValues(0, 0, [])
+                return
+            edge = shape.Edges[0]
+            comb = core.curvature_comb(edge, scale=self._arrow_len() * 0.5, samples=24)
+            if not comb or not hasattr(comb, "Edges"):
+                self.comb_set.numVertices.setValues(0, 0, [])
+                self.jerk_set.numVertices.setValues(0, 0, [])
+                return
+            points = []
+            nv = []
+            for i in range(comb.Edges.getLength()):
+                e = comb.Edges[i]
+                p = [e.getPoint(j) for j in range(2)]
+                points.extend([(q.x, q.y, q.z) for q in p])
+                nv.append(2)
+            self.comb_coords.point.setValues(0, len(points), points)
+            self.comb_set.numVertices.setValues(0, len(nv), nv)
+            # No jerk comb for non-Bezier (jerk needs handle data)
+            self.jerk_set.numVertices.setValues(0, 0, [])
+        except Exception:
+            self.comb_set.numVertices.setValues(0, 0, [])
+            self.jerk_set.numVertices.setValues(0, 0, [])
 
     def _destroy_curvature_comb(self):
         """Destroy curvature comb visualization."""
@@ -2364,6 +2756,252 @@ class PointEditor(object):
             except Exception:
                 pass
             self.comb_vis_root = None
+
+    # ---- Phase 1: inflection (kappa=0) markers ---------------------------- #
+
+    def _build_inflection_overlay(self):
+        """Create the Coin3D root for inflection (kappa=0) markers.
+
+        Orange filled circles drawn at each parameter where curvature changes
+        sign. Built once in __init__, updated live via _update_inflection_markers.
+        """
+        try:
+            from pivy import coin
+            self.inflection_vis_root = coin.SoSeparator()
+            self.inflection_col = coin.SoBaseColor()
+            self.inflection_col.rgb = (1.0, 0.5, 0.0)   # orange
+            self.inflection_coords = coin.SoCoordinate3()
+            self.inflection_mk = coin.SoMarkerSet()
+            try:
+                self.inflection_mk.markerIndex = coin.SoMarkerSet.CIRCLE_FILLED_7_7
+            except Exception:
+                pass
+            self.inflection_mk.numPoints = 0
+            self.inflection_vis_root.addChild(self.inflection_col)
+            self.inflection_vis_root.addChild(self.inflection_coords)
+            self.inflection_vis_root.addChild(self.inflection_mk)
+            doc = FreeCADGui.ActiveDocument
+            view = doc.ActiveView if doc is not None else None
+            if view:
+                view.getSceneGraph().addChild(self.inflection_vis_root)
+        except Exception:
+            self.inflection_vis_root = None
+
+    def _destroy_inflection_overlay(self):
+        """Remove the inflection marker overlay from the scene graph."""
+        if self.inflection_vis_root:
+            try:
+                doc = FreeCADGui.ActiveDocument
+                view = doc.ActiveView if doc is not None else None
+                if view:
+                    view.getSceneGraph().removeChild(self.inflection_vis_root)
+            except Exception:
+                pass
+            self.inflection_vis_root = None
+
+    def _detect_inflections(self, edge, samples=64):
+        """Return 3D points where curvature changes sign along an edge.
+
+        Samples d1 x d2 magnitude across the edge; near-zero crossings of the
+        curvature scalar flag an inflection. Returns [] on any failure.
+        Pure math on edge.firstDerivative/secondDerivative -- headless-safe.
+        """
+        try:
+            inflections = []
+            L = edge.Length
+            n = max(16, min(samples, int(max(L, 1.0) / 2.0) * 4))
+            prev_k = None
+            prev_t = None
+            prev_sign = None
+            for i in range(n + 1):
+                t = i / n
+                d1 = edge.firstDerivative(t)
+                d2 = edge.secondDerivative(t)
+                speed2 = d1.dot(d1)
+                if speed2 < 1e-12:
+                    continue
+                k = (d1.cross(d2)).Length / (speed2 ** 1.5)
+                cross_vec = d1.cross(d2)
+                cx, cy, cz = abs(cross_vec.x), abs(cross_vec.y), abs(cross_vec.z)
+                if cx >= cy and cx >= cz:
+                    sign = 1.0 if cross_vec.x > 0 else (-1.0 if cross_vec.x < 0 else 0.0)
+                elif cy >= cz:
+                    sign = 1.0 if cross_vec.y > 0 else (-1.0 if cross_vec.y < 0 else 0.0)
+                else:
+                    sign = 1.0 if cross_vec.z > 0 else (-1.0 if cross_vec.z < 0 else 0.0)
+                if prev_k is not None and prev_k < 1e-6 and k > 1e-6:
+                    inflections.append(edge.value((prev_t + t) / 2.0))
+                elif prev_sign is not None and sign != 0 and prev_sign != 0 and sign != prev_sign and k < 1e-4:
+                    inflections.append(edge.value((prev_t + t) / 2.0))
+                prev_k = k
+                prev_t = t
+                if sign != 0:
+                    prev_sign = sign
+            return inflections
+        except Exception:
+            return []
+
+    def _update_inflection_markers(self):
+        """Refresh inflection markers from the current curve shape."""
+        if not self.inflection_vis_root:
+            return
+        try:
+            shape = self.obj.Shape
+            if not shape or not shape.Edges:
+                self.inflection_mk.numPoints = 0
+                return
+            edge = shape.Edges[0]
+            pts = self._detect_inflections(edge)
+            from pivy import coin
+            coords = [(p.x, p.y, p.z) for p in pts]
+            self.inflection_coords.point.setValues(0, len(coords), coords)
+            self.inflection_mk.numPoints = len(coords)
+            doc = FreeCADGui.ActiveDocument
+            view = doc.ActiveView if doc is not None else None
+            if view:
+                sg = view.getSceneGraph()
+                if len(coords) and not sg.hasChild(self.inflection_vis_root):
+                    sg.addChild(self.inflection_vis_root)
+                elif not len(coords) and sg.hasChild(self.inflection_vis_root):
+                    sg.removeChild(self.inflection_vis_root)
+        except Exception:
+            pass
+
+    # ---- Phase 1: multi-CV highlight + box select ------------------------ #
+
+    def _build_multi_cv_highlight(self):
+        """Create the Coin overlay for multi-selected control points.
+
+        Yellow filled squares drawn at each selected point index. Also creates
+        the box-select rubber-band switch (empty until a box drag begins).
+        """
+        try:
+            from pivy import coin
+            # Highlight switch: shows yellow squares at selected point indices
+            self._hl_switch = coin.SoSwitch()
+            self._hl_switch.whichChild = -1
+            hl = coin.SoSeparator()
+            hcol = coin.SoBaseColor()
+            hcol.rgb = (1.0, 1.0, 0.0)   # yellow
+            self._hl_coords = coin.SoCoordinate3()
+            self._hl_mk = coin.SoMarkerSet()
+            try:
+                self._hl_mk.markerIndex = coin.SoMarkerSet.SQUARE_FILLED_7_7
+            except Exception:
+                pass
+            self._hl_mk.numPoints = 0
+            hl.addChild(hcol)
+            hl.addChild(self._hl_coords)
+            hl.addChild(self._hl_mk)
+            self._hl_switch.addChild(hl)
+            self.root.addChild(self._hl_switch)
+
+            # Box-select rubber band (screen-space rect drawn during Ctrl+drag)
+            self._box_switch = coin.SoSwitch()
+            self._box_switch.whichChild = -1
+            bx = coin.SoSeparator()
+            bcol = coin.SoBaseColor()
+            bcol.rgb = (0.2, 0.85, 1.0)   # light blue
+            bstyle = coin.SoDrawStyle()
+            bstyle.lineWidth = 2
+            bstyle.linePattern = coin.SoDrawStyle.DOT
+            self._box_coords = coin.SoCoordinate3()
+            self._box_line = coin.SoLineSet()
+            self._box_line.numVertices.setValue(4)
+            bx.addChild(bcol)
+            bx.addChild(bstyle)
+            bx.addChild(self._box_coords)
+            bx.addChild(self._box_line)
+            self._box_switch.addChild(bx)
+            self.root.addChild(self._box_switch)
+        except Exception:
+            self._hl_switch = None
+            self._box_switch = None
+
+    def highlight_points(self, idx_set):
+        """Re-colour markers for the given point indices (multi-CV selection).
+
+        Called from the panel when table rows are selected/deselected.
+        Draws yellow filled squares at each selected point.
+        """
+        if not self._hl_switch:
+            return
+        try:
+            pts = self._points()
+            idxs = sorted(i for i in idx_set if 0 <= i < len(pts))
+            self.selected_point_indices = set(idxs)
+            coords = [(pts[i].x, pts[i].y, pts[i].z) for i in idxs]
+            self._hl_coords.point.setValues(0, len(coords), coords)
+            self._hl_mk.numPoints = len(coords)
+            self._hl_switch.whichChild = 0 if coords else -1
+        except Exception:
+            pass
+
+    def _start_box_select(self, pos):
+        """Begin a viewport box-selection drag (Ctrl+LMB on empty space)."""
+        self._box_select_active = True
+        self._box_select_start = pos
+        self._show_box_select(pos, pos)
+
+    def _update_box_select(self, pos):
+        """Resize the box-select rubber band as the cursor moves."""
+        if not self._box_select_active or self._box_switch is None:
+            return
+        self._show_box_select(self._box_select_start, pos)
+
+    def _show_box_select(self, p0, p1):
+        """Draw the box-select rubber band rectangle (screen-space -> 3D)."""
+        if self._box_switch is None:
+            return
+        try:
+            x0, y0 = p0
+            x1, y1 = p1
+            left, right = min(x0, x1), max(x0, x1)
+            top, bottom = min(y0, y1), max(y0, y1)
+            corners = [(left, top), (right, top), (right, bottom), (left, bottom), (left, top)]
+            pts3d = []
+            for cx, cy in corners:
+                gp = self.view.getPoint(cx, cy)
+                if gp is not None:
+                    pts3d.append((gp.x, gp.y, gp.z))
+                else:
+                    pts3d.append((0.0, 0.0, 0.0))
+            self._box_coords.point.setValues(0, len(pts3d), pts3d)
+            self._box_switch.whichChild = 0
+        except Exception:
+            self._box_switch.whichChild = -1
+
+    def _end_box_select(self, pos):
+        """Finalize box selection: pick all points whose screen projection
+        falls inside the drag rectangle, then highlight them."""
+        self._box_select_active = False
+        if self._box_switch is not None:
+            self._box_switch.whichChild = -1
+        try:
+            pts = self._points()
+            x0, y0 = self._box_select_start
+            x1, y1 = pos
+            left, right = min(x0, x1), max(x0, x1)
+            top, bottom = min(y0, y1), max(y0, y1)
+            chosen = set()
+            for i, p in enumerate(pts):
+                sp = self._screen(p)
+                if sp is None:
+                    continue
+                sx, sy = sp
+                if left <= sx <= right and top <= sy <= bottom:
+                    chosen.add(i)
+            self.selected_point_indices = chosen
+            self.highlight_points(chosen)
+            panel = getattr(self, "_panel", None)
+            if panel is not None and hasattr(panel, "table"):
+                panel.table.clearSelection()
+                from PySide import QtCore
+                for i in sorted(chosen):
+                    panel.table.selectRow(i)
+            return chosen
+        except Exception:
+            return set()
 
 
 class KnotEditor(object):

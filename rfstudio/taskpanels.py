@@ -35,7 +35,7 @@ from rfstudio.panel_surface import (  # noqa: F401
     SurfacePanel, LoftPanel, OffsetThickenPanel, ShellPanel, BlendSurfPanel,
     StitchShellPanel, PolylineFilletPanel,
     JoinCurvePanel, BlendSurfClosedPanel,
-    TrimByIntersectionPanel,
+    TrimByIntersectionPanel, TrimSoSPanel,
 )
 from rfstudio.panel_qa import (  # noqa: F401
     SurfaceReviewPanel,
